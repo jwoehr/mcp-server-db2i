@@ -3,7 +3,8 @@
  * IBM DB2i MCP Server
  *
  * A Model Context Protocol server for querying and inspecting
- * IBM DB2 for i (DB2i) databases using the JT400 JDBC driver.
+ * IBM DB2 for i (DB2i) databases through JT400 (JDBC) or IBM i Access ODBC,
+ * on one or more IBM i systems (DB2I_PROFILES).
  * 
  * Supports two transport modes:
  * - stdio (default): For CLI/IDE integration
@@ -15,22 +16,40 @@
  * - 'both': Both transports simultaneously
  */
 
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { serveStdio, type StdioServerHandle } from '@modelcontextprotocol/server/stdio';
 import type http from 'node:http';
 import type https from 'node:https';
 
-import { loadConfig, isHttpEnabled, isStdioEnabled, getTransportMode, getHttpConfig } from './config.js';
+import {
+  isHttpEnabled,
+  isStdioEnabled,
+  getTransportMode,
+  getHttpConfig,
+  getEnabledTools,
+  getResponseFormat,
+  connectionSecurity,
+  assertCustomToolsWatch,
+  isCustomToolsWatchEnabled,
+  isQueryParseCheckEnabled,
+  getQueryLimitConfig,
+} from './config.js';
 import { initializePool, testConnection, closeGlobalPool } from './db/connection.js';
+import { defaultSystem, getSystems, isProfilesFileConfigured, type SystemProfile } from './systems.js';
 import { logger, flushLogger } from './utils/logger.js';
 import { getRateLimiter } from './utils/rateLimiter.js';
-import { createServer, SERVER_NAME, SERVER_VERSION } from './server.js';
+import { createServer, pinStdioServer, SERVER_NAME, SERVER_VERSION } from './server.js';
+import { startCustomToolsWatch, stopCustomToolsWatch } from './customTools/watch.js';
+import { parseCliArgs, runValidateTools } from './cli.js';
+import { loadCustomToolsFromEnv } from './customTools/loader.js';
+import { closeAuditLog, initAuditLog } from './utils/auditLog.js';
+import { setCustomTools } from './customTools/registry.js';
 import { startHttpServer, shutdownHttpServer } from './transports/http.js';
 
 /**
  * Main entry point
  */
 async function main(): Promise<void> {
-  let stdioServer: ReturnType<typeof createServer> | null = null;
+  let stdioServer: StdioServerHandle | null = null;
   let httpServer: http.Server | https.Server | null = null;
 
   /**
@@ -38,6 +57,8 @@ async function main(): Promise<void> {
    */
   async function shutdown(signal: string): Promise<void> {
     logger.info(`Received ${signal}, shutting down...`);
+    stopCustomToolsWatch();
+    closeAuditLog();
 
     const shutdownPromises: Promise<void>[] = [];
 
@@ -79,22 +100,64 @@ async function main(): Promise<void> {
 
     // Initialize rate limiter (logs its own config)
     getRateLimiter();
+    // Fail on a malformed QUERY_DEFAULT_LIMIT / QUERY_MAX_LIMIT now, not on the first query
+    getQueryLimitConfig();
+
+    // Reads and checks DB2I_PROFILES, so a bad file stops startup
+    const systems = getSystems();
+    const profiles = isProfilesFileConfigured();
+    if (profiles) {
+      logger.info(
+        { systems: systems.map((system) => ({ name: system.name, host: system.config.hostname, driver: system.config.driver })) },
+        'IBM i systems loaded from DB2I_PROFILES'
+      );
+    }
+    for (const system of systems) {
+      warnConnectionSecurity(system, profiles);
+    }
+
+    // Validates tool files and MCP_TOOLS_ENABLED / MCP_TOOLS_DISABLED before any transport starts
+    const customTools = loadCustomToolsFromEnv();
+    assertCustomToolsWatch();
+    if (customTools.masking.size > 0 && !isQueryParseCheckEnabled()) {
+      logger.warn(
+        'Masking rules are loaded and QUERY_PARSE_CHECK is off. execute_query will refuse to run until the check is on.'
+      );
+    }
+    initAuditLog();
+    setCustomTools(customTools);
+    const enabledTools = getEnabledTools(customTools.tools);
+    if (enabledTools.length === 0) {
+      logger.warn('All tools are disabled by MCP_TOOLS_ENABLED / MCP_TOOLS_DISABLED');
+    }
+    logger.info(
+      {
+        tools: enabledTools,
+        customTools: customTools.tools.length,
+        annotations: customTools.annotations.length,
+        responseFormat: getResponseFormat(),
+      },
+      'Tool configuration loaded'
+    );
+    if (isCustomToolsWatchEnabled()) {
+      startCustomToolsWatch();
+      logger.info('Watching custom tool files for changes');
+    }
 
     // Check which transports are enabled
     const stdioEnabled = isStdioEnabled();
     const httpEnabled = isHttpEnabled();
 
-    // For stdio mode, we need DB config from environment
+    // For stdio mode, the default system's connection settings are required
     if (stdioEnabled) {
-      // Load configuration from environment variables
-      const config = loadConfig();
-      logger.debug({ hostname: config.hostname, port: config.port }, 'Configuration loaded for stdio');
+      const system = defaultSystem();
+      const { config } = system;
+      logger.debug({ hostname: config.hostname, port: config.port, system: system.name }, 'Configuration loaded for stdio');
 
-      // Initialize global database connection pool for stdio
-      initializePool(config);
-      logger.debug('Global database connection pool initialized');
+      // Register the stdio pools. Other systems connect on their first query.
+      initializePool(config, system.name);
 
-      // Test the connection
+      // Test the default system's connection
       const connected = await testConnection();
       if (!connected) {
         logger.warn('Could not verify database connection. The server will start but queries may fail.');
@@ -102,10 +165,17 @@ async function main(): Promise<void> {
         logger.info('Database connection verified');
       }
 
-      // Create and connect stdio MCP server
-      stdioServer = createServer();
-      const transport = new StdioServerTransport();
-      await stdioServer.connect(transport);
+      // serveStdio pins one server per connection and speaks both 2025 and 2026-07-28
+      stdioServer = serveStdio(() => {
+        const server = createServer();
+        const release = pinStdioServer(server);
+        const close = server.close.bind(server);
+        server.close = () => {
+          release();
+          return close();
+        };
+        return server;
+      });
       logger.info(
         { name: SERVER_NAME, version: SERVER_VERSION },
         'MCP server connected via stdio transport'
@@ -165,9 +235,54 @@ async function main(): Promise<void> {
   }
 }
 
-// Run the server
-main().catch((error) => {
-  logger.fatal({ err: error }, 'Fatal error during server startup');
+/**
+ * Log the driver, and warn when a system's options turn off read only or TLS.
+ */
+function warnConnectionSecurity(system: SystemProfile, profiles: boolean): void {
+  const security = profiles
+    ? connectionSecurity(
+        system.config.driver,
+        system.config.driver === 'odbc' ? system.config.odbcOptions : system.config.jdbcOptions
+      )
+    : connectionSecurity();
+  const optionsVariable = profiles
+    ? `Profile ${system.name} ${security.driver === 'odbc' ? 'odbcOptions' : 'jdbcOptions'}`
+    : security.optionsVariable;
+  const context = profiles ? { system: system.name } : {};
+
+  logger.info({ ...context, driver: security.driver }, 'Database driver selected');
+  if (security.accessOverride !== undefined) {
+    logger.warn(
+      { ...context, access: security.accessOverride },
+      `${optionsVariable} sets ${security.driver === 'odbc' ? 'CONNTYPE' : 'access'} and overrides the read only default`
+    );
+  }
+  if (!security.secure) {
+    logger.warn(
+      context,
+      `Database connection is not using TLS. Set ${security.secureHint} in ${optionsVariable} after the IBM i host servers are configured for SSL.`
+    );
+  }
+}
+
+const command = parseCliArgs(process.argv.slice(2));
+if (command.kind === 'serve') {
+  main().catch((error) => {
+    logger.fatal({ err: error }, 'Fatal error during server startup');
+    flushLogger();
+    process.exit(1);
+  });
+} else if (command.kind === 'usage') {
+  process.stderr.write(`${command.message}\n`);
   flushLogger();
   process.exit(1);
-});
+} else {
+  runValidateTools(command).then((code) => {
+    flushLogger();
+    process.exit(code);
+  }).catch((error) => {
+    logger.fatal({ err: error }, 'validate-tools failed');
+    flushLogger();
+    process.exit(1);
+  });
+}

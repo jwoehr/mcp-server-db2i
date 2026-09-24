@@ -1,5 +1,139 @@
 # Changelog
 
+## [2.7.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.6.0...v2.7.0) (2026-09-24)
+
+
+### Features
+
+* make ODBC the default driver and JT400 optional ([#102](https://github.com/Strom-Capital/mcp-server-db2i/issues/102)) ([2447c4a](https://github.com/Strom-Capital/mcp-server-db2i/commit/2447c4a90e544da964a94bdc14bc5cc800f59603))
+
+## [2.6.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.5.1...v2.6.0) (2026-09-24)
+
+
+### Features
+
+* add a driver interface and an IBM i Access ODBC backend ([#96](https://github.com/Strom-Capital/mcp-server-db2i/issues/96)) ([9c3e88a](https://github.com/Strom-Capital/mcp-server-db2i/commit/9c3e88a0e2c3c14944773614b416a0b68a0b714d)), closes [#57](https://github.com/Strom-Capital/mcp-server-db2i/issues/57)
+* connect to multiple IBM i systems through profiles ([#98](https://github.com/Strom-Capital/mcp-server-db2i/issues/98)) ([cd910a4](https://github.com/Strom-Capital/mcp-server-db2i/commit/cd910a4de06a7553402b3ecd1496c9af4ef7a3f0))
+
+
+### Bug Fixes
+
+* housekeeping pass after connection profiles and the ODBC driver ([#99](https://github.com/Strom-Capital/mcp-server-db2i/issues/99)) ([4182a50](https://github.com/Strom-Capital/mcp-server-db2i/commit/4182a506f3dfdd04ee5ff68315f7f7ecb1a7ea05))
+
+
+### CI/CD
+
+* run CI in the release workflow only before a publish ([#100](https://github.com/Strom-Capital/mcp-server-db2i/issues/100)) ([57850bb](https://github.com/Strom-Capital/mcp-server-db2i/commit/57850bbdfa23f21e3cde903ed416b029b2cce381))
+
+## [2.5.1](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.5.0...v2.5.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* count /auth attempts on arrival and drop CORS credentials ([#94](https://github.com/Strom-Capital/mcp-server-db2i/issues/94)) ([046f1e5](https://github.com/Strom-Capital/mcp-server-db2i/commit/046f1e512d7d8c8bd36c9fd3d27c2059f2c80467)), closes [#93](https://github.com/Strom-Capital/mcp-server-db2i/issues/93)
+
+## [2.5.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.4.0...v2.5.0) (2026-09-24)
+
+
+### Features
+
+* add get_journal_info and profile_table ([#76](https://github.com/Strom-Capital/mcp-server-db2i/issues/76)) ([0a5d694](https://github.com/Strom-Capital/mcp-server-db2i/commit/0a5d6945aa321d8a16ddc06aad966c91250b22cb)), closes [#74](https://github.com/Strom-Capital/mcp-server-db2i/issues/74) [#75](https://github.com/Strom-Capital/mcp-server-db2i/issues/75)
+* apply QUERY_ALLOWED_SCHEMAS to the catalog browsing tools ([98383d5](https://github.com/Strom-Capital/mcp-server-db2i/commit/98383d54f4b6a92c6e8c000e56bf0428b7cdf994))
+* expose MCP resources and prompts ([#80](https://github.com/Strom-Capital/mcp-server-db2i/issues/80)) ([98383d5](https://github.com/Strom-Capital/mcp-server-db2i/commit/98383d54f4b6a92c6e8c000e56bf0428b7cdf994))
+
+
+### Bug Fixes
+
+* report a missing library from get_journal_info ([#78](https://github.com/Strom-Capital/mcp-server-db2i/issues/78)) ([27af26f](https://github.com/Strom-Capital/mcp-server-db2i/commit/27af26f4fc338eb46536f6e09dea096baf4f5c91))
+
+
+### CI/CD
+
+* wait up to 10 minutes for npm before registry publish ([#72](https://github.com/Strom-Capital/mcp-server-db2i/issues/72)) ([17164e7](https://github.com/Strom-Capital/mcp-server-db2i/commit/17164e7e395608b2ce5a7b05ca528d01e9edb369))
+
+## [2.4.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.3.0...v2.4.0) (2026-09-24)
+
+
+### Features
+
+* add a validate-tools command for YAML tool files ([#67](https://github.com/Strom-Capital/mcp-server-db2i/issues/67)) ([8963230](https://github.com/Strom-Capital/mcp-server-db2i/commit/89632307e2c039fadcbcde9c1f99bf4a420e67d3))
+* add search_columns and search_tables ([4a819ca](https://github.com/Strom-Capital/mcp-server-db2i/commit/4a819cab459e621cf4f5a15a0992cc71675c127b))
+* mask sensitive columns in query results ([#70](https://github.com/Strom-Capital/mcp-server-db2i/issues/70)) ([db0f800](https://github.com/Strom-Capital/mcp-server-db2i/commit/db0f800a089e7c2f0ebf4036fd1e29145873ff3d))
+* record each tool call in an audit log ([#69](https://github.com/Strom-Capital/mcp-server-db2i/issues/69)) ([8b18502](https://github.com/Strom-Capital/mcp-server-db2i/commit/8b1850284ceaf850587e1cfab75e1b9bf818ba68))
+* reload YAML tools when their files change ([#68](https://github.com/Strom-Capital/mcp-server-db2i/issues/68)) ([affa527](https://github.com/Strom-Capital/mcp-server-db2i/commit/affa5274ba9c9029d1bfd6978b7de3a068a28031))
+
+## [2.3.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.2.1...v2.3.0) (2026-09-24)
+
+
+### Features
+
+* require Node 22 and node-jt400 7 ([#53](https://github.com/Strom-Capital/mcp-server-db2i/issues/53)) ([2afc062](https://github.com/Strom-Capital/mcp-server-db2i/commit/2afc0629c3a0062c13ba257f8d377e9d39666150))
+
+
+### CI/CD
+
+* retry MCP Registry publish until npm shows the version ([#55](https://github.com/Strom-Capital/mcp-server-db2i/issues/55)) ([598b708](https://github.com/Strom-Capital/mcp-server-db2i/commit/598b7080cc1cdbd5533912c370d8f72652bb1f70))
+
+## [2.2.1](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.2.0...v2.2.1) (2026-09-23)
+
+
+### Features
+
+* publish to the official MCP Registry ([#49](https://github.com/Strom-Capital/mcp-server-db2i/issues/49)) ([856db9d](https://github.com/Strom-Capital/mcp-server-db2i/commit/856db9ddec904fb0c89c86a7665691c928a5d316)), closes [#48](https://github.com/Strom-Capital/mcp-server-db2i/issues/48)
+
+
+### Miscellaneous
+
+* ship the registry listing as 2.2.1 ([#51](https://github.com/Strom-Capital/mcp-server-db2i/issues/51)) ([7386edb](https://github.com/Strom-Capital/mcp-server-db2i/commit/7386edbfd930afacf9488884dc73a195b0a9833a))
+
+## [2.2.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.1.0...v2.2.0) (2026-09-23)
+
+
+### Features
+
+* load read-only business SQL tools from YAML ([#47](https://github.com/Strom-Capital/mcp-server-db2i/issues/47)) ([690b985](https://github.com/Strom-Capital/mcp-server-db2i/commit/690b9858ff59d26e6d7dd1af1585e9f7aa064fe8))
+* validate SQL and return object DDL and dependents ([#44](https://github.com/Strom-Capital/mcp-server-db2i/issues/44)) ([932a6a8](https://github.com/Strom-Capital/mcp-server-db2i/commit/932a6a839031635068ffa57c9e3a889672e71258))
+
+## [2.1.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.0.0...v2.1.0) (2026-09-23)
+
+
+### Features
+
+* configurable tool selection and compact response format ([#37](https://github.com/Strom-Capital/mcp-server-db2i/issues/37)) ([0597685](https://github.com/Strom-Capital/mcp-server-db2i/commit/05976859f731071fbb21e1c128a5272a7c062f33)), closes [#35](https://github.com/Strom-Capital/mcp-server-db2i/issues/35)
+* use DB2I_SCHEMA as the default library and add a schema allowlist ([#39](https://github.com/Strom-Capital/mcp-server-db2i/issues/39)) ([c4e9787](https://github.com/Strom-Capital/mcp-server-db2i/commit/c4e9787fbcf3d40abafcc3e63cbb2329f8627b13)), closes [#36](https://github.com/Strom-Capital/mcp-server-db2i/issues/36)
+
+
+### Bug Fixes
+
+* close read-only SQL and HTTP exposure gaps ([1c75a21](https://github.com/Strom-Capital/mcp-server-db2i/commit/1c75a218fa4841ace3b5cb60596a7fe5eda3f083)), closes [#40](https://github.com/Strom-Capital/mcp-server-db2i/issues/40)
+
+## [2.0.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v1.3.2...v2.0.0) (2026-09-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* migrate to MCP SDK v2 and default HTTP sessions to stateless ([#34](https://github.com/Strom-Capital/mcp-server-db2i/issues/34))
+
+### Features
+
+* migrate to MCP SDK v2 and default HTTP sessions to stateless ([#34](https://github.com/Strom-Capital/mcp-server-db2i/issues/34)) ([bf37f26](https://github.com/Strom-Capital/mcp-server-db2i/commit/bf37f268b8c33c965922eefac388b62e906223af)), closes [#27](https://github.com/Strom-Capital/mcp-server-db2i/issues/27)
+
+
+### CI/CD
+
+* publish npm via OIDC and allow republishing v1.3.2 ([e706589](https://github.com/Strom-Capital/mcp-server-db2i/commit/e706589e3b7932c9367906d7a1bb1a5b601e3e2d))
+* publish npm via OIDC trusted publishing and allow tag retries ([1eb2362](https://github.com/Strom-Capital/mcp-server-db2i/commit/1eb2362adddba54119f82c2c96595af969a33f1c))
+* run publish tests on Node 20, publish with Node 24 ([4c34d99](https://github.com/Strom-Capital/mcp-server-db2i/commit/4c34d99583f181e7e5b72d28116af3e34fe42cfd))
+* run publish-job tests on Node 20 and publish with Node 24 ([b576466](https://github.com/Strom-Capital/mcp-server-db2i/commit/b57646667f125902fe31039abc294705e1f9aaa8))
+* stop duplicate changelog rows and dedupe the release pipeline ([#32](https://github.com/Strom-Capital/mcp-server-db2i/issues/32)) ([5361afa](https://github.com/Strom-Capital/mcp-server-db2i/commit/5361afab8a589dd90ff39acf7a9f8b215dfb097c))
+
+## [1.3.2](https://github.com/Strom-Capital/mcp-server-db2i/compare/v1.3.1...v1.3.2) (2026-09-23)
+
+
+### Bug Fixes
+
+* harden HTTP transport, clamp query limits, and bump MCP SDK to 1.30 ([#28](https://github.com/Strom-Capital/mcp-server-db2i/pull/28)) ([13ca726](https://github.com/Strom-Capital/mcp-server-db2i/commit/13ca726019d66e1d5969ee61565447d3313c9abc)), closes [#26](https://github.com/Strom-Capital/mcp-server-db2i/issues/26)
+
 ## [1.3.1](https://github.com/Strom-Capital/mcp-server-db2i/compare/v1.3.0...v1.3.1) (2026-03-05)
 
 

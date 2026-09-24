@@ -4,8 +4,9 @@ This guide covers setting up a development environment and contributing to mcp-s
 
 ## Prerequisites
 
-- **Node.js** 20.6 or higher (required for `--env-file` flag)
-- **Java Runtime Environment (JRE)** 11 or higher (for JDBC)
+- **Node.js** 22 or higher (required for `--env-file` flag)
+- **unixODBC** and the **IBM i Access ODBC Driver** for the default `odbc` driver (see [Database Drivers](configuration.md#database-drivers))
+- **JDK** 11 or higher, optional. Only needed to build and run the `jt400` driver: `npm install` builds its Java bridge when a JDK is present and skips it otherwise. The tests mock both drivers, but `npm run typecheck` needs both packages installed, and CI builds both
 - **npm** or **yarn**
 - Access to an IBM i system (for integration testing)
 
@@ -21,8 +22,11 @@ cd mcp-server-db2i
 ### 2. Install Dependencies
 
 ```bash
+nvm use
 npm install
 ```
+
+`nvm use` reads `.nvmrc` and switches to Node 22. fnm and mise read the same file. `.npmrc` sets `engine-strict`, so `npm install` fails on an older Node instead of building the native modules for the wrong version. If you switch Node versions later, run `npm rebuild` so the native module matches.
 
 ### 3. Configure Environment
 
@@ -45,51 +49,61 @@ LOG_PRETTY=true
 npm run dev
 ```
 
-This uses `tsx` to run TypeScript directly with hot-reload support.
+This uses `tsx` to run TypeScript directly. It does not restart on changes.
 
 ## Available Scripts
 
 | Script | Description |
 |--------|-------------|
-| `npm run dev` | Run in development mode with hot-reload |
+| `npm run dev` | Run the TypeScript source with `tsx` |
 | `npm run build` | Compile TypeScript to JavaScript |
 | `npm start` | Run production build |
 | `npm test` | Run tests |
 | `npm run test:watch` | Run tests in watch mode |
 | `npm run lint` | Run ESLint |
 | `npm run lint:fix` | Run ESLint with auto-fix |
-| `npm run typecheck` | Run TypeScript type checking |
+| `npm run typecheck` | Type-check `src` and `tests` |
 
 ## Project Structure
 
 ```
 mcp-server-db2i/
 ├── src/
-│   ├── index.ts           # Entry point
-│   ├── server.ts          # MCP server factory
+│   ├── index.ts           # Entry point: startup checks, transports, shutdown
+│   ├── cli.ts             # Command-line flags and validate-tools
+│   ├── server.ts          # MCP server factory and tool registration
+│   ├── systems.ts         # DB2I_PROFILES and the per-call target system
+│   ├── resources.ts       # MCP resources and name completion
+│   ├── prompts.ts         # MCP prompts
 │   ├── config.ts          # Configuration loading
 │   ├── openapi.ts         # OpenAPI specification
-│   ├── auth/              # Authentication (HTTP)
-│   │   ├── index.ts
-│   │   ├── types.ts
-│   │   ├── tokenManager.ts
-│   │   └── authMiddleware.ts
+│   ├── auth/              # Authentication (HTTP): tokens and middleware
 │   ├── db/                # Database layer
-│   │   ├── connection.ts  # Connection pool management
-│   │   ├── queries.ts     # Query functions
-│   │   └── drivers/       # Driver implementations
+│   │   ├── connection.ts  # Connection pools per caller and system
+│   │   ├── driver.ts      # Driver interface
+│   │   ├── drivers/       # jt400 and odbc implementations
+│   │   ├── queries.ts     # Catalog queries
+│   │   ├── profile.ts     # profile_table statistics
+│   │   └── sqlServices.ts # PARSE_STATEMENT, GENERATE_SQL, RELATED_OBJECTS
+│   ├── customTools/       # YAML business SQL tools, annotations, masking, file watch
 │   ├── tools/             # MCP tools
-│   │   ├── query.ts       # execute_query tool
-│   │   └── metadata.ts    # Schema/table tools
-│   ├── transports/        # Transport implementations
-│   │   ├── http.ts        # HTTP/Express server
-│   │   ├── sessionManager.ts
-│   │   └── index.ts
-│   └── utils/             # Utilities
+│   │   ├── query.ts       # execute_query
+│   │   ├── sqlLimit.ts    # FETCH FIRST row cap
+│   │   ├── metadata.ts    # Schema, table, and catalog search tools
+│   │   ├── profile.ts     # profile_table
+│   │   └── sqlServices.ts # validate_query, DDL, related objects, journals
+│   ├── transports/        # HTTP transport
+│   │   ├── http.ts        # Express server and /auth
+│   │   ├── sessionAuth.ts # Session key per auth mode
+│   │   └── sessionManager.ts
+│   └── utils/
 │       ├── logger.ts      # Structured logging
+│       ├── auditLog.ts    # One JSON line per tool call
+│       ├── formatResult.ts # json, pretty, and markdown tool text
 │       ├── rateLimiter.ts # Rate limiting
-│       └── security/      # SQL validation
-├── tests/                 # Test files
+│       └── security/      # SQL validation and schema allowlist
+├── tests/                 # Unit and integration tests (no IBM i needed)
+├── examples/              # Business SQL tools and a profiles file
 ├── docs/                  # Documentation
 ├── Dockerfile
 ├── docker-compose.yml
@@ -120,11 +134,34 @@ npm run test -- --coverage
 
 ### Integration Tests
 
-Integration tests require a real IBM i connection. Set environment variables and run:
+The tests in `tests/integration/` run the MCP server end to end over an in-memory transport, with the database driver mocked. They need no IBM i connection and run as part of `npm test`. To run only them:
 
 ```bash
 npm run test -- tests/integration/
 ```
+
+## Validating tool files
+
+`validate-tools` runs the startup checks on YAML tool files and then exits. It does not open a database connection and does not need `DB2I_HOSTNAME`.
+
+```bash
+npx mcp-server-db2i validate-tools examples/erp-tools
+```
+
+`QUERY_ALLOWED_SCHEMAS` and `DB2I_SCHEMA` are applied when they are set. `--connect` also runs each statement through `QSYS2.PARSE_STATEMENT` on `ibmi.example.com` (or whichever host `DB2I_HOSTNAME` names). That path needs credentials. A missing `PARSE_STATEMENT` is a failure.
+
+```bash
+npx mcp-server-db2i validate-tools --connect examples/erp-tools
+```
+
+A CI job can run the check with no secrets:
+
+```yaml
+      - name: Validate tool files
+        run: npx mcp-server-db2i validate-tools examples/erp-tools
+```
+
+The command exits 0 when every file passes and 1 when any file fails.
 
 ## Code Style
 
@@ -148,6 +185,7 @@ npm run lint:fix
 
 ```typescript
 // src/tools/myTool.ts
+import type { DbTarget } from '../systems.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger({ component: 'my-tool' });
@@ -155,7 +193,7 @@ const log = createChildLogger({ component: 'my-tool' });
 export interface MyToolInput {
   param1: string;
   param2?: number;
-  sessionId?: string;  // For HTTP transport
+  target?: DbTarget;  // Caller and IBM i system; omit for the stdio default
 }
 
 export async function myTool(input: MyToolInput): Promise<{
@@ -177,33 +215,36 @@ export async function myTool(input: MyToolInput): Promise<{
 }
 ```
 
-2. **Register the tool** in `src/server.ts`:
+2. **Add the name** to `TOOL_NAMES` in `src/config.ts`, so `MCP_TOOLS_ENABLED` and `MCP_TOOLS_DISABLED` accept it.
+
+3. **Register the tool** in `createServer()` in `src/server.ts`. `withToolHandler` resolves the target system, applies the rate limit, writes the audit line, and formats the result:
 
 ```typescript
-import { z } from 'zod';
-import { myTool } from './tools/myTool.js';
-
-// In createServer():
-server.registerTool(
-  'my_tool',
-  {
-    title: 'My Tool',
-    description: 'Description of what this tool does',
-    annotations: { readOnlyHint: true },
-    inputSchema: {
-      param1: z.string().describe('First parameter'),
-      param2: z.number().optional().describe('Optional second parameter'),
+if (enabledTools.has('my_tool')) {
+  server.registerTool(
+    'my_tool',
+    {
+      title: 'My Tool',
+      description: 'Description of what this tool does',
+      annotations: READ_ONLY_ANNOTATIONS,
+      inputSchema: z.object({
+        ...system,
+        param1: z.string().describe('First parameter'),
+        param2: z.number().optional().describe('Optional second parameter'),
+      }),
+      outputSchema: myToolOutputSchema,
     },
-  },
-  withToolHandler(
-    (args, sessionId) => myTool({ ...args, sessionId }),
-    'My tool failed',
-    sessionContext
-  )
-);
+    withToolHandler(
+      (args, target) => myTool({ ...args, target }),
+      'My tool failed',
+      sessionContext,
+      argsAudit('my_tool'),
+    )
+  );
+}
 ```
 
-3. **Add tests** in `tests/`:
+4. **Add tests** in `tests/`:
 
 ```typescript
 // tests/myTool.test.ts
@@ -222,7 +263,9 @@ describe('myTool', () => {
 
 ### Connection Pool
 
-The `db/connection.ts` module manages JDBC connection pools:
+The `db/connection.ts` module manages connection pools. It does not know which driver it uses: `db/driver.ts` defines the `DbPool` and `DbDriver` interfaces, and `db/drivers/jt400.ts` and `db/drivers/odbc.ts` implement them. The driver module is imported on first use, and a pool connects on its first query. `tests/db/drivers.contract.test.ts` runs both implementations against fakes.
+
+Pools:
 
 - **Global pool**: For stdio transport
 - **Session pools**: For HTTP transport (per-authenticated user)
@@ -360,23 +403,26 @@ Then create a Pull Request on GitHub.
 
 ### Pull Request Guidelines
 
+- Use a [Conventional Commits](https://www.conventionalcommits.org/) PR title (`feat:`, `fix:`, `ci:`, …). That title becomes the squash-commit subject.
+- Squash-merge only. Merge commits make Release Please list the same change twice in `CHANGELOG.md`.
 - Describe the changes clearly
-- Reference any related issues
+- Reference any related issues (`Fixes #123` in the PR body)
 - Ensure all tests pass
 - Update documentation as needed
 - Keep changes focused and atomic
 
 ## Release Process
 
-Releases are automated via GitHub Actions using Release Please:
+Releases are automated via GitHub Actions using [Release Please](https://github.com/googleapis/release-please):
 
-1. Commits to `main` are analyzed
-2. A release PR is automatically created/updated
-3. Merging the release PR triggers:
-   - Version bump
-   - Changelog update
-   - npm publish
-   - GitHub release
+1. Squash-merged conventional commits on `main` are analyzed
+2. A release PR is automatically created/updated with the version bump and `CHANGELOG.md`
+3. Merging the release PR tags `vX.Y.Z`, creates the GitHub release, runs CI on the tagged commit, and publishes `mcp-server-db2i` to npm via OIDC trusted publishing. Other pushes to `main` only update the release PR: branch protection has already built and tested them
+4. CI and npm publish both run on Node 22. Publish installs the latest npm so trusted publishing works. The registry publish retries up to 20 times, 30 seconds apart (about 10 minutes), because a just-published npm version can still 404.
+
+To retry publishing an already-tagged release (for example after an npm outage), run the **Release** workflow with `workflow_dispatch` and set `tag` to `vX.Y.Z`. That path skips Release Please and republishes the existing tag.
+
+`ci:` commits appear under **CI/CD** in the next version’s changelog but do not bump the version by themselves.
 
 ## Getting Help
 

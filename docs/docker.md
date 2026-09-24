@@ -10,6 +10,8 @@ This guide covers running mcp-server-db2i with Docker and docker-compose.
 docker build -t mcp-server-db2i .
 ```
 
+This builds the default `odbc` image with the IBM i Access ODBC Driver. IBM publishes that driver for amd64 only, so on an arm64 host such as an Apple Silicon Mac add `--platform linux/amd64`, or build the `jt400` image instead. See [Multi-Stage Build](#multi-stage-build).
+
 ### Run with Environment Variables
 
 > **Security Warning:** Passing credentials via `-e` flags exposes them in process lists (`ps aux`), `docker inspect` output, and shell history. Use `--env-file` for local testing and Docker secrets for production deployments.
@@ -157,8 +159,11 @@ services:
   mcp-server-db2i:
     # ...
     environment:
-      - MCP_HTTP_HOST=127.0.0.1  # Only bind to localhost
+      # 0.0.0.0 so the proxy container can reach this process. 127.0.0.1 is only this container's loopback.
+      - MCP_HTTP_HOST=0.0.0.0
       - MCP_HTTP_PORT=3000
+      # Name clients send in Host. Loopback alone is not enough once a proxy forwards a public hostname.
+      - MCP_ALLOWED_HOSTS=db2i.example.com
 
   nginx:
     image: nginx:alpine
@@ -179,18 +184,19 @@ All environment variables can be set in docker-compose.yml or via `.env` file:
 environment:
   # Database connection
   - DB2I_HOSTNAME=${DB2I_HOSTNAME}
-  - DB2I_PORT=${DB2I_PORT:-446}
-  - DB2I_DATABASE=${DB2I_DATABASE:-*LOCAL}
   - DB2I_USERNAME=${DB2I_USERNAME}
   - DB2I_PASSWORD=${DB2I_PASSWORD}
   - DB2I_SCHEMA=${DB2I_SCHEMA:-}
+  # DB2I_DRIVER is set by the image target (odbc or jt400)
   - DB2I_JDBC_OPTIONS=${DB2I_JDBC_OPTIONS:-}
+  - DB2I_ODBC_OPTIONS=${DB2I_ODBC_OPTIONS:-}
   
   # Transport settings
   - MCP_TRANSPORT=${MCP_TRANSPORT:-stdio}
   - MCP_HTTP_PORT=${MCP_HTTP_PORT:-3000}
   - MCP_HTTP_HOST=${MCP_HTTP_HOST:-127.0.0.1}
-  - MCP_SESSION_MODE=${MCP_SESSION_MODE:-stateful}
+  - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-}
+  - MCP_SESSION_MODE=${MCP_SESSION_MODE:-stateless}
   - MCP_TOKEN_EXPIRY=${MCP_TOKEN_EXPIRY:-3600}
   - MCP_MAX_SESSIONS=${MCP_MAX_SESSIONS:-100}
   
@@ -207,22 +213,67 @@ environment:
   # Query limits
   - QUERY_DEFAULT_LIMIT=${QUERY_DEFAULT_LIMIT:-1000}
   - QUERY_MAX_LIMIT=${QUERY_MAX_LIMIT:-10000}
+  - QUERY_ALLOWED_SCHEMAS=${QUERY_ALLOWED_SCHEMAS:-}
+  - QUERY_PARSE_CHECK=${QUERY_PARSE_CHECK:-}
+  
+  # Tool selection and response format
+  - MCP_TOOLS_ENABLED=${MCP_TOOLS_ENABLED:-}
+  - MCP_TOOLS_DISABLED=${MCP_TOOLS_DISABLED:-}
+  - MCP_CUSTOM_TOOLS=${MCP_CUSTOM_TOOLS:-}
+  - MCP_RESPONSE_FORMAT=${MCP_RESPONSE_FORMAT:-json}
   
   # Logging
   - LOG_LEVEL=${LOG_LEVEL:-info}
 ```
 
+## Business SQL tools
+
+Mount a directory of YAML tool files and point `MCP_CUSTOM_TOOLS` at it. The example pack in `examples/erp-tools` uses placeholder names such as `MYLIB.ORDERHDR`. Edit those names before relying on the tools.
+
+```yaml
+services:
+  mcp-server-db2i:
+    environment:
+      - MCP_CUSTOM_TOOLS=/tools
+      - QUERY_ALLOWED_SCHEMAS=MYLIB
+    volumes:
+      - ./examples/erp-tools:/tools:ro
+```
+
+The server reads the files at startup. A statement that is not a query, or that names a library outside `QUERY_ALLOWED_SCHEMAS`, stops the container. See [Business SQL tools](custom-tools.md).
+
 ## Multi-Stage Build
 
-The Dockerfile uses a multi-stage build for minimal image size:
+The Dockerfile uses a multi-stage build with two runtime targets:
 
-1. **Builder stage**: Compiles TypeScript to JavaScript
-2. **Production stage**: Contains only runtime dependencies
+1. **Builder stage**: Compiles TypeScript to JavaScript and prunes dev dependencies
+2. **`odbc` target** (default): unixODBC and the IBM i Access ODBC Driver from IBM's apt repository, no Java. Sets `DB2I_DRIVER=odbc`.
+3. **`jt400` target**: OpenJDK 17 JRE for the JT400 JDBC driver. Sets `DB2I_DRIVER=jt400`.
 
-The final image:
-- Uses Node.js Alpine for small size
-- Runs as non-root user (`mcpuser`)
-- Includes only production dependencies
+```bash
+# ODBC image (default), no JDK or JRE
+docker build -t mcp-server-db2i .
+docker run --rm -i --env-file .env -e DB2I_ODBC_OPTIONS="SSL=1" mcp-server-db2i
+
+# JDBC image
+docker build --target jt400 -t mcp-server-db2i:jt400 .
+```
+
+IBM publishes the ODBC driver package for amd64, i386 and ppc64el only. On an arm64 host such as an Apple Silicon Mac, build and run the ODBC image under emulation with `--platform linux/amd64`; the build fails early with a message otherwise. The `jt400` image builds natively on arm64.
+
+```bash
+docker build --platform linux/amd64 -t mcp-server-db2i .
+```
+
+The bundled `docker-compose.yml` builds the ODBC image with `platform: linux/amd64`. To use the JDBC image, set `target: jt400` under `build` and remove the `platform` line.
+
+Both images:
+- Use `node:22-bookworm-slim`. Bookworm is pinned so OpenJDK 17 stays available for the `jt400` target. Debian trixie does not package it.
+- Run as non-root user (`mcpuser`)
+- Include only production dependencies
+- Default `MCP_SESSION_MODE` to `stateless`, matching the server. `stateful` is deprecated.
+
+The `odbc` image installs `ibm-iaccess` from `public.dhe.ibm.com` at build time, so the build needs network access to that host. See [Database Drivers](configuration.md#database-drivers) for the ODBC keywords.
 
 ## Health Checks
 
@@ -233,14 +284,14 @@ services:
   mcp-server-db2i:
     # ...
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
 ```
 
-> **Note:** We use `wget` instead of `curl` because curl is not included in Node.js Alpine images.
+> **Note:** The image is Debian slim and does not include `curl` or `wget`. The check uses Node's built-in `fetch`.
 
 ## Resource Limits
 
@@ -342,6 +393,8 @@ services:
       - DB2I_PASSWORD_FILE=/run/secrets/db2i_password
       - DB2I_SCHEMA=${DB2I_SCHEMA}
       - MCP_TRANSPORT=http
+      - MCP_HTTP_HOST=0.0.0.0
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-}
       - MCP_TLS_ENABLED=true
       - MCP_TLS_CERT_PATH=/certs/server.crt
       - MCP_TLS_KEY_PATH=/certs/server.key
@@ -353,7 +406,7 @@ services:
     volumes:
       - ./certs:/certs:ro
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "--no-check-certificate", "https://localhost:3000/health"]
+      test: ["CMD", "node", "-e", "process.env.NODE_TLS_REJECT_UNAUTHORIZED='0'; fetch('https://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3

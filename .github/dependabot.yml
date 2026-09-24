@@ -1,0 +1,47 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+      prefix-development: chore
+    ignore:
+      # Majors are chosen by hand to stay close to the Node runtime in .nvmrc
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # Packages that must move in lockstep, including majors.
+      # Dependabot assigns each dependency to the first group it matches.
+      eslint:
+        patterns: ["eslint", "@eslint/*"]
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
+      production:
+        dependency-type: production
+        update-types: [minor, patch]
+      development:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    ignore:
+      # The image tracks the Node major pinned in .nvmrc; bump both together
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]

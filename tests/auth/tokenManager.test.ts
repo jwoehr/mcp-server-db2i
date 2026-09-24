@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // Mock the config module before importing tokenManager
 vi.mock('../../src/config.js', () => ({
+  DEFAULT_SYSTEM_NAME: 'default',
   getHttpConfig: vi.fn(() => ({
     transport: 'http',
     port: 3000,
@@ -40,7 +41,9 @@ describe('TokenManager', () => {
     password: 'testpass',
     database: '*LOCAL',
     schema: 'TESTLIB',
+    driver: 'jt400',
     jdbcOptions: {},
+    odbcOptions: {},
   };
 
   beforeEach(() => {
@@ -74,6 +77,28 @@ describe('TokenManager', () => {
       const result = tokenManager.createSession(mockConfig, 1800);
 
       expect(result.expiresIn).toBe(1800);
+    });
+
+    it('should not let a custom duration exceed MCP_TOKEN_EXPIRY', () => {
+      const result = tokenManager.createSession(mockConfig, 86400);
+
+      expect(result.expiresIn).toBe(3600);
+    });
+
+    it('should release resources when an expired token is presented', () => {
+      vi.useFakeTimers();
+      try {
+        const cleanup = vi.fn();
+        tokenManager.setCleanupCallback(cleanup);
+        const { token } = tokenManager.createSession(mockConfig, 60);
+
+        vi.advanceTimersByTime(61_000);
+
+        expect(tokenManager.validateToken(token).valid).toBe(false);
+        expect(cleanup).toHaveBeenCalledWith(token);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -148,17 +173,6 @@ describe('TokenManager', () => {
   describe('canCreateSession', () => {
     it('should return true when under limit', () => {
       expect(tokenManager.canCreateSession()).toBe(true);
-    });
-  });
-
-  describe('setMcpSessionId', () => {
-    it('should associate MCP session ID with token', () => {
-      const { token } = tokenManager.createSession(mockConfig);
-      
-      tokenManager.setMcpSessionId(token, 'mcp-session-123');
-      
-      const session = tokenManager.getSession(token);
-      expect(session?.mcpSessionId).toBe('mcp-session-123');
     });
   });
 });

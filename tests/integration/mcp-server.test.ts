@@ -6,9 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { Client, InMemoryTransport, type CallToolResult } from '@modelcontextprotocol/client';
 
 // Mock node-jt400 before importing modules that use it
 const mockQuery = vi.fn();
@@ -36,8 +34,9 @@ vi.mock('../../src/utils/rateLimiter.js', async (importOriginal) => {
 });
 
 // Now import the server after mocks are set up
+import { TOOL_NAMES } from '../../src/config.js';
 import { createServer } from '../../src/server.js';
-import { initializePool } from '../../src/db/connection.js';
+import { closeSessionPool, initializePool, initializeSessionPool } from '../../src/db/connection.js';
 import { getRateLimiter } from '../../src/utils/rateLimiter.js';
 
 describe('MCP Server Integration', () => {
@@ -55,9 +54,11 @@ describe('MCP Server Integration', () => {
     process.env = {
       ...originalEnv,
       DB2I_HOSTNAME: 'test-host',
+      DB2I_DRIVER: 'jt400',
       DB2I_USERNAME: 'test-user',
       DB2I_PASSWORD: 'test-pass',
       DB2I_SCHEMA: 'TESTLIB',
+      QUERY_PARSE_CHECK: 'false',
     };
 
     // Initialize the connection pool (uses mocked node-jt400)
@@ -68,7 +69,9 @@ describe('MCP Server Integration', () => {
       password: 'test-pass',
       database: '*LOCAL',
       schema: 'TESTLIB',
+      driver: 'jt400',
       jdbcOptions: {},
+      odbcOptions: {},
     });
 
     // Create linked transports for in-memory communication
@@ -94,19 +97,27 @@ describe('MCP Server Integration', () => {
   });
 
   describe('Tool Discovery', () => {
-    it('should list all 7 registered tools', async () => {
+    it('should list every built-in tool', async () => {
       const { tools } = await client.listTools();
 
-      expect(tools).toHaveLength(7);
+      expect(tools).toHaveLength(TOOL_NAMES.length);
 
       const toolNames = tools.map((t) => t.name);
       expect(toolNames).toContain('execute_query');
+      expect(toolNames).toContain('get_business_context');
       expect(toolNames).toContain('list_schemas');
       expect(toolNames).toContain('list_tables');
+      expect(toolNames).toContain('search_tables');
+      expect(toolNames).toContain('search_columns');
       expect(toolNames).toContain('describe_table');
       expect(toolNames).toContain('list_views');
       expect(toolNames).toContain('list_indexes');
       expect(toolNames).toContain('get_table_constraints');
+      expect(toolNames).toContain('validate_query');
+      expect(toolNames).toContain('get_object_ddl');
+      expect(toolNames).toContain('get_related_objects');
+      expect(toolNames).toContain('get_journal_info');
+      expect(toolNames).toContain('profile_table');
     });
 
     it('should have correct metadata for execute_query tool', async () => {
@@ -124,7 +135,186 @@ describe('MCP Server Integration', () => {
       for (const tool of tools) {
         // The annotations should indicate read-only operations
         expect(tool.annotations?.readOnlyHint).toBe(true);
+        expect(tool.annotations?.destructiveHint).toBe(false);
+        expect(tool.annotations?.idempotentHint).toBe(true);
+        expect(tool.annotations?.openWorldHint).toBe(false);
       }
+    });
+
+    it('should declare outputSchema on all tools', async () => {
+      const { tools } = await client.listTools();
+
+      for (const tool of tools) {
+        expect(tool.outputSchema).toBeDefined();
+      }
+    });
+
+    it('should omit tools disabled via MCP_TOOLS_DISABLED', async () => {
+      process.env.MCP_TOOLS_DISABLED = 'execute_query';
+
+      const [filteredClientTransport, filteredServerTransport] = InMemoryTransport.createLinkedPair();
+      const filteredServer = createServer();
+      await filteredServer.connect(filteredServerTransport);
+      const filteredClient = new Client({ name: 'filtered-test', version: '1.0.0' });
+      await filteredClient.connect(filteredClientTransport);
+
+      const { tools } = await filteredClient.listTools();
+      const toolNames = tools.map((t) => t.name);
+      expect(toolNames).toHaveLength(TOOL_NAMES.length - 1);
+      expect(toolNames).not.toContain('execute_query');
+      expect(toolNames).toContain('list_schemas');
+
+      await filteredClient.close();
+      await filteredClientTransport.close();
+      await filteredServerTransport.close();
+    });
+  });
+
+  describe('Schema Allowlist', () => {
+    it('should reject a query that names a library outside QUERY_ALLOWED_SCHEMAS', async () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'TESTLIB';
+      mockQuery.mockResolvedValueOnce([{ ID: 1 }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM OTHERLIB.USERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      const errorText = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(errorText).toContain('OTHERLIB.USERS');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['list_tables', {}],
+      ['describe_table', { table: 'ORDERHDR' }],
+      ['list_views', {}],
+      ['list_indexes', { table: 'ORDERHDR' }],
+      ['get_table_constraints', { table: 'ORDERHDR' }],
+    ])('should reject %s for a library outside QUERY_ALLOWED_SCHEMAS', async (name, args) => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'TESTLIB';
+
+      const result = await client.callTool({
+        name,
+        arguments: { schema: 'OTHERLIB', ...args },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      const errorText = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(errorText).toBe('Schema OTHERLIB is not in the allowed schemas (TESTLIB).');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('should still use an allowed default schema when none is given', async () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'TESTLIB';
+      mockQuery.mockResolvedValueOnce([{ TABLE_NAME: 'ORDERS', TABLE_TYPE: 'T', TABLE_TEXT: null }]);
+
+      const result = await client.callTool({ name: 'list_tables', arguments: {} }) as CallToolResult;
+
+      expect(result.isError).toBeUndefined();
+      expect(mockQuery).toHaveBeenCalledWith(expect.any(String), expect.arrayContaining(['TESTLIB']));
+    });
+
+    it('should list only libraries in QUERY_ALLOWED_SCHEMAS', async () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'TESTLIB,QSYS2';
+      mockQuery.mockResolvedValueOnce([
+        { SCHEMA_NAME: 'OTHERLIB', SCHEMA_TEXT: null },
+        { SCHEMA_NAME: 'QSYS2', SCHEMA_TEXT: 'Catalog' },
+        { SCHEMA_NAME: 'TESTLIB', SCHEMA_TEXT: null },
+      ]);
+
+      const result = await client.callTool({ name: 'list_schemas', arguments: {} }) as CallToolResult;
+
+      const content = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+      expect(content.data.map((row: { schema_name: string }) => row.schema_name)).toEqual(['QSYS2', 'TESTLIB']);
+      expect(content.count).toBe(2);
+    });
+  });
+
+  describe('PARSE_STATEMENT check', () => {
+    it('should reject a statement that does not parse', async () => {
+      process.env.QUERY_PARSE_CHECK = 'true';
+      mockQuery.mockResolvedValueOnce([]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM MYLIB.ORDERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      const errorText = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(errorText).toContain('could not be parsed');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('PARSE_STATEMENT'),
+        expect.any(Array)
+      );
+    });
+
+    it('should reject a statement whose type is not a query', async () => {
+      process.env.QUERY_PARSE_CHECK = 'true';
+      mockQuery.mockResolvedValueOnce([
+        { NAME_TYPE: 'TABLE', SCHEMA: 'MYLIB', NAME: 'ORDERS', COLUMN_NAME: null, SQL_STATEMENT_TYPE: 'INSERT' },
+      ]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM MYLIB.ORDERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      const errorText = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(errorText).toContain('INSERT');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('should reject the query when PARSE_STATEMENT is missing', async () => {
+      process.env.QUERY_PARSE_CHECK = 'true';
+      mockQuery.mockRejectedValueOnce(new Error('PARSE_STATEMENT in QSYS2 type *N not found. SQL0204'));
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM MYLIB.ORDERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      const errorText = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(errorText).toContain('QUERY_PARSE_CHECK=false');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('Row limit', () => {
+    it('uses QUERY_DEFAULT_LIMIT when the call passes no limit', async () => {
+      process.env.QUERY_DEFAULT_LIMIT = '5';
+      mockQuery.mockResolvedValueOnce([{ ID: 1 }]);
+
+      await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM MYLIB.ORDERS' },
+      });
+
+      const [sql] = mockQuery.mock.calls[0] as [string];
+      expect(sql).toContain('FETCH FIRST 5 ROWS ONLY');
+    });
+  });
+
+  describe('Response Format', () => {
+    it('should render row results as a markdown table when MCP_RESPONSE_FORMAT=markdown', async () => {
+      process.env.MCP_RESPONSE_FORMAT = 'markdown';
+      const mockRows = [{ ID: 1, NAME: 'Alice' }];
+      mockQuery.mockResolvedValueOnce(mockRows);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM MYLIB.USERS' },
+      }) as CallToolResult;
+
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).toContain('| ID | NAME |');
+      expect(text).toContain('| 1 | Alice |');
+      expect(result.structuredContent).toMatchObject({ success: true, data: mockRows });
     });
   });
 
@@ -151,6 +341,11 @@ describe('MCP Server Integration', () => {
       expect(content.success).toBe(true);
       expect(content.data).toEqual(mockRows);
       expect(content.rowCount).toBe(2);
+      expect(result.structuredContent).toMatchObject({
+        success: true,
+        data: mockRows,
+        rowCount: 2,
+      });
     });
 
     it('should reject dangerous queries (SQL injection attempt)', async () => {
@@ -206,6 +401,44 @@ describe('MCP Server Integration', () => {
       // Check that the query was modified to include FETCH FIRST
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining('FETCH FIRST 50 ROWS ONLY'),
+        expect.any(Array)
+      );
+    });
+
+    it('should apply FETCH FIRST when a column name contains LIMIT', async () => {
+      mockQuery.mockResolvedValueOnce([{ CREDIT_LIMIT: 5000 }]);
+
+      await client.callTool({
+        name: 'execute_query',
+        arguments: {
+          sql: 'SELECT CREDIT_LIMIT FROM MYLIB.ACCOUNTS',
+          limit: 25,
+        },
+      });
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('FETCH FIRST 25 ROWS ONLY'),
+        expect.any(Array)
+      );
+    });
+
+    it('should clamp an oversized FETCH FIRST in the SQL text', async () => {
+      mockQuery.mockResolvedValueOnce([{ ID: 1 }]);
+
+      await client.callTool({
+        name: 'execute_query',
+        arguments: {
+          sql: 'SELECT * FROM MYLIB.USERS FETCH FIRST 10000000 ROWS ONLY',
+          limit: 100,
+        },
+      });
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('FETCH FIRST 100 ROWS ONLY'),
+        expect.any(Array)
+      );
+      expect(mockQuery).not.toHaveBeenCalledWith(
+        expect.stringContaining('10000000'),
         expect.any(Array)
       );
     });
@@ -295,6 +528,67 @@ describe('MCP Server Integration', () => {
       expect(mockQuery).toHaveBeenCalledWith(
         expect.any(String),
         expect.arrayContaining(['TESTLIB'])
+      );
+    });
+  });
+
+  describe('search_tables Tool', () => {
+    it('should return tables matching the filter', async () => {
+      mockQuery.mockResolvedValueOnce([
+        { TABLE_SCHEMA: 'MYLIB', TABLE_NAME: 'ORDERS', TABLE_TYPE: 'T', TABLE_TEXT: 'Order lines' },
+      ]);
+
+      const result = await client.callTool({
+        name: 'search_tables',
+        arguments: { filter: 'ORDER*', schema: 'MYLIB' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBeUndefined();
+      const content = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+      expect(content.success).toBe(true);
+      expect(content.data).toEqual([
+        { schema_name: 'MYLIB', table_name: 'ORDERS', table_type: 'T', table_text: 'Order lines' },
+      ]);
+      expect(content.truncated).toBe(false);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('QSYS2.SYSTABLES'),
+        expect.arrayContaining(['ORDER%', 'MYLIB'])
+      );
+    });
+  });
+
+  describe('search_columns Tool', () => {
+    it('should return columns matching the filter', async () => {
+      mockQuery.mockResolvedValueOnce([
+        {
+          TABLE_SCHEMA: 'MYLIB',
+          TABLE_NAME: 'ORDERS',
+          COLUMN_NAME: 'ITEMNO',
+          SYSTEM_COLUMN_NAME: 'ITEMNO',
+          DATA_TYPE: 'CHAR',
+          LENGTH: 15,
+          NUMERIC_SCALE: 0,
+          COLUMN_TEXT: 'Item',
+        },
+      ]);
+
+      const result = await client.callTool({
+        name: 'search_columns',
+        arguments: { filter: 'ITEMNO', schema: 'MYLIB' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBeUndefined();
+      const content = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+      expect(content.success).toBe(true);
+      expect(content.data[0]).toMatchObject({
+        schema_name: 'MYLIB',
+        table_name: 'ORDERS',
+        column_name: 'ITEMNO',
+        column_text: 'Item',
+      });
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('QSYS2.SYSCOLUMNS'),
+        expect.arrayContaining(['%ITEMNO%', 'MYLIB'])
       );
     });
   });
@@ -514,6 +808,69 @@ describe('MCP Server Integration', () => {
       await newClient.close();
       await newClientTransport.close();
       await newServerTransport.close();
+    });
+
+    it('should key the rate limiter by session or stdio', async () => {
+      const checkLimit = vi.fn(() => ({ allowed: true, remaining: 99 }));
+      const mockRateLimiter = getRateLimiter as ReturnType<typeof vi.fn>;
+      mockRateLimiter.mockReturnValue({
+        checkLimit,
+        formatError: vi.fn(),
+      });
+
+      mockQuery.mockResolvedValue([{ ID: 1 }]);
+
+      const stdioResult = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT 1 FROM SYSIBM.SYSDUMMY1' },
+      }) as CallToolResult;
+      expect(stdioResult.isError).toBeUndefined();
+      expect(checkLimit).toHaveBeenCalledWith('stdio');
+
+      const [sessionClientTransport, sessionServerTransport] = InMemoryTransport.createLinkedPair();
+      initializeSessionPool('session-token-abc');
+      const sessionServer = createServer({
+        sessionId: 'session-token-abc',
+        binding: {
+          system: 'default',
+          config: {
+            hostname: 'test-host',
+            port: 446,
+            username: 'test-user',
+            password: 'test-pass',
+            database: '*LOCAL',
+            schema: 'TESTLIB',
+            driver: 'jt400',
+            jdbcOptions: {},
+            odbcOptions: {},
+          },
+        },
+      });
+      await sessionServer.connect(sessionServerTransport);
+      const sessionClient = new Client({ name: 'session-test', version: '1.0.0' });
+      await sessionClient.connect(sessionClientTransport);
+
+      await sessionClient.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT 1 FROM SYSIBM.SYSDUMMY1' },
+      });
+      expect(checkLimit).toHaveBeenCalledWith('session-token-abc');
+
+      await sessionClient.close();
+      await sessionClientTransport.close();
+      await sessionServerTransport.close();
+      await closeSessionPool('session-token-abc');
+
+      mockRateLimiter.mockReset();
+      mockRateLimiter.mockImplementation(() => ({
+        checkLimit: vi.fn(() => ({ allowed: true, remaining: 99 })),
+        formatError: vi.fn(() => ({
+          error: 'Rate limit exceeded',
+          waitTimeSeconds: 60,
+          limit: 100,
+          windowMs: 900000,
+        })),
+      }));
     });
   });
 

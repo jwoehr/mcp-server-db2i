@@ -64,11 +64,22 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Database Driver
+      description: The value of DB2I_DRIVER, or the profile's driver
+      options:
+        - odbc (default)
+        - jt400
+    validations:
+      required: true
+
   - type: input
     id: node-version
     attributes:
       label: Node.js Version
-      placeholder: "20.x"
+      placeholder: "22.x"
 
   - type: input
     id: ibm-i-version

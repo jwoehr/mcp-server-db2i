@@ -14,6 +14,23 @@ import {
   validateHostname,
   getQueryLimitConfig,
   applyQueryLimit,
+  getEnabledTools,
+  getResponseFormat,
+  getAllowedSchemas,
+  isQueryParseCheckEnabled,
+  isCustomToolsWatchEnabled,
+  assertCustomToolsWatch,
+  getAuditConfig,
+  getAuthAllowedDbHosts,
+  hostnameOf,
+  jdbcConnectionSecurity,
+  odbcConnectionSecurity,
+  connectionSecurity,
+  getDbDriver,
+  buildOdbcConnectionConfig,
+  serializeOdbcConnectionString,
+  assertExtendedMetadataAllowsMasking,
+  TOOL_NAMES,
   type DB2iConfig,
   type QueryLimitConfig,
 } from '../src/config.js';
@@ -456,7 +473,9 @@ describe('Config Module', () => {
       password: 'testpass',
       database: '*LOCAL',
       schema: '',
+      driver: 'jt400',
       jdbcOptions: {},
+      odbcOptions: {},
     };
 
     it('should include host, user, and password', () => {
@@ -475,6 +494,34 @@ describe('Config Module', () => {
     it('should add default date format', () => {
       const connConfig = buildConnectionConfig(baseConfig);
       expect(connConfig['date format']).toBe('iso');
+    });
+
+    it('should not add a default naming when the option uses other casing', () => {
+      const connConfig = buildConnectionConfig({ ...baseConfig, jdbcOptions: { Naming: 'sql' } });
+      expect(connConfig['naming']).toBeUndefined();
+      expect(connConfig['Naming']).toBe('sql');
+    });
+
+    it('should default the driver access mode to read only', () => {
+      const connConfig = buildConnectionConfig(baseConfig);
+      expect(connConfig['access']).toBe('read only');
+    });
+
+    it('should omit access when readOnly is false', () => {
+      const connConfig = buildConnectionConfig(
+        { ...baseConfig, jdbcOptions: { access: 'read only' } },
+        { readOnly: false }
+      );
+      expect(connConfig['access']).toBeUndefined();
+    });
+
+    it('should keep an explicit access option', () => {
+      const connConfig = buildConnectionConfig({
+        ...baseConfig,
+        jdbcOptions: { access: 'all' },
+      });
+      expect(connConfig['access']).toBe('all');
+      expect(connConfig['Access']).toBeUndefined();
     });
 
     it('should not override user-specified naming', () => {
@@ -512,6 +559,273 @@ describe('Config Module', () => {
       // Defaults should still be present
       expect(connConfig['naming']).toBe('system');
       expect(connConfig['date format']).toBe('iso');
+    });
+
+    it('should use the schema as the library list when libraries is not set', () => {
+      const connConfig = buildConnectionConfig({ ...baseConfig, schema: 'MYLIB' });
+      expect(connConfig['libraries']).toBe('MYLIB');
+    });
+
+    it('should not set libraries when no schema is configured', () => {
+      const connConfig = buildConnectionConfig(baseConfig);
+      expect(connConfig['libraries']).toBeUndefined();
+    });
+
+    it('should keep an explicit libraries option over the schema', () => {
+      const connConfig = buildConnectionConfig({
+        ...baseConfig,
+        schema: 'MYLIB',
+        jdbcOptions: { Libraries: 'OTHERLIB' },
+      });
+      expect(connConfig['libraries']).toBeUndefined();
+      expect(connConfig['Libraries']).toBe('OTHERLIB');
+    });
+  });
+
+  describe('jdbcConnectionSecurity', () => {
+    it('should report TLS as disabled when secure is unset', () => {
+      delete process.env.DB2I_JDBC_OPTIONS;
+      expect(jdbcConnectionSecurity().secure).toBe(false);
+      expect(jdbcConnectionSecurity().accessOverride).toBeUndefined();
+    });
+
+    it('should report an explicit access override and secure=true', () => {
+      const security = jdbcConnectionSecurity({ access: 'all', secure: 'true' });
+      expect(security.accessOverride).toBe('all');
+      expect(security.secure).toBe(true);
+    });
+  });
+
+  describe('getDbDriver', () => {
+    it('should default to odbc', () => {
+      delete process.env.DB2I_DRIVER;
+      expect(getDbDriver()).toBe('odbc');
+      process.env.DB2I_DRIVER = '';
+      expect(getDbDriver()).toBe('odbc');
+    });
+
+    it('should accept jt400 in any case', () => {
+      process.env.DB2I_DRIVER = 'JT400';
+      expect(getDbDriver()).toBe('jt400');
+      delete process.env.DB2I_DRIVER;
+    });
+
+    it('should accept odbc in any case', () => {
+      process.env.DB2I_DRIVER = 'ODBC';
+      expect(getDbDriver()).toBe('odbc');
+      delete process.env.DB2I_DRIVER;
+    });
+
+    it('should reject an unknown driver', () => {
+      process.env.DB2I_DRIVER = 'mapepire';
+      expect(() => getDbDriver()).toThrow('Invalid DB2I_DRIVER value: "mapepire"');
+      delete process.env.DB2I_DRIVER;
+    });
+
+    it('should populate driver and odbcOptions in loadConfig', () => {
+      process.env.DB2I_HOSTNAME = 'host';
+      process.env.DB2I_USERNAME = 'user';
+      process.env.DB2I_PASSWORD = 'pass';
+      process.env.DB2I_DRIVER = 'odbc';
+      process.env.DB2I_ODBC_OPTIONS = 'SSL=1; DBQ=,LIB1,LIB2';
+      const config = loadConfig();
+      expect(config.driver).toBe('odbc');
+      expect(config.odbcOptions).toEqual({ SSL: '1', DBQ: ',LIB1,LIB2' });
+      delete process.env.DB2I_DRIVER;
+      delete process.env.DB2I_ODBC_OPTIONS;
+    });
+  });
+
+  describe('buildOdbcConnectionConfig', () => {
+    const baseConfig: DB2iConfig = {
+      hostname: 'myhost.example.com',
+      port: 446,
+      username: 'TESTUSER',
+      password: 'testpass',
+      database: '*LOCAL',
+      schema: '',
+      driver: 'odbc',
+      jdbcOptions: {},
+      odbcOptions: {},
+    };
+
+    it('should set the driver, system and credentials', () => {
+      const keywords = buildOdbcConnectionConfig(baseConfig);
+      expect(keywords['DRIVER']).toBe('IBM i Access ODBC Driver');
+      expect(keywords['SYSTEM']).toBe('myhost.example.com');
+      expect(keywords['UID']).toBe('TESTUSER');
+      expect(keywords['PWD']).toBe('testpass');
+    });
+
+    it('should not pass the DRDA port or database name', () => {
+      const keywords = buildOdbcConnectionConfig(baseConfig);
+      expect(Object.keys(keywords)).not.toContain('PORT');
+      expect(Object.keys(keywords)).not.toContain('DATABASE');
+    });
+
+    it('should default to system naming, ISO dates and trimmed CHAR columns', () => {
+      const keywords = buildOdbcConnectionConfig(baseConfig);
+      expect(keywords['NAM']).toBe('1');
+      expect(keywords['DFT']).toBe('5');
+      expect(keywords['TRIMCHAR']).toBe('1');
+    });
+
+    it('should default the connection type to read only', () => {
+      expect(buildOdbcConnectionConfig(baseConfig)['CONNTYPE']).toBe('2');
+    });
+
+    it('should omit CONNTYPE when readOnly is false', () => {
+      const keywords = buildOdbcConnectionConfig(
+        { ...baseConfig, odbcOptions: { ConnectionType: '2' } },
+        { readOnly: false }
+      );
+      expect(keywords['CONNTYPE']).toBeUndefined();
+      expect(keywords['ConnectionType']).toBeUndefined();
+    });
+
+    it('should keep an explicit connection type on the query connection', () => {
+      const keywords = buildOdbcConnectionConfig({
+        ...baseConfig,
+        odbcOptions: { ConnectionType: '0' },
+      });
+      expect(keywords['ConnectionType']).toBe('0');
+      expect(keywords['CONNTYPE']).toBeUndefined();
+    });
+
+    it('should not override naming, date format or trimming aliases', () => {
+      const keywords = buildOdbcConnectionConfig({
+        ...baseConfig,
+        odbcOptions: { Naming: '0', DateFormat: '4', TrimCharFields: '0' },
+      });
+      expect(keywords['NAM']).toBeUndefined();
+      expect(keywords['DFT']).toBeUndefined();
+      expect(keywords['TRIMCHAR']).toBeUndefined();
+      expect(keywords['Naming']).toBe('0');
+    });
+
+    it('should omit the default driver when a DSN or DRIVER is given', () => {
+      expect(buildOdbcConnectionConfig({ ...baseConfig, odbcOptions: { DSN: 'MYDSN' } })['DRIVER']).toBeUndefined();
+      expect(
+        buildOdbcConnectionConfig({ ...baseConfig, odbcOptions: { Driver: 'Other' } })['DRIVER']
+      ).toBeUndefined();
+    });
+
+    it('should use the schema as the library list when DBQ is not set', () => {
+      expect(buildOdbcConnectionConfig({ ...baseConfig, schema: 'MYLIB' })['DBQ']).toBe('MYLIB');
+      expect(buildOdbcConnectionConfig(baseConfig)['DBQ']).toBeUndefined();
+    });
+
+    it('should keep an explicit library list over the schema', () => {
+      const keywords = buildOdbcConnectionConfig({
+        ...baseConfig,
+        schema: 'MYLIB',
+        odbcOptions: { DefaultLibraries: ',OTHERLIB' },
+      });
+      expect(keywords['DBQ']).toBeUndefined();
+      expect(keywords['DefaultLibraries']).toBe(',OTHERLIB');
+    });
+
+    it('should merge extra keywords after the defaults', () => {
+      const keywords = buildOdbcConnectionConfig({
+        ...baseConfig,
+        odbcOptions: { SSL: '1', CCSID: '1208' },
+      });
+      expect(keywords['SSL']).toBe('1');
+      expect(keywords['CCSID']).toBe('1208');
+      expect(keywords['NAM']).toBe('1');
+    });
+  });
+
+  describe('serializeOdbcConnectionString', () => {
+    it('should join keywords with semicolons', () => {
+      expect(serializeOdbcConnectionString({ DRIVER: 'IBM i Access ODBC Driver', NAM: '1' })).toBe(
+        'DRIVER=IBM i Access ODBC Driver;NAM=1'
+      );
+    });
+
+    it('should brace values with special characters', () => {
+      expect(serializeOdbcConnectionString({ PWD: 'a;b=c', UID: ' x ' })).toBe(
+        'PWD={a;b=c};UID={ x }'
+      );
+    });
+
+    it('should reject a closing brace', () => {
+      expect(() => serializeOdbcConnectionString({ PWD: 'a}b' })).toThrow(
+        'ODBC connection keyword PWD contains "}"'
+      );
+    });
+  });
+
+  describe('odbcConnectionSecurity and connectionSecurity', () => {
+    it('should report TLS as off and no override by default', () => {
+      delete process.env.DB2I_ODBC_OPTIONS;
+      expect(odbcConnectionSecurity()).toEqual({ accessOverride: undefined, secure: false });
+    });
+
+    it('should report CONNTYPE as an override and SSL=1 as secure', () => {
+      const security = odbcConnectionSecurity({ ConnectionType: '0', ssl: '1' });
+      expect(security.accessOverride).toBe('0');
+      expect(security.secure).toBe(true);
+    });
+
+    it('should describe the jt400 driver', () => {
+      process.env.DB2I_JDBC_OPTIONS = 'secure=true';
+      const security = connectionSecurity('jt400');
+      expect(security).toMatchObject({
+        driver: 'jt400',
+        optionsVariable: 'DB2I_JDBC_OPTIONS',
+        secure: true,
+        secureHint: 'secure=true',
+      });
+      delete process.env.DB2I_JDBC_OPTIONS;
+    });
+
+    it('should describe the odbc driver from DB2I_DRIVER', () => {
+      process.env.DB2I_DRIVER = 'odbc';
+      process.env.DB2I_ODBC_OPTIONS = 'CONNTYPE=0';
+      const security = connectionSecurity();
+      expect(security).toMatchObject({
+        driver: 'odbc',
+        optionsVariable: 'DB2I_ODBC_OPTIONS',
+        accessOverride: '0',
+        secure: false,
+        secureHint: 'SSL=1',
+      });
+      delete process.env.DB2I_DRIVER;
+      delete process.env.DB2I_ODBC_OPTIONS;
+    });
+  });
+
+  describe('hostnameOf', () => {
+    it('should strip a port, brackets, and a trailing dot', () => {
+      expect(hostnameOf('App.Example.com:3000')).toBe('app.example.com');
+      expect(hostnameOf('[::1]:3000')).toBe('::1');
+      expect(hostnameOf('localhost.')).toBe('localhost');
+    });
+
+    it('should reject userinfo and paths', () => {
+      expect(hostnameOf('user@host')).toBeUndefined();
+      expect(hostnameOf('host/path')).toBeUndefined();
+    });
+  });
+
+  describe('getAuthAllowedDbHosts', () => {
+    it('should use DB2I_HOSTNAME when the allowlist is unset', () => {
+      delete process.env.MCP_AUTH_ALLOWED_DB_HOSTS;
+      process.env.DB2I_HOSTNAME = 'Public.Example.com';
+      expect(getAuthAllowedDbHosts()).toEqual(['public.example.com']);
+    });
+
+    it('should prefer an explicit allowlist', () => {
+      process.env.MCP_AUTH_ALLOWED_DB_HOSTS = 'one.example.com, two.example.com';
+      process.env.DB2I_HOSTNAME = 'public.example.com';
+      expect(getAuthAllowedDbHosts()).toEqual(['one.example.com', 'two.example.com']);
+    });
+
+    it('should be unrestricted when neither value is set', () => {
+      delete process.env.MCP_AUTH_ALLOWED_DB_HOSTS;
+      delete process.env.DB2I_HOSTNAME;
+      expect(getAuthAllowedDbHosts()).toBeNull();
     });
   });
 
@@ -556,6 +870,14 @@ describe('Config Module', () => {
       delete process.env.QUERY_DEFAULT_LIMIT;
       delete process.env.QUERY_MAX_LIMIT;
     });
+
+    it('should reject a limit that is not a whole number', () => {
+      process.env.QUERY_DEFAULT_LIMIT = 'abc';
+
+      expect(() => getQueryLimitConfig()).toThrow('QUERY_DEFAULT_LIMIT must be a whole number, got "abc"');
+
+      delete process.env.QUERY_DEFAULT_LIMIT;
+    });
   });
 
   describe('applyQueryLimit', () => {
@@ -585,6 +907,237 @@ describe('Config Module', () => {
 
     it('should handle edge case where requested equals max', () => {
       expect(applyQueryLimit(10000, testConfig)).toBe(10000);
+    });
+  });
+
+  describe('getEnabledTools', () => {
+    beforeEach(() => {
+      delete process.env.MCP_TOOLS_ENABLED;
+      delete process.env.MCP_TOOLS_DISABLED;
+    });
+
+    it('should enable all tools by default', () => {
+      expect(getEnabledTools()).toEqual([...TOOL_NAMES]);
+    });
+
+    it('should treat empty values as unset', () => {
+      process.env.MCP_TOOLS_ENABLED = '  ';
+      process.env.MCP_TOOLS_DISABLED = '';
+      expect(getEnabledTools()).toEqual([...TOOL_NAMES]);
+    });
+
+    it('should only enable allowlisted tools', () => {
+      process.env.MCP_TOOLS_ENABLED = 'list_schemas,describe_table';
+      expect(getEnabledTools()).toEqual(['list_schemas', 'describe_table']);
+    });
+
+    it('should drop denylisted tools', () => {
+      process.env.MCP_TOOLS_DISABLED = 'execute_query';
+      const tools = getEnabledTools();
+      expect(tools).not.toContain('execute_query');
+      expect(tools).toHaveLength(TOOL_NAMES.length - 1);
+    });
+
+    it('should drop search_columns when it is denylisted', () => {
+      process.env.MCP_TOOLS_DISABLED = 'search_columns';
+      const tools = getEnabledTools();
+      expect(tools).not.toContain('search_columns');
+      expect(tools).toContain('search_tables');
+    });
+
+    it('should enable and disable get_journal_info and profile_table by name', () => {
+      process.env.MCP_TOOLS_ENABLED = 'get_journal_info,profile_table,describe_table';
+      process.env.MCP_TOOLS_DISABLED = 'profile_table';
+      expect(getEnabledTools()).toEqual(['describe_table', 'get_journal_info']);
+    });
+
+    it('should apply the denylist after the allowlist', () => {
+      process.env.MCP_TOOLS_ENABLED = 'execute_query,list_tables';
+      process.env.MCP_TOOLS_DISABLED = 'execute_query';
+      expect(getEnabledTools()).toEqual(['list_tables']);
+    });
+
+    it('should ignore whitespace, case, and empty entries', () => {
+      process.env.MCP_TOOLS_ENABLED = ' List_Tables , ,LIST_VIEWS ';
+      expect(getEnabledTools()).toEqual(['list_tables', 'list_views']);
+    });
+
+    it('should keep registration order regardless of list order', () => {
+      process.env.MCP_TOOLS_ENABLED = 'get_table_constraints,execute_query';
+      expect(getEnabledTools()).toEqual(['execute_query', 'get_table_constraints']);
+    });
+
+    it('should throw on unknown names in MCP_TOOLS_ENABLED', () => {
+      process.env.MCP_TOOLS_ENABLED = 'list_tables,drop_table';
+      expect(() => getEnabledTools()).toThrow(/MCP_TOOLS_ENABLED: drop_table/);
+    });
+
+    it('should throw on unknown names in MCP_TOOLS_DISABLED', () => {
+      process.env.MCP_TOOLS_DISABLED = 'exec_query';
+      expect(() => getEnabledTools()).toThrow(/MCP_TOOLS_DISABLED: exec_query.*Valid tools: execute_query/);
+    });
+
+    it('should enable one custom toolset and skip the others', () => {
+      process.env.MCP_TOOLS_ENABLED = 'toolset:sales';
+      const custom = [
+        { name: 'search_sales_orders', toolset: 'sales' },
+        { name: 'list_purchase_orders', toolset: 'purchasing' },
+      ];
+      expect(getEnabledTools(custom)).toEqual(['search_sales_orders']);
+    });
+
+    it('should drop a denied toolset and keep built-in tools', () => {
+      process.env.MCP_TOOLS_DISABLED = 'toolset:sales';
+      const custom = [
+        { name: 'search_sales_orders', toolset: 'sales' },
+        { name: 'get_item', toolset: 'master' },
+      ];
+      const tools = getEnabledTools(custom);
+      expect(tools).toContain('execute_query');
+      expect(tools).toContain('get_item');
+      expect(tools).not.toContain('search_sales_orders');
+      expect(tools).toHaveLength(TOOL_NAMES.length + 1);
+    });
+
+    it('should let a denylist entry win over an allowlist entry', () => {
+      process.env.MCP_TOOLS_ENABLED = 'search_sales_orders,get_item';
+      process.env.MCP_TOOLS_DISABLED = 'toolset:sales';
+      const custom = [
+        { name: 'search_sales_orders', toolset: 'sales' },
+        { name: 'get_item', toolset: 'master' },
+      ];
+      expect(getEnabledTools(custom)).toEqual(['get_item']);
+    });
+
+    it('should throw on an unknown toolset', () => {
+      process.env.MCP_TOOLS_ENABLED = 'toolset:missing';
+      expect(() => getEnabledTools([{ name: 'get_item', toolset: 'master' }]))
+        .toThrow(/MCP_TOOLS_ENABLED: toolset:missing/);
+    });
+  });
+
+  describe('getResponseFormat', () => {
+    it('should default to json', () => {
+      delete process.env.MCP_RESPONSE_FORMAT;
+      expect(getResponseFormat()).toBe('json');
+    });
+
+    it('should accept pretty and markdown case-insensitively', () => {
+      process.env.MCP_RESPONSE_FORMAT = 'Pretty';
+      expect(getResponseFormat()).toBe('pretty');
+      process.env.MCP_RESPONSE_FORMAT = ' MARKDOWN ';
+      expect(getResponseFormat()).toBe('markdown');
+    });
+
+    it('should fall back to json for invalid values', () => {
+      process.env.MCP_RESPONSE_FORMAT = 'xml';
+      expect(getResponseFormat()).toBe('json');
+    });
+  });
+
+  describe('getAllowedSchemas', () => {
+    beforeEach(() => {
+      delete process.env.QUERY_ALLOWED_SCHEMAS;
+    });
+
+    it('should be off when unset or blank', () => {
+      expect(getAllowedSchemas()).toBeUndefined();
+      process.env.QUERY_ALLOWED_SCHEMAS = '  ,  ';
+      expect(getAllowedSchemas()).toBeUndefined();
+    });
+
+    it('should uppercase names and ignore surrounding whitespace', () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = ' mylib , QSYS2 ';
+      expect(getAllowedSchemas()).toEqual(['MYLIB', 'QSYS2']);
+    });
+
+    it('should drop duplicate names', () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'MYLIB,mylib';
+      expect(getAllowedSchemas()).toEqual(['MYLIB']);
+    });
+  });
+
+  describe('isQueryParseCheckEnabled', () => {
+    it('should be on by default', () => {
+      delete process.env.QUERY_PARSE_CHECK;
+      expect(isQueryParseCheckEnabled()).toBe(true);
+    });
+
+    it('should turn off for false and 0', () => {
+      process.env.QUERY_PARSE_CHECK = 'false';
+      expect(isQueryParseCheckEnabled()).toBe(false);
+      process.env.QUERY_PARSE_CHECK = '0';
+      expect(isQueryParseCheckEnabled()).toBe(false);
+    });
+
+    it('should stay on for other values', () => {
+      process.env.QUERY_PARSE_CHECK = 'true';
+      expect(isQueryParseCheckEnabled()).toBe(true);
+      process.env.QUERY_PARSE_CHECK = 'no';
+      expect(isQueryParseCheckEnabled()).toBe(true);
+    });
+  });
+
+  describe('isCustomToolsWatchEnabled', () => {
+    it('should be off unless set to true or 1', () => {
+      delete process.env.MCP_CUSTOM_TOOLS_WATCH;
+      expect(isCustomToolsWatchEnabled()).toBe(false);
+      process.env.MCP_CUSTOM_TOOLS_WATCH = 'false';
+      expect(isCustomToolsWatchEnabled()).toBe(false);
+      process.env.MCP_CUSTOM_TOOLS_WATCH = 'true';
+      expect(isCustomToolsWatchEnabled()).toBe(true);
+      process.env.MCP_CUSTOM_TOOLS_WATCH = '1';
+      expect(isCustomToolsWatchEnabled()).toBe(true);
+    });
+
+    it('should reject a watch with nothing to watch', () => {
+      process.env.MCP_CUSTOM_TOOLS_WATCH = 'true';
+      delete process.env.MCP_CUSTOM_TOOLS;
+      expect(() => assertCustomToolsWatch()).toThrow(/MCP_CUSTOM_TOOLS_WATCH is set but MCP_CUSTOM_TOOLS is empty/);
+      process.env.MCP_CUSTOM_TOOLS = '   ';
+      expect(() => assertCustomToolsWatch()).toThrow(/nothing to watch/);
+      process.env.MCP_CUSTOM_TOOLS = 'examples/erp-tools';
+      expect(() => assertCustomToolsWatch()).not.toThrow();
+      delete process.env.MCP_CUSTOM_TOOLS_WATCH;
+      delete process.env.MCP_CUSTOM_TOOLS;
+      expect(() => assertCustomToolsWatch()).not.toThrow();
+    });
+  });
+
+  describe('assertExtendedMetadataAllowsMasking', () => {
+    it('should reject extended metadata when masking is loaded', () => {
+      process.env.DB2I_DRIVER = 'jt400';
+      delete process.env.DB2I_JDBC_OPTIONS;
+      expect(() => assertExtendedMetadataAllowsMasking(true)).not.toThrow();
+      process.env.DB2I_JDBC_OPTIONS = 'extended metadata=true';
+      expect(() => assertExtendedMetadataAllowsMasking(true)).toThrow(/extended metadata=true/);
+      expect(() => assertExtendedMetadataAllowsMasking(false)).not.toThrow();
+      delete process.env.DB2I_DRIVER;
+      delete process.env.DB2I_JDBC_OPTIONS;
+    });
+
+    it('should not apply to the odbc driver', () => {
+      process.env.DB2I_JDBC_OPTIONS = 'extended metadata=true';
+      expect(() => assertExtendedMetadataAllowsMasking(true, 'odbc')).not.toThrow();
+      process.env.DB2I_DRIVER = 'odbc';
+      expect(() => assertExtendedMetadataAllowsMasking(true)).not.toThrow();
+      delete process.env.DB2I_DRIVER;
+      expect(() => assertExtendedMetadataAllowsMasking(true)).not.toThrow();
+      delete process.env.DB2I_JDBC_OPTIONS;
+    });
+  });
+
+  describe('getAuditConfig', () => {
+    it('should be off when MCP_AUDIT_LOG is unset', () => {
+      delete process.env.MCP_AUDIT_LOG;
+      delete process.env.MCP_AUDIT_SQL;
+      expect(getAuditConfig()).toBeUndefined();
+    });
+
+    it('should reject an unknown SQL mode', () => {
+      process.env.MCP_AUDIT_SQL = 'raw';
+      expect(() => getAuditConfig()).toThrow(/MCP_AUDIT_SQL must be "hash" or "full"/);
+      delete process.env.MCP_AUDIT_SQL;
     });
   });
 });

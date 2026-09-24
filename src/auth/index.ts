@@ -8,7 +8,6 @@
 export type {
   AuthRequest,
   AuthResponse,
-  AuthErrorResponse,
   TokenSession,
   TokenValidationResult,
   AuthValidationResult,
@@ -20,9 +19,8 @@ export { getTokenManager, TokenManager, type SessionCleanupCallback } from './to
 // Middleware
 export {
   authMiddleware,
-  optionalAuthMiddleware,
+  extractBearerToken,
   authRateLimitMiddleware,
-  recordFailedAuthAttempt,
   clearAuthRateLimit,
   type AuthenticatedRequest,
 } from './authMiddleware.js';

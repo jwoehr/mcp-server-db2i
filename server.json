@@ -1,0 +1,70 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Strom-Capital/mcp-server-db2i",
+  "title": "IBM DB2 for i",
+  "description": "Read-only SQL queries and schema inspection for IBM Db2 for i over ODBC, JT400 or Mapepire (SSH).",
+  "repository": {
+    "url": "https://github.com/Strom-Capital/mcp-server-db2i",
+    "source": "github"
+  },
+  "version": "2.7.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "mcp-server-db2i",
+      "version": "2.7.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "DB2I_HOSTNAME",
+          "description": "IBM i hostname or IPv4 address",
+          "isRequired": true,
+          "placeholder": "ibmi.example.com"
+        },
+        {
+          "name": "DB2I_USERNAME",
+          "description": "IBM i user profile",
+          "isRequired": true
+        },
+        {
+          "name": "DB2I_PASSWORD",
+          "description": "IBM i password",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "DB2I_SCHEMA",
+          "description": "Default schema (library)",
+          "placeholder": "MYLIB"
+        },
+        {
+          "name": "DB2I_PROFILES",
+          "description": "Path to a YAML file of IBM i systems. When set, it replaces the DB2I_* connection variables"
+        },
+        {
+          "name": "QUERY_ALLOWED_SCHEMAS",
+          "description": "Comma-separated schemas the server may read. Empty disables the check.",
+          "placeholder": "MYLIB,OTHERLIB"
+        },
+        {
+          "name": "DB2I_DRIVER",
+          "description": "Database driver: odbc (default, IBM i Access ODBC driver, no Java) or jt400 (optional node-jt400 package, needs a JDK at install and a JRE at runtime)",
+          "isRequired": false,
+          "default": "odbc"
+        },
+        {
+          "name": "DB2I_JDBC_OPTIONS",
+          "description": "Extra JT400 JDBC properties, semicolon-separated (jt400 driver)",
+          "isRequired": false
+        },
+        {
+          "name": "DB2I_ODBC_OPTIONS",
+          "description": "Extra IBM i Access ODBC connection keywords, semicolon-separated (odbc driver)",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

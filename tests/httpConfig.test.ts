@@ -54,9 +54,16 @@ describe('HTTP Configuration', () => {
   });
 
   describe('getSessionMode', () => {
-    it('should default to stateful', async () => {
+    it('should default to stateless', async () => {
       delete process.env.MCP_SESSION_MODE;
       
+      const { getSessionMode } = await import('../src/config.js');
+      expect(getSessionMode()).toBe('stateless');
+    });
+
+    it('should return stateful when explicitly set', async () => {
+      process.env.MCP_SESSION_MODE = 'stateful';
+
       const { getSessionMode } = await import('../src/config.js');
       expect(getSessionMode()).toBe('stateful');
     });
@@ -123,16 +130,32 @@ describe('HTTP Configuration', () => {
       delete process.env.MCP_TOKEN_EXPIRY;
       delete process.env.MCP_MAX_SESSIONS;
       delete process.env.MCP_TLS_ENABLED;
+      delete process.env.MCP_ALLOWED_HOSTS;
+      delete process.env.MCP_ALLOW_UNAUTHENTICATED_HTTP;
 
       const { getHttpConfig } = await import('../src/config.js');
       const config = getHttpConfig();
 
       expect(config.port).toBe(3000);
       expect(config.host).toBe('127.0.0.1');
-      expect(config.sessionMode).toBe('stateful');
+      expect(config.sessionMode).toBe('stateless');
       expect(config.tokenExpiry).toBe(3600);
       expect(config.maxSessions).toBe(100);
       expect(config.tls.enabled).toBe(false);
+      expect(config.allowedHosts).toEqual(expect.arrayContaining(['localhost', '127.0.0.1', '::1']));
+      expect(config.allowUnauthenticatedHttp).toBe(false);
+    });
+
+    it('should add MCP_ALLOWED_HOSTS and keep loopback', async () => {
+      process.env.MCP_ALLOWED_HOSTS = 'App.Example.com';
+      process.env.MCP_HTTP_HOST = '0.0.0.0';
+
+      const { getHttpConfig } = await import('../src/config.js');
+      const config = getHttpConfig();
+
+      expect(config.allowedHosts).toContain('app.example.com');
+      expect(config.allowedHosts).toContain('127.0.0.1');
+      expect(config.allowedHosts).not.toContain('0.0.0.0');
     });
 
     it('should respect custom port', async () => {

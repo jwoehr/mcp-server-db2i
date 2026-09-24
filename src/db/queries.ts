@@ -3,15 +3,7 @@
  */
 
 import { executeQuery } from './connection.js';
-import {
-  SqlSecurityValidator,
-  validateQuery as validateSqlQuery,
-  type SecurityValidationResult,
-  type SecurityConfig,
-} from '../utils/security/sqlSecurityValidator.js';
-
-// Re-export for backwards compatibility and convenience
-export { SqlSecurityValidator, validateSqlQuery, type SecurityValidationResult, type SecurityConfig };
+import type { DbTarget } from '../systems.js';
 
 /**
  * Convert a filter pattern to SQL LIKE pattern
@@ -41,37 +33,12 @@ export function filterToLikePattern(filter: string | undefined): string {
 }
 
 /**
- * Validate that a query is read-only (SELECT only)
- * 
- * Uses the enhanced SqlSecurityValidator with AST parsing and regex fallback
- * for comprehensive security validation.
- * 
- * @param sql - SQL query to validate
- * @returns true if the query is safe to execute, false otherwise
- */
-export function isReadOnlyQuery(sql: string): boolean {
-  const result = SqlSecurityValidator.validateQuery(sql);
-  return result.isValid;
-  }
-
-/**
- * Validate a query and return detailed results including any violations
- * 
- * @param sql - SQL query to validate
- * @param config - Optional security configuration
- * @returns Detailed validation result with violations
- */
-export function validateQuery(sql: string, config?: SecurityConfig): SecurityValidationResult {
-  return SqlSecurityValidator.validateQuery(sql, config);
-}
-
-/**
  * List all schemas/libraries
  * 
  * @param filter - Optional filter pattern
- * @param sessionId - Optional session ID for HTTP transport
+ * @param target - Caller and system to query
  */
-export async function listSchemas(filter?: string, sessionId?: string): Promise<Array<{ schema_name: string; schema_text: string | null }>> {
+export async function listSchemas(filter?: string, target?: DbTarget): Promise<Array<{ schema_name: string; schema_text: string | null }>> {
   const pattern = filterToLikePattern(filter);
   
   const sql = `
@@ -83,7 +50,7 @@ export async function listSchemas(filter?: string, sessionId?: string): Promise<
     ORDER BY SCHEMA_NAME
   `;
 
-  const result = await executeQuery(sql, [pattern], sessionId);
+  const result = await executeQuery(sql, [pattern], target);
   
   return result.rows.map(row => ({
     schema_name: String(row.SCHEMA_NAME || '').trim(),
@@ -96,12 +63,12 @@ export async function listSchemas(filter?: string, sessionId?: string): Promise<
  * 
  * @param schema - Schema name
  * @param filter - Optional filter pattern
- * @param sessionId - Optional session ID for HTTP transport
+ * @param target - Caller and system to query
  */
 export async function listTables(
   schema: string,
   filter?: string,
-  sessionId?: string
+  target?: DbTarget
 ): Promise<Array<{ table_name: string; table_type: string; table_text: string | null }>> {
   const pattern = filterToLikePattern(filter);
   
@@ -116,7 +83,7 @@ export async function listTables(
     ORDER BY TABLE_NAME
   `;
 
-  const result = await executeQuery(sql, [schema.toUpperCase(), pattern], sessionId);
+  const result = await executeQuery(sql, [schema.toUpperCase(), pattern], target);
   
   return result.rows.map(row => ({
     table_name: String(row.TABLE_NAME || '').trim(),
@@ -130,12 +97,12 @@ export async function listTables(
  * 
  * @param schema - Schema name
  * @param table - Table name
- * @param sessionId - Optional session ID for HTTP transport
+ * @param target - Caller and system to query
  */
 export async function describeTable(
   schema: string,
   table: string,
-  sessionId?: string
+  target?: DbTarget
 ): Promise<Array<{
   column_name: string;
   ordinal_position: number;
@@ -166,7 +133,7 @@ export async function describeTable(
     ORDER BY ORDINAL_POSITION
   `;
 
-  const result = await executeQuery(sql, [schema.toUpperCase(), table.toUpperCase()], sessionId);
+  const result = await executeQuery(sql, [schema.toUpperCase(), table.toUpperCase()], target);
   
   return result.rows.map(row => ({
     column_name: String(row.COLUMN_NAME || '').trim(),
@@ -190,12 +157,12 @@ export async function describeTable(
  * 
  * @param schema - Schema name
  * @param filter - Optional filter pattern
- * @param sessionId - Optional session ID for HTTP transport
+ * @param target - Caller and system to query
  */
 export async function listViews(
   schema: string,
   filter?: string,
-  sessionId?: string
+  target?: DbTarget
 ): Promise<Array<{ view_name: string; view_text: string | null }>> {
   const pattern = filterToLikePattern(filter);
   
@@ -210,7 +177,7 @@ export async function listViews(
     ORDER BY TABLE_NAME
   `;
 
-  const result = await executeQuery(sql, [schema.toUpperCase(), pattern], sessionId);
+  const result = await executeQuery(sql, [schema.toUpperCase(), pattern], target);
   
   return result.rows.map(row => ({
     view_name: String(row.VIEW_NAME || '').trim(),
@@ -226,12 +193,12 @@ export async function listViews(
  * 
  * @param schema - Schema name
  * @param table - Table name
- * @param sessionId - Optional session ID for HTTP transport
+ * @param target - Caller and system to query
  */
 export async function listIndexes(
   schema: string,
   table: string,
-  sessionId?: string
+  target?: DbTarget
 ): Promise<Array<{
   index_name: string;
   index_schema: string;
@@ -257,7 +224,7 @@ export async function listIndexes(
     ORDER BY I.INDEX_NAME
   `;
 
-  const result = await executeQuery(sql, [schema.toUpperCase(), table.toUpperCase()], sessionId);
+  const result = await executeQuery(sql, [schema.toUpperCase(), table.toUpperCase()], target);
   
   return result.rows.map(row => ({
     index_name: String(row.INDEX_NAME || '').trim(),
@@ -272,12 +239,12 @@ export async function listIndexes(
  * 
  * @param schema - Schema name
  * @param table - Table name
- * @param sessionId - Optional session ID for HTTP transport
+ * @param target - Caller and system to query
  */
 export async function getTableConstraints(
   schema: string,
   table: string,
-  sessionId?: string
+  target?: DbTarget
 ): Promise<Array<{
   constraint_name: string;
   constraint_type: string;
@@ -312,7 +279,7 @@ export async function getTableConstraints(
     ORDER BY CST.CONSTRAINT_NAME, KC.ORDINAL_POSITION
   `;
 
-  const result = await executeQuery(sql, [schema.toUpperCase(), table.toUpperCase()], sessionId);
+  const result = await executeQuery(sql, [schema.toUpperCase(), table.toUpperCase()], target);
   
   return result.rows.map(row => ({
     constraint_name: String(row.CONSTRAINT_NAME || '').trim(),
@@ -323,4 +290,171 @@ export async function getTableConstraints(
     referenced_table_name: row.REFERENCED_TABLE_NAME ? String(row.REFERENCED_TABLE_NAME).trim() : null,
     referenced_column_name: row.REFERENCED_COLUMN_NAME ? String(row.REFERENCED_COLUMN_NAME).trim() : null,
   }));
+}
+
+/**
+ * Libraries a catalog search covers.
+ * `schemas` wins. Otherwise `excludeSystem` drops Q* and SYS* libraries.
+ */
+export interface CatalogSearchScope {
+  schemas?: string[];
+  excludeSystem: boolean;
+  /** Rows to return. The query reads one extra row to detect truncation. */
+  limit: number;
+}
+
+export interface CatalogSearchResult<T> {
+  rows: T[];
+  truncated: boolean;
+}
+
+export interface SearchColumnRow {
+  schema_name: string;
+  table_name: string;
+  column_name: string;
+  system_column_name: string;
+  data_type: string;
+  length: number | null;
+  numeric_scale: number | null;
+  column_text: string | null;
+}
+
+export interface SearchTableRow {
+  schema_name: string;
+  table_name: string;
+  table_type: string;
+  table_text: string | null;
+}
+
+function schemaPredicate(scope: CatalogSearchScope): { sql: string; params: string[] } {
+  if (scope.schemas && scope.schemas.length > 0) {
+    const placeholders = scope.schemas.map(() => '?').join(', ');
+    return {
+      sql: `AND TABLE_SCHEMA IN (${placeholders})`,
+      params: scope.schemas.map((name) => name.toUpperCase()),
+    };
+  }
+
+  if (scope.excludeSystem) {
+    return {
+      sql: "AND TABLE_SCHEMA NOT LIKE 'Q%' AND TABLE_SCHEMA NOT LIKE 'SYS%'",
+      params: [],
+    };
+  }
+
+  return { sql: '', params: [] };
+}
+
+/**
+ * FETCH FIRST count is a server-computed integer, never a bound value.
+ * One extra row tells the caller the cap hid more matches.
+ */
+function fetchFirst(limit: number): string {
+  const count = limit + 1;
+  if (!Number.isSafeInteger(count) || count < 2) {
+    throw new Error('Search limit must be a positive integer.');
+  }
+  return `FETCH FIRST ${count} ROWS ONLY`;
+}
+
+function capRows<T>(rows: T[], limit: number): CatalogSearchResult<T> {
+  if (rows.length > limit) {
+    return { rows: rows.slice(0, limit), truncated: true };
+  }
+  return { rows, truncated: false };
+}
+
+function textOrNull(value: unknown): string | null {
+  if (value == null) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+/**
+ * Find columns whose name, system name, or text matches the filter.
+ * The filter uses the same * wildcard syntax as the list tools.
+ */
+export async function searchColumns(
+  filter: string,
+  scope: CatalogSearchScope,
+  target?: DbTarget
+): Promise<CatalogSearchResult<SearchColumnRow>> {
+  const pattern = filterToLikePattern(filter);
+  const schemas = schemaPredicate(scope);
+
+  const sql = `
+    SELECT
+      TABLE_SCHEMA,
+      TABLE_NAME,
+      COLUMN_NAME,
+      SYSTEM_COLUMN_NAME,
+      DATA_TYPE,
+      LENGTH,
+      NUMERIC_SCALE,
+      COLUMN_TEXT
+    FROM QSYS2.SYSCOLUMNS
+    WHERE (
+      COLUMN_NAME LIKE ?
+      OR SYSTEM_COLUMN_NAME LIKE ?
+      OR UPPER(COLUMN_TEXT) LIKE ?
+    )
+    ${schemas.sql}
+    ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+    ${fetchFirst(scope.limit)}
+  `;
+
+  const result = await executeQuery(sql, [pattern, pattern, pattern, ...schemas.params], target);
+  const rows = result.rows.map((row) => ({
+    schema_name: String(row.TABLE_SCHEMA || '').trim(),
+    table_name: String(row.TABLE_NAME || '').trim(),
+    column_name: String(row.COLUMN_NAME || '').trim(),
+    system_column_name: String(row.SYSTEM_COLUMN_NAME || '').trim(),
+    data_type: String(row.DATA_TYPE || '').trim(),
+    length: row.LENGTH != null ? Number(row.LENGTH) : null,
+    numeric_scale: row.NUMERIC_SCALE != null ? Number(row.NUMERIC_SCALE) : null,
+    column_text: textOrNull(row.COLUMN_TEXT),
+  }));
+
+  return capRows(rows, scope.limit);
+}
+
+/**
+ * Find tables whose name, system name, or text matches the filter.
+ */
+export async function searchTables(
+  filter: string,
+  scope: CatalogSearchScope,
+  target?: DbTarget
+): Promise<CatalogSearchResult<SearchTableRow>> {
+  const pattern = filterToLikePattern(filter);
+  const schemas = schemaPredicate(scope);
+
+  const sql = `
+    SELECT
+      TABLE_SCHEMA,
+      TABLE_NAME,
+      TABLE_TYPE,
+      TABLE_TEXT
+    FROM QSYS2.SYSTABLES
+    WHERE (
+      TABLE_NAME LIKE ?
+      OR SYSTEM_TABLE_NAME LIKE ?
+      OR UPPER(TABLE_TEXT) LIKE ?
+    )
+    ${schemas.sql}
+    ORDER BY TABLE_SCHEMA, TABLE_NAME
+    ${fetchFirst(scope.limit)}
+  `;
+
+  const result = await executeQuery(sql, [pattern, pattern, pattern, ...schemas.params], target);
+  const rows = result.rows.map((row) => ({
+    schema_name: String(row.TABLE_SCHEMA || '').trim(),
+    table_name: String(row.TABLE_NAME || '').trim(),
+    table_type: String(row.TABLE_TYPE || '').trim(),
+    table_text: textOrNull(row.TABLE_TEXT),
+  }));
+
+  return capRows(rows, scope.limit);
 }
