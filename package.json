@@ -1,7 +1,7 @@
 {
   "name": "mcp-server-db2i",
   "mcpName": "io.github.Strom-Capital/mcp-server-db2i",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "MCP server for IBM DB2 for i (DB2i) database queries and metadata inspection",
   "type": "module",
   "main": "dist/index.js",
@@ -59,6 +59,7 @@
     "@modelcontextprotocol/client": "^2.1.0",
     "@types/express": "^5.0.6",
     "@types/node": "^22.20.4",
+    "@types/ssh2": "^1.15.6",
     "@vitest/coverage-v8": "^5.0.1",
     "eslint": "^10.11.0",
     "tsx": "^4.23.15",
@@ -78,7 +79,9 @@
     "LICENSE"
   ],
   "optionalDependencies": {
+    "@ibm/mapepire-js": "^1.0.0",
     "node-jt400": "^7.0.1",
-    "odbc": "^2.6.0"
+    "odbc": "^2.6.0",
+    "ssh2": "^1.17.0"
   }
 }
