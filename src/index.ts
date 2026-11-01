@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * IBM DB2i MCP Server
+ * IBM Db2i MCP Server
  *
  * A Model Context Protocol server for querying and inspecting
- * IBM DB2 for i (DB2i) databases through JT400 (JDBC) or IBM i Access ODBC,
+ * IBM Db2 for i (Db2i) databases through JT400 (JDBC) or IBM i Access ODBC,
  * on one or more IBM i systems (DB2I_PROFILES).
  * 
  * Supports two transport modes:
@@ -16,9 +16,7 @@
  * - 'both': Both transports simultaneously
  */
 
-import { serveStdio, type StdioServerHandle } from '@modelcontextprotocol/server/stdio';
-import type http from 'node:http';
-import type https from 'node:https';
+import { serveStdio } from '@modelcontextprotocol/server/stdio';
 
 import {
   isHttpEnabled,
@@ -32,65 +30,30 @@ import {
   isCustomToolsWatchEnabled,
   isQueryParseCheckEnabled,
   getQueryLimitConfig,
+  getQueryTimeoutSeconds,
+  getQueryMaxLength,
+  getBuildId,
 } from './config.js';
-import { initializePool, testConnection, closeGlobalPool } from './db/connection.js';
+import { initializePool, testConnection, closeGlobalPool, pendingPoolCloses } from './db/connection.js';
+import { findMissingDriverPackages, missingDriverPackagesMessage } from './db/driverPackages.js';
 import { defaultSystem, getSystems, isProfilesFileConfigured, type SystemProfile } from './systems.js';
 import { logger, flushLogger } from './utils/logger.js';
 import { getRateLimiter } from './utils/rateLimiter.js';
 import { createServer, pinStdioServer, SERVER_NAME, SERVER_VERSION } from './server.js';
-import { startCustomToolsWatch, stopCustomToolsWatch } from './customTools/watch.js';
-import { parseCliArgs, runValidateTools } from './cli.js';
+import { startCustomToolsWatch } from './customTools/watch.js';
+import { missingConnectionHelp, parseCliArgs, runValidateTools } from './cli.js';
 import { loadCustomToolsFromEnv } from './customTools/loader.js';
-import { closeAuditLog, initAuditLog } from './utils/auditLog.js';
+import { initAuditLog } from './utils/auditLog.js';
+import { initExportStore } from './export/store.js';
 import { setCustomTools } from './customTools/registry.js';
 import { startHttpServer, shutdownHttpServer } from './transports/http.js';
+import { ClientAwareStdioTransport } from './transports/stdio.js';
+import { createLifecycle } from './lifecycle.js';
 
 /**
  * Main entry point
  */
 async function main(): Promise<void> {
-  let stdioServer: StdioServerHandle | null = null;
-  let httpServer: http.Server | https.Server | null = null;
-
-  /**
-   * Gracefully shutdown all servers
-   */
-  async function shutdown(signal: string): Promise<void> {
-    logger.info(`Received ${signal}, shutting down...`);
-    stopCustomToolsWatch();
-    closeAuditLog();
-
-    const shutdownPromises: Promise<void>[] = [];
-
-    // Shutdown HTTP server if running
-    if (httpServer) {
-      shutdownPromises.push(
-        shutdownHttpServer(httpServer).catch((err) => {
-          logger.error({ err }, 'Error shutting down HTTP server');
-        })
-      );
-    }
-
-    // Shutdown stdio server if running
-    if (stdioServer) {
-      shutdownPromises.push(
-        stdioServer.close().then(() => {
-          logger.info('Stdio MCP server closed');
-        }).catch((err) => {
-          logger.error({ err }, 'Error closing stdio MCP server');
-        })
-      );
-    }
-
-    await Promise.all(shutdownPromises);
-
-    // Close global DB pool (used by stdio transport)
-    await closeGlobalPool();
-    
-    flushLogger();
-    process.exit(0);
-  }
-
   try {
     const transportMode = getTransportMode();
     logger.info(
@@ -100,8 +63,11 @@ async function main(): Promise<void> {
 
     // Initialize rate limiter (logs its own config)
     getRateLimiter();
-    // Fail on a malformed QUERY_DEFAULT_LIMIT / QUERY_MAX_LIMIT now, not on the first query
+    // Fail on a malformed QUERY_DEFAULT_LIMIT / QUERY_MAX_LIMIT / QUERY_TIMEOUT / QUERY_MAX_LENGTH / MCP_BUILD_ID now, not on the first query
     getQueryLimitConfig();
+    getQueryTimeoutSeconds();
+    getQueryMaxLength();
+    getBuildId();
 
     // Reads and checks DB2I_PROFILES, so a bad file stops startup
     const systems = getSystems();
@@ -115,6 +81,17 @@ async function main(): Promise<void> {
     for (const system of systems) {
       warnConnectionSecurity(system, profiles);
     }
+    // npm leaves out the jt400 and mapepire packages. Say what to install now, not on the first query.
+    const missingPackages = findMissingDriverPackages(
+      systems.map((system) => ({ name: system.name, driver: system.config.driver })),
+      { profiles }
+    );
+    if (missingPackages.length > 0) {
+      logger.fatal({ missing: missingPackages }, 'Database driver packages are not installed');
+      flushLogger();
+      process.stderr.write(`\n${missingDriverPackagesMessage(missingPackages)}`);
+      process.exit(1);
+    }
 
     // Validates tool files and MCP_TOOLS_ENABLED / MCP_TOOLS_DISABLED before any transport starts
     const customTools = loadCustomToolsFromEnv();
@@ -125,6 +102,8 @@ async function main(): Promise<void> {
       );
     }
     initAuditLog();
+    // Checks the EXPORT_* settings and prepares EXPORT_DIR, so a bad setting stops startup
+    await initExportStore();
     setCustomTools(customTools);
     const enabledTools = getEnabledTools(customTools.tools);
     if (enabledTools.length === 0) {
@@ -147,6 +126,12 @@ async function main(): Promise<void> {
     // Check which transports are enabled
     const stdioEnabled = isStdioEnabled();
     const httpEnabled = isHttpEnabled();
+    const lifecycle = createLifecycle({
+      httpEnabled,
+      closeStdioPools: closeGlobalPool,
+      pendingPools: pendingPoolCloses,
+      exit: (code) => process.exit(code),
+    });
 
     // For stdio mode, the default system's connection settings are required
     if (stdioEnabled) {
@@ -166,7 +151,8 @@ async function main(): Promise<void> {
       }
 
       // serveStdio pins one server per connection and speaks both 2025 and 2026-07-28
-      stdioServer = serveStdio(() => {
+      // The transport reports a closed stdin or a broken stdout: the client is gone
+      const stdioServer = serveStdio(() => {
         const server = createServer();
         const release = pinStdioServer(server);
         const close = server.close.bind(server);
@@ -175,7 +161,8 @@ async function main(): Promise<void> {
           return close();
         };
         return server;
-      });
+      }, { transport: new ClientAwareStdioTransport(() => lifecycle.onStdioClientGone()) });
+      lifecycle.setStdio(() => stdioServer.close());
       logger.info(
         { name: SERVER_NAME, version: SERVER_VERSION },
         'MCP server connected via stdio transport'
@@ -197,7 +184,8 @@ async function main(): Promise<void> {
         'Starting HTTP transport...'
       );
 
-      httpServer = await startHttpServer();
+      const httpServer = await startHttpServer();
+      lifecycle.setHttp(() => shutdownHttpServer(httpServer));
       
       logger.info(
         { name: SERVER_NAME, version: SERVER_VERSION },
@@ -213,20 +201,16 @@ async function main(): Promise<void> {
     } else if (httpEnabled) {
       logger.info('MCP server running with HTTP transport only');
     }
+    if (stdioEnabled && process.stdin.isTTY) {
+      logger.info('Started from a terminal. MCP clients start this command themselves; press Ctrl+C to stop.');
+    }
 
-    // Handle shutdown gracefully
-    process.on('SIGINT', () => {
-      shutdown('SIGINT').catch((err) => {
-        logger.error({ err }, 'Error during SIGINT shutdown');
-        process.exit(1);
+    // Handle shutdown gracefully. SIGHUP is what a closing terminal sends.
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+      process.on(signal, () => {
+        void lifecycle.shutdown(signal);
       });
-    });
-    process.on('SIGTERM', () => {
-      shutdown('SIGTERM').catch((err) => {
-        logger.error({ err }, 'Error during SIGTERM shutdown');
-        process.exit(1);
-      });
-    });
+    }
 
   } catch (error) {
     logger.fatal({ err: error }, 'Failed to start MCP server');
@@ -281,7 +265,17 @@ function warnConnectionSecurity(system: SystemProfile, profiles: boolean): void 
 }
 
 const command = parseCliArgs(process.argv.slice(2));
-if (command.kind === 'serve') {
+const setupHelp = command.kind === 'serve' ? missingConnectionHelp() : null;
+if (setupHelp) {
+  process.stderr.write(setupHelp);
+  process.exit(1);
+} else if (command.kind === 'help') {
+  process.stdout.write(command.message);
+  process.exit(0);
+} else if (command.kind === 'version') {
+  process.stdout.write(`${SERVER_VERSION}\n`);
+  process.exit(0);
+} else if (command.kind === 'serve') {
   main().catch((error) => {
     logger.fatal({ err: error }, 'Fatal error during server startup');
     flushLogger();

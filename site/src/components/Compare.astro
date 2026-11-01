@@ -1,0 +1,65 @@
+---
+import { links } from '../lib/links';
+
+const options = [
+  {
+    title: 'This server',
+    intro: 'A good fit when:',
+    points: [
+      'You would rather not install or run a server on the IBM i. It uses the database host servers your system already runs, or an SSH login that starts Mapepire as your own user, with no daemon.',
+      'You want reads only, enforced by the server: a read-only connection, a SQL validator and a library allowlist.',
+      'Several people share one server and sign in with their own IBM i profiles.',
+    ],
+    href: links.quickstart,
+    label: 'Get started',
+  },
+  {
+    title: "IBM's MCP server for IBM i",
+    intro: 'A good fit when:',
+    points: [
+      'The Mapepire server already runs on your IBM i, or you are happy to install it.',
+      'You want its ready-made SQL tool sets for performance, jobs, security and storage.',
+      'You are building agents with Agno, LangChain or Google ADK, or want its ibmi command-line tool next to the server.',
+    ],
+    href: links.ibmMcp,
+    label: 'IBM/ibmi-mcp-server on GitHub',
+  },
+];
+---
+<section class="section" id="compare">
+  <div class="container">
+    <div class="sec-head">
+      <p class="label">Other options</p>
+      <div>
+        <h2>Which MCP server fits you.</h2>
+        <p class="lead">IBM maintains its own open-source MCP server for IBM i. Both are free, and they start from different places. Here is how to choose.</p>
+      </div>
+    </div>
+    <div class="options">
+      {options.map((o) => (
+        <div class="option">
+          <h3>{o.title}</h3>
+          <p class="label">{o.intro}</p>
+          <ul class="rows">
+            {o.points.map((p) => <li>{p}</li>)}
+          </ul>
+          <a class="link-rule" href={o.href}>{o.label} <span aria-hidden="true">→</span></a>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .options { display: grid; border-top: 1px solid var(--line-strong); }
+  @media (min-width: 760px) { .options { grid-template-columns: 1fr 1fr; } }
+  .option { display: flex; flex-direction: column; gap: 14px; padding: 24px 0 32px; }
+  .option + .option { border-top: 1px solid var(--line); }
+  @media (min-width: 760px) {
+    .option { padding-right: 32px; }
+    .option + .option { border-top: 0; border-left: 1px solid var(--line); padding-left: 32px; padding-right: 0; }
+  }
+  .option h3 { margin: 0; font-size: 1.75rem; font-weight: 400; letter-spacing: -0.025em; }
+  .option .rows li { padding: 10px 0; color: var(--muted); font-size: 0.95rem; }
+  .option .link-rule { margin-top: auto; align-self: flex-start; }
+</style>

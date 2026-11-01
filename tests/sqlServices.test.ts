@@ -8,14 +8,32 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../src/db/connection.js', () => ({
   executeQuery: vi.fn(),
   executeProcedure: vi.fn(),
+  explainUnparsedStatement: vi.fn(async () => undefined),
 }));
 
-import { executeProcedure, executeQuery } from '../src/db/connection.js';
-import { clearRoutineCache, generateObjectDdl } from '../src/db/sqlServices.js';
+import { executeProcedure, executeQuery, explainUnparsedStatement } from '../src/db/connection.js';
+import {
+  clearRoutineCache,
+  clearServicesCache,
+  generateObjectDdl,
+  SERVICES_CACHE_TTL_MS,
+} from '../src/db/sqlServices.js';
+import type { DbTarget } from '../src/systems.js';
 import { executeQueryTool } from '../src/tools/query.js';
-import { getJournalInfoTool, getObjectDdlTool, getRelatedObjectsTool, validateQueryTool } from '../src/tools/sqlServices.js';
+import {
+  getJournalInfoTool,
+  getObjectDdlTool,
+  getRelatedObjectsTool,
+  searchIbmiServicesTool,
+  validateQueryTool,
+} from '../src/tools/sqlServices.js';
 
 const query = vi.mocked(executeQuery);
+const explain = vi.mocked(explainUnparsedStatement);
+const SQL0104 = {
+  message: '[42000] SQL0104 - Token EXISTS was not valid. Valid tokens: <IDENTIFIER>.',
+  details: { sqlstate: '42000', sqlcode: -104, cause: 'A syntax error was detected at token EXISTS.', recovery: 'Correct the syntax.' },
+};
 const procedure = vi.mocked(executeProcedure);
 
 function parsedRow(row: Record<string, unknown>) {
@@ -35,6 +53,7 @@ describe('SQL service tools', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearRoutineCache();
+    clearServicesCache();
     process.env = { ...originalEnv };
     delete process.env.QUERY_ALLOWED_SCHEMAS;
     process.env.QUERY_PARSE_CHECK = 'false';
@@ -50,6 +69,22 @@ describe('SQL service tools', () => {
       expect(result.valid).toBe(false);
       expect(result.violations).toContain('The statement could not be parsed.');
       expect(query).toHaveBeenCalledTimes(1);
+      expect(result.sqlstate).toBeUndefined();
+    });
+
+    it("should report Db2's reason when the statement does not parse and a prepare explains it", async () => {
+      query.mockResolvedValueOnce({ rows: [] });
+      explain.mockResolvedValueOnce(SQL0104);
+
+      const result = await validateQueryTool({
+        sql: 'SELECT CASE WHEN EXISTS (SELECT 1 FROM MYLIB.ORDERS) THEN 1 END FROM SYSIBM.SYSDUMMY1;',
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.violations?.[0]).toContain('SQL0104 - Token EXISTS was not valid');
+      expect(result).toMatchObject(SQL0104.details);
+      // The prepare gets the statement as PARSE_STATEMENT did, without the semicolon
+      expect(explain.mock.calls[0]?.[0]).toBe('SELECT CASE WHEN EXISTS (SELECT 1 FROM MYLIB.ORDERS) THEN 1 END FROM SYSIBM.SYSDUMMY1');
     });
 
     it('should report a table that is not in the catalog', async () => {
@@ -164,6 +199,118 @@ describe('SQL service tools', () => {
       expect(result.violations?.join(' ')).toContain('OTHERLIB.ORDERS');
       expect(query).toHaveBeenCalledTimes(1);
       expect(query.mock.calls[0]?.[0]).toContain('PARSE_STATEMENT');
+    });
+
+    it('should report valid Db2 for i as valid when the JavaScript parser cannot read it', async () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'MYLIB';
+      query.mockImplementation(async (sql: string) => {
+        if (sql.includes('PARSE_STATEMENT')) {
+          return {
+            rows: [
+              parsedRow({ NAME_TYPE: 'TABLE', SCHEMA: 'MYLIB', NAME: 'ORDERS' }),
+              parsedRow({ NAME_TYPE: 'COLUMN', SCHEMA: 'MYLIB', NAME: 'ORDERS', COLUMN_NAME: 'ITEMNO' }),
+            ],
+          };
+        }
+        if (sql.includes('SYSTABLES')) {
+          return { rows: [{ TABLE_SCHEMA: 'MYLIB', TABLE_NAME: 'ORDERS' }] };
+        }
+        return { rows: [{ TABLE_SCHEMA: 'MYLIB', TABLE_NAME: 'ORDERS', COLUMN_NAME: 'ITEMNO' }] };
+      });
+
+      const result = await validateQueryTool({
+        sql: "SELECT ITEMNO, LISTAGG(ITEMNO, ',') WITHIN GROUP (ORDER BY ITEMNO) FROM MYLIB.ORDERS GROUP BY ITEMNO",
+      });
+
+      expect(result.violations).toEqual([]);
+      expect(result.valid).toBe(true);
+    });
+
+    it('should report a qualified column on a table outside the allowlist and not look it up', async () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'MYLIB';
+      query.mockResolvedValue({
+        rows: [
+          parsedRow({ NAME_TYPE: 'COLUMN', SCHEMA: 'OTHERLIB', NAME: 'ORDERS', COLUMN_NAME: 'ORDERNO' }),
+        ],
+      });
+
+      const result = await validateQueryTool({ sql: 'SELECT OTHERLIB.ORDERS.ORDERNO FROM MYLIB.ORDERS' });
+
+      expect(result.valid).toBe(false);
+      expect(result.violations).toEqual([
+        'Table OTHERLIB.ORDERS is not in the allowed schemas (MYLIB).',
+      ]);
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('should check qualified columns once each and report the missing ones by table', async () => {
+      query.mockImplementation(async (sql: string) => {
+        if (sql.includes('PARSE_STATEMENT')) {
+          return {
+            rows: [
+              parsedRow({ NAME_TYPE: 'TABLE', SCHEMA: 'MYLIB', NAME: 'ORDERS' }),
+              // Column rows name the table without a schema; it comes from the table list
+              parsedRow({ NAME_TYPE: 'COLUMN', NAME: 'ORDERS', COLUMN_NAME: 'ORDERNO' }),
+              parsedRow({ NAME_TYPE: 'COLUMN', NAME: 'ORDERS', COLUMN_NAME: 'ORDERNO' }),
+              parsedRow({ NAME_TYPE: 'COLUMN', NAME: 'ORDERS', COLUMN_NAME: 'NOSUCHCOL' }),
+            ],
+          };
+        }
+        if (sql.includes('SYSTABLES')) {
+          return { rows: [{ TABLE_SCHEMA: 'MYLIB', TABLE_NAME: 'ORDERS' }] };
+        }
+        if (sql.includes('SYSCOLUMNS')) {
+          return { rows: [{ TABLE_SCHEMA: 'MYLIB', TABLE_NAME: 'ORDERS', COLUMN_NAME: 'ORDERNO' }] };
+        }
+        return { rows: [] };
+      });
+
+      const result = await validateQueryTool({
+        sql: 'SELECT ORDERS.ORDERNO, ORDERS.NOSUCHCOL FROM MYLIB.ORDERS WHERE ORDERS.ORDERNO = 1001',
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.missingColumns).toEqual(['MYLIB.ORDERS.NOSUCHCOL']);
+      const columnLookup = query.mock.calls.find(([sql]) => sql.includes('SYSCOLUMNS'));
+      expect(columnLookup?.[1]).toEqual(['MYLIB', 'ORDERS', 'ORDERNO', 'MYLIB', 'ORDERS', 'NOSUCHCOL']);
+    });
+
+    it('should report an unqualified column when the statement names no table', async () => {
+      query.mockResolvedValue({
+        rows: [parsedRow({ NAME_TYPE: 'COLUMN', COLUMN_NAME: 'ORDERNO' })],
+      });
+
+      const result = await validateQueryTool({ sql: 'SELECT ORDERNO FROM SYSIBM.SYSDUMMY1' });
+
+      expect(result.valid).toBe(false);
+      expect(result.violations).toEqual(['Column ORDERNO could not be checked because the statement names no table.']);
+      expect(result.missingColumns).toEqual([]);
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('should accept an unqualified column found on one of the named tables', async () => {
+      query.mockImplementation(async (sql: string) => {
+        if (sql.includes('PARSE_STATEMENT')) {
+          return {
+            rows: [
+              parsedRow({ NAME_TYPE: 'TABLE', SCHEMA: 'MYLIB', NAME: 'ORDERS' }),
+              parsedRow({ NAME_TYPE: 'COLUMN', COLUMN_NAME: 'ORDERNO' }),
+            ],
+          };
+        }
+        if (sql.includes('SYSTABLES')) {
+          return { rows: [{ TABLE_SCHEMA: 'MYLIB', TABLE_NAME: 'ORDERS' }] };
+        }
+        if (sql.includes('SYSCOLUMNS')) {
+          return { rows: [{ COLUMN_NAME: 'ORDERNO' }] };
+        }
+        return { rows: [] };
+      });
+
+      const result = await validateQueryTool({ sql: 'SELECT ORDERNO FROM MYLIB.ORDERS' });
+
+      expect(result.valid).toBe(true);
+      expect(result.missingColumns).toEqual([]);
     });
   });
 
@@ -398,6 +545,156 @@ describe('SQL service tools', () => {
     });
   });
 
+  describe('search_ibmi_services', () => {
+    function serviceRow(category: string, name: string, example: string | null = null) {
+      return {
+        SERVICE_CATEGORY: category,
+        SERVICE_SCHEMA_NAME: 'QSYS2',
+        SERVICE_NAME: name,
+        SQL_OBJECT_TYPE: 'TABLE FUNCTION',
+        SYSTEM_OBJECT_NAME: null,
+        EARLIEST_POSSIBLE_RELEASE: 'V7R3M0',
+        INITIAL_DB2_GROUP_LEVEL: '5',
+        LATEST_DB2_GROUP_LEVEL: null,
+        EXAMPLE: example,
+      };
+    }
+
+    const catalog = {
+      rows: [
+        serviceRow('JOURNAL', 'DISPLAY_JOURNAL', '-- Description: Read entries\r\nSELECT * FROM TABLE(QSYS2.DISPLAY_JOURNAL(\'MYLIB\', \'QSQJRN\')) X'),
+        serviceRow('JOURNAL', 'JOURNAL_INFO', 'SELECT * FROM QSYS2.JOURNAL_INFO'),
+        serviceRow('SECURITY', 'USER_INFO', 'SELECT * FROM QSYS2.USER_INFO'),
+        serviceRow('WORK MANAGEMENT', 'ACTIVE_JOB_INFO', 'SELECT * FROM TABLE(QSYS2.ACTIVE_JOB_INFO()) X'),
+      ],
+    };
+
+    function target(system: string, username = 'MCPUSER'): DbTarget {
+      return { poolKey: system, system, config: { username } } as unknown as DbTarget;
+    }
+
+    it('should list categories with counts when called with no filter', async () => {
+      query.mockResolvedValueOnce(catalog);
+
+      const result = await searchIbmiServicesTool({});
+
+      expect(result.success).toBe(true);
+      expect(result.categories).toEqual([
+        { category: 'JOURNAL', count: 2 },
+        { category: 'SECURITY', count: 1 },
+        { category: 'WORK MANAGEMENT', count: 1 },
+      ]);
+      expect(result.count).toBe(3);
+      expect(result.data).toBeUndefined();
+      expect(query.mock.calls[0][0]).toContain('QSYS2.SERVICES_INFO');
+    });
+
+    it('should match every keyword against name and category, ignoring case', async () => {
+      query.mockResolvedValueOnce(catalog);
+
+      const result = await searchIbmiServicesTool({ query: 'journal  display' });
+
+      expect(result.data?.map((row) => row.service_name)).toEqual(['DISPLAY_JOURNAL']);
+      expect(result.data?.[0]).toMatchObject({
+        category: 'JOURNAL',
+        schema: 'QSYS2',
+        sql_object_type: 'TABLE FUNCTION',
+        earliest_release: 'V7R3M0',
+        initial_db2_group_level: 5,
+        latest_db2_group_level: null,
+      });
+      expect(result.data?.[0].example).toBe("-- Description: Read entries\nSELECT * FROM TABLE(QSYS2.DISPLAY_JOURNAL('MYLIB', 'QSQJRN')) X");
+    });
+
+    it('should search examples only when asked', async () => {
+      query.mockResolvedValueOnce(catalog);
+
+      const plain = await searchIbmiServicesTool({ query: 'MYLIB' });
+      const withExamples = await searchIbmiServicesTool({ query: 'mylib', searchExamples: true });
+
+      expect(plain.data).toEqual([]);
+      expect(withExamples.data?.map((row) => row.service_name)).toEqual(['DISPLAY_JOURNAL']);
+    });
+
+    it('should filter by exact category, ignoring case', async () => {
+      query.mockResolvedValueOnce(catalog);
+
+      const result = await searchIbmiServicesTool({ category: 'work management' });
+      const partial = await searchIbmiServicesTool({ category: 'WORK' });
+
+      expect(result.data?.map((row) => row.service_name)).toEqual(['ACTIVE_JOB_INFO']);
+      expect(partial.data).toEqual([]);
+    });
+
+    it('should leave out examples when include_example is false', async () => {
+      query.mockResolvedValueOnce(catalog);
+
+      const result = await searchIbmiServicesTool({ category: 'SECURITY', includeExample: false });
+
+      expect(result.data?.[0].service_name).toBe('USER_INFO');
+      expect(result.data?.[0]).not.toHaveProperty('example');
+    });
+
+    it('should cap results at the limit and report truncation', async () => {
+      process.env.QUERY_MAX_LIMIT = '2';
+      query.mockResolvedValueOnce(catalog);
+
+      const result = await searchIbmiServicesTool({ query: 'info', limit: 10 });
+
+      expect(result.data?.map((row) => row.service_name)).toEqual(['JOURNAL_INFO', 'USER_INFO']);
+      expect(result.count).toBe(2);
+      expect(result.truncated).toBe(true);
+    });
+
+    it('should read the catalog once per system and user within the cache time', async () => {
+      query.mockResolvedValue(catalog);
+
+      await searchIbmiServicesTool({ target: target('prod') });
+      await searchIbmiServicesTool({ query: 'journal', target: target('prod') });
+      expect(query).toHaveBeenCalledTimes(1);
+
+      await searchIbmiServicesTool({ target: target('test') });
+      await searchIbmiServicesTool({ target: target('prod', 'OTHERUSER') });
+      expect(query).toHaveBeenCalledTimes(3);
+    });
+
+    it('should read the catalog again after the cache expires', async () => {
+      vi.useFakeTimers();
+      try {
+        query.mockResolvedValue(catalog);
+
+        await searchIbmiServicesTool({});
+        vi.advanceTimersByTime(SERVICES_CACHE_TTL_MS + 1);
+        await searchIbmiServicesTool({});
+
+        expect(query).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('should explain a missing SERVICES_INFO view and not cache the failure', async () => {
+      query.mockRejectedValueOnce(new Error('Database query failed: [42704] SQL0204 - SERVICES_INFO in QSYS2 type *FILE not found.'));
+      query.mockResolvedValueOnce(catalog);
+
+      const failed = await searchIbmiServicesTool({});
+      const retried = await searchIbmiServicesTool({});
+
+      expect(failed.success).toBe(false);
+      expect(failed.error).toContain('QSYS2.SERVICES_INFO is not available');
+      expect(retried.success).toBe(true);
+      expect(query).toHaveBeenCalledTimes(2);
+    });
+
+    it('should return other database errors as they are', async () => {
+      query.mockRejectedValueOnce(new Error('Database query failed: connection reset'));
+
+      const result = await searchIbmiServicesTool({});
+
+      expect(result).toEqual({ success: false, error: 'Database query failed: connection reset' });
+    });
+  });
+
   describe('execute_query parse check', () => {
     it('should run the query when the check is off', async () => {
       query.mockResolvedValueOnce({ rows: [{ ORDERNO: 1001 }] });
@@ -418,6 +715,38 @@ describe('SQL service tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('could not be parsed');
+      expect(result.error).toContain('QUERY_PARSE_CHECK=false');
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it('should say when Db2 accepts a statement that PARSE_STATEMENT cannot parse', async () => {
+      process.env.QUERY_PARSE_CHECK = 'true';
+      query.mockResolvedValueOnce({ rows: [] });
+      explain.mockResolvedValueOnce({ accepted: true });
+
+      const result = await executeQueryTool({ sql: 'VALUES 1' });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('although Db2 accepts it');
+      expect(result.error).toContain('SELECT * FROM (VALUES');
+      expect(query).toHaveBeenCalledTimes(1);
+    });
+
+    it("should return Db2's reason, cause and recovery when a prepare explains the parse failure", async () => {
+      process.env.QUERY_PARSE_CHECK = 'true';
+      query.mockResolvedValueOnce({ rows: [] });
+      explain.mockResolvedValueOnce(SQL0104);
+
+      const result = await executeQueryTool({
+        sql: 'SELECT CASE WHEN EXISTS (SELECT 1 FROM MYLIB.ORDERS) THEN 1 END FROM SYSIBM.SYSDUMMY1',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errorKind).toBe('parse_check');
+      expect(result.error).toContain('could not be parsed: [42000] SQL0104');
+      expect(result.error).toContain('was not run');
+      expect(result).toMatchObject(SQL0104.details);
+      // Only PARSE_STATEMENT ran; the statement itself was never executed
       expect(query).toHaveBeenCalledTimes(1);
     });
 

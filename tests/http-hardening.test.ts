@@ -7,17 +7,21 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Express } from 'express';
 
-vi.mock('node-jt400', () => ({
-  pool: vi.fn(() => ({
-    query: vi.fn().mockResolvedValue([]),
-  })),
-}));
+vi.mock('node-jt400', async () => {
+  const { withExecute } = await import('./helpers/jt400Fake.js');
+  return {
+    pool: vi.fn(() => withExecute({
+      query: vi.fn().mockResolvedValue([]),
+    })),
+  };
+});
 
 import { createHttpApp, startHttpServer } from '../src/transports/http.js';
 import { getSessionManager } from '../src/transports/sessionManager.js';
 import { getTokenManager } from '../src/auth/tokenManager.js';
 import { createServer } from '../src/server.js';
 import type { DB2iConfig } from '../src/config.js';
+import { withExecute } from './helpers/jt400Fake.js';
 
 const dbConfig: DB2iConfig = {
   hostname: 'test-host',
@@ -290,8 +294,8 @@ describe('HTTP /auth database host allowlist', () => {
 
 describe('HTTP /auth rate limiting', () => {
   const originalEnv = process.env;
-  // The limiter is module state keyed by client IP, so each test starts in a
-  // later rate-limit window instead of relying on test order.
+  // Each app gets its own limiter. The fake clock moves forward per test so the
+  // window tests can set times relative to a known start.
   let clock = Date.now();
 
   beforeEach(() => {
@@ -312,7 +316,7 @@ describe('HTTP /auth rate limiting', () => {
 
   afterEach(async () => {
     const { pool } = await import('node-jt400');
-    vi.mocked(pool).mockImplementation(() => ({
+    vi.mocked(pool).mockImplementation(() => withExecute({
       query: vi.fn().mockResolvedValue([]),
     }) as unknown as ReturnType<typeof pool>);
     vi.useRealTimers();
@@ -322,7 +326,7 @@ describe('HTTP /auth rate limiting', () => {
 
   async function mockDbLogin(succeeds: boolean): Promise<void> {
     const { pool } = await import('node-jt400');
-    vi.mocked(pool).mockImplementation(() => ({
+    vi.mocked(pool).mockImplementation(() => withExecute({
       query: vi.fn(() =>
         new Promise((resolve, reject) => {
           setTimeout(() => (succeeds ? resolve([]) : reject(new Error('Password not correct'))), 50);
@@ -352,7 +356,7 @@ describe('HTTP /auth rate limiting', () => {
     }
   });
 
-  it('resets the count after a successful login', async () => {
+  it('does not count a successful login, and does not forget earlier failures', async () => {
     const { server, baseUrl } = await listen(createHttpApp());
     try {
       await mockDbLogin(false);
@@ -360,14 +364,58 @@ describe('HTTP /auth rate limiting', () => {
         expect((await postAuth(baseUrl)).status).toBe(401);
       }
 
+      // A valid profile must not reset the count used to guess another profile's password
       await mockDbLogin(true);
+      expect((await postAuth(baseUrl)).status).toBe(201);
       expect((await postAuth(baseUrl)).status).toBe(201);
 
       await mockDbLogin(false);
-      for (let i = 0; i < 5; i++) {
-        expect((await postAuth(baseUrl)).status).toBe(401);
-      }
+      expect((await postAuth(baseUrl)).status).toBe(401);
       expect((await postAuth(baseUrl)).status).toBe(429);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('uses the configured attempt count and window', async () => {
+    process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS = '2';
+    process.env.AUTH_RATE_LIMIT_WINDOW_MS = '120000';
+    await mockDbLogin(false);
+    const { server, baseUrl } = await listen(createHttpApp());
+    try {
+      expect((await postAuth(baseUrl)).status).toBe(401);
+      expect((await postAuth(baseUrl)).status).toBe(401);
+      const limited = await postAuth(baseUrl);
+      expect(limited.status).toBe(429);
+      expect(((await limited.json()) as { retry_after: number }).retry_after).toBe(120);
+
+      // Still inside the 2-minute window after the default 60 seconds
+      vi.setSystemTime(clock + 90_000);
+      expect((await postAuth(baseUrl)).status).toBe(429);
+
+      vi.setSystemTime(clock + 120_000);
+      expect((await postAuth(baseUrl)).status).toBe(401);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('keys the limit on the forwarded client address when MCP_TRUST_PROXY is set', async () => {
+    process.env.MCP_TRUST_PROXY = '1';
+    await mockDbLogin(false);
+    const { server, baseUrl } = await listen(createHttpApp());
+    const postFrom = (client: string): Promise<Response> =>
+      fetch(`${baseUrl}/auth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': client },
+        body: JSON.stringify({ username: 'user', password: 'wrong' }),
+      });
+    try {
+      for (let i = 0; i < 5; i++) {
+        expect((await postFrom('203.0.113.10')).status).toBe(401);
+      }
+      expect((await postFrom('203.0.113.10')).status).toBe(429);
+      expect((await postFrom('203.0.113.20')).status).toBe(401);
     } finally {
       await closeServer(server);
     }

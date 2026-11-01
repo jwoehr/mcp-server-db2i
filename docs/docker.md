@@ -1,4 +1,7 @@
-# Docker Guide
+---
+title: "Docker"
+description: "Run mcp-server-db2i in a container with Docker and docker-compose."
+---
 
 This guide covers running mcp-server-db2i with Docker and docker-compose.
 
@@ -10,7 +13,7 @@ This guide covers running mcp-server-db2i with Docker and docker-compose.
 docker build -t mcp-server-db2i .
 ```
 
-This builds the default `odbc` image with the IBM i Access ODBC Driver. IBM publishes that driver for amd64 only, so on an arm64 host such as an Apple Silicon Mac add `--platform linux/amd64`, or build the `jt400` image instead. See [Multi-Stage Build](#multi-stage-build).
+This builds the default `odbc` image with the IBM i Access ODBC Driver. IBM publishes no arm64 Linux build of that driver, so on an arm64 host such as an Apple Silicon Mac add `--platform linux/amd64`, or build the `jt400` image instead. See [Multi-Stage Build](#multi-stage-build).
 
 ### Run with Environment Variables
 
@@ -82,11 +85,11 @@ For production deployments, use Docker secrets instead of environment variables.
 mkdir -p ./secrets
 
 # Securely prompt for username (doesn't leak to shell history)
-read -p "Enter DB2i username: " username
+read -p "Enter Db2i username: " username
 echo "$username" > ./secrets/db2i_username.txt
 
 # Securely prompt for password (hidden input)
-read -s -p "Enter DB2i password: " password
+read -s -p "Enter Db2i password: " password
 echo
 echo "$password" > ./secrets/db2i_password.txt
 
@@ -199,6 +202,7 @@ environment:
   - MCP_SESSION_MODE=${MCP_SESSION_MODE:-stateless}
   - MCP_TOKEN_EXPIRY=${MCP_TOKEN_EXPIRY:-3600}
   - MCP_MAX_SESSIONS=${MCP_MAX_SESSIONS:-100}
+  - MCP_POOL_IDLE_TIMEOUT=${MCP_POOL_IDLE_TIMEOUT:-600}
   
   # TLS settings
   - MCP_TLS_ENABLED=${MCP_TLS_ENABLED:-false}
@@ -209,12 +213,23 @@ environment:
   - RATE_LIMIT_WINDOW_MS=${RATE_LIMIT_WINDOW_MS:-900000}
   - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-100}
   - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
+  - AUTH_RATE_LIMIT_MAX_ATTEMPTS=${AUTH_RATE_LIMIT_MAX_ATTEMPTS:-5}
+  - AUTH_RATE_LIMIT_WINDOW_MS=${AUTH_RATE_LIMIT_WINDOW_MS:-60000}
+  - OAUTH_RATE_LIMIT_MAX_REQUESTS=${OAUTH_RATE_LIMIT_MAX_REQUESTS:-120}
+  - OAUTH_RATE_LIMIT_WINDOW_MS=${OAUTH_RATE_LIMIT_WINDOW_MS:-60000}
   
   # Query limits
   - QUERY_DEFAULT_LIMIT=${QUERY_DEFAULT_LIMIT:-1000}
   - QUERY_MAX_LIMIT=${QUERY_MAX_LIMIT:-10000}
+  - QUERY_TIMEOUT=${QUERY_TIMEOUT:-}
   - QUERY_ALLOWED_SCHEMAS=${QUERY_ALLOWED_SCHEMAS:-}
   - QUERY_PARSE_CHECK=${QUERY_PARSE_CHECK:-}
+  - QUERY_MAX_LENGTH=${QUERY_MAX_LENGTH:-}
+  
+  # Query exports (export_query)
+  - EXPORT_ENABLED=${EXPORT_ENABLED:-}
+  - EXPORT_DIR=${EXPORT_DIR:-/data/exports}
+  - MCP_PUBLIC_URL=${MCP_PUBLIC_URL:-}
   
   # Tool selection and response format
   - MCP_TOOLS_ENABLED=${MCP_TOOLS_ENABLED:-}
@@ -242,13 +257,34 @@ services:
 
 The server reads the files at startup. A statement that is not a query, or that names a library outside `QUERY_ALLOWED_SCHEMAS`, stops the container. See [Business SQL tools](custom-tools.md).
 
+## Query exports
+
+The image has an empty `/data/exports` directory owned by `mcpuser` with mode `0700`. Point `EXPORT_DIR` at it and mount a named volume there, which takes the same owner:
+
+```yaml
+services:
+  mcp-server-db2i:
+    environment:
+      - EXPORT_ENABLED=true
+      - EXPORT_DIR=/data/exports
+      # HTTP: download links are <MCP_PUBLIC_URL>/exports/<id>
+      - MCP_PUBLIC_URL=https://mcp.example.com
+    volumes:
+      - exports:/data/exports
+
+volumes:
+  exports:
+```
+
+Over HTTP, users download through the link and never see the path. Over stdio the result is a path inside the container, which is only useful on the host through a bind mount: mount a host directory at `/data/exports` and make it writable by the container's `mcpuser`. See [Query exports](configuration.md#query-exports).
+
 ## Multi-Stage Build
 
 The Dockerfile uses a multi-stage build with two runtime targets:
 
-1. **Builder stage**: Compiles TypeScript to JavaScript and prunes dev dependencies
+1. **Builder stage**: Compiles TypeScript to JavaScript, then installs the production packages for each target. Both include `@ibm/mapepire-js` and `ssh2`; only the `jt400` target includes `node-jt400`
 2. **`odbc` target** (default): unixODBC and the IBM i Access ODBC Driver from IBM's apt repository, no Java. Sets `DB2I_DRIVER=odbc`.
-3. **`jt400` target**: OpenJDK 17 JRE for the JT400 JDBC driver. Sets `DB2I_DRIVER=jt400`.
+3. **`jt400` target**: OpenJDK 17 JRE and `node-jt400` for the JT400 JDBC driver. Sets `DB2I_DRIVER=jt400`.
 
 ```bash
 # ODBC image (default), no JDK or JRE
@@ -259,7 +295,7 @@ docker run --rm -i --env-file .env -e DB2I_ODBC_OPTIONS="SSL=1" mcp-server-db2i
 docker build --target jt400 -t mcp-server-db2i:jt400 .
 ```
 
-IBM publishes the ODBC driver package for amd64, i386 and ppc64el only. On an arm64 host such as an Apple Silicon Mac, build and run the ODBC image under emulation with `--platform linux/amd64`; the build fails early with a message otherwise. The `jt400` image builds natively on arm64.
+IBM publishes the ODBC driver package for amd64 and ppc64el, and its apt repository also carries older i386 builds (see [Installing the IBM i Access ODBC Driver](configuration.md#installing-the-ibm-i-access-odbc-driver)). There is no arm64 build, so in practice the ODBC image is an amd64 image. On an arm64 host such as an Apple Silicon Mac, build and run it under emulation with `--platform linux/amd64`; the build fails early with a message otherwise. The `jt400` image builds natively on arm64.
 
 ```bash
 docker build --platform linux/amd64 -t mcp-server-db2i .
@@ -270,6 +306,12 @@ Either image can run the `mapepire` driver, because it needs nothing native. Ove
 ```bash
 docker run --rm -i --env-file .env -e DB2I_DRIVER=mapepire \
   -e DB2I_MAPEPIRE_OPTIONS="hostKey=SHA256:abc...xyz" mcp-server-db2i:jt400
+```
+
+To tell images apart in the audit log between releases, pass the git commit as `MCP_BUILD_ID`. Every audit line then records it as `build`, next to `serverVersion`:
+
+```bash
+docker build --build-arg MCP_BUILD_ID=$(git rev-parse --short HEAD) -t mcp-server-db2i .
 ```
 
 The bundled `docker-compose.yml` builds the ODBC image with `platform: linux/amd64`. To use the JDBC image, set `target: jt400` under `build` and remove the `platform` line.
@@ -445,7 +487,7 @@ secrets:
 
 ### Connection Refused
 
-1. Check if IBM i port (446) is accessible
+1. Check that the container can reach the IBM i ports your driver uses: 449, 8476 and 8471 (9476 and 9471 with TLS) for `odbc` and `jt400`, or SSH (port 22) for `mapepire`. Port 446 is not used
 2. Verify hostname resolves correctly
 3. Check firewall rules
 

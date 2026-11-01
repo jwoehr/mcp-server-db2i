@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 
 vi.mock('../../src/db/connection.js', () => ({
   executeQuery: vi.fn(),
@@ -57,12 +58,17 @@ tools:
 `;
 }
 
-async function waitFor(check: () => boolean): Promise<void> {
+async function waitFor(check: () => boolean, retry?: () => void): Promise<void> {
   // fs.watch events can lag when the whole suite runs in parallel
   const deadline = Date.now() + 5000;
+  let nextRetry = Date.now() + 200;
   while (Date.now() < deadline) {
     if (check()) {
       return;
+    }
+    if (retry && Date.now() >= nextRetry) {
+      retry();
+      nextRetry = Date.now() + 200;
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
@@ -141,6 +147,39 @@ profiles:
   });
 });
 
+describe('execute_query description on reload', () => {
+  it('adds and removes the business context sentence as annotations come and go', async () => {
+    const dir = tempDir();
+    const file = path.join(dir, 'tools.yaml');
+    writeFileSync(file, toolYaml('search_sales_orders', 'Open sales orders'));
+    process.env.MCP_CUSTOM_TOOLS = dir;
+    expect(reloadCustomTools()).toBe(true);
+
+    const server = createServer();
+    releases.push(pinStdioServer(server));
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const client = new Client({ name: 'reload-test', version: '1.0.0' });
+    await client.connect(clientTransport);
+    const queryDescription = async (): Promise<string | undefined> =>
+      (await client.listTools()).tools.find((tool) => tool.name === 'execute_query')?.description;
+
+    try {
+      expect(await queryDescription()).not.toContain('get_business_context');
+
+      writeFileSync(file, `${toolYaml('search_sales_orders', 'Open sales orders')}annotations:\n  MYLIB.ORDERHDR:\n    description: Order headers\n`);
+      expect(reloadCustomTools()).toBe(true);
+      expect(await queryDescription()).toContain('call get_business_context');
+
+      writeFileSync(file, toolYaml('search_sales_orders', 'Open sales orders'));
+      expect(reloadCustomTools()).toBe(true);
+      expect(await queryDescription()).not.toContain('get_business_context');
+    } finally {
+      await client.close();
+    }
+  });
+});
+
 describe('custom tools watch', () => {
   it('reloads a valid edit and a file added or removed in the directory', async () => {
     const dir = tempDir();
@@ -154,8 +193,12 @@ describe('custom tools watch', () => {
     const listChanged = vi.spyOn(server, 'sendToolListChanged');
     startCustomToolsWatch({ debounceMs: 30 });
 
-    writeFileSync(orders, toolYaml('search_sales_orders', 'Closed sales orders'));
-    await waitFor(() => liveCustomTool(server, 'search_sales_orders')?.description === 'Closed sales orders');
+    // On macOS fs.watch starts its FSEvents stream after watch() returns, and a
+    // write before the stream is running is never reported. Repeat the first
+    // write until it lands. Once one event arrives, later writes are seen.
+    const editOrders = () => writeFileSync(orders, toolYaml('search_sales_orders', 'Closed sales orders'));
+    editOrders();
+    await waitFor(() => liveCustomTool(server, 'search_sales_orders')?.description === 'Closed sales orders', editOrders);
     expect(listChanged).toHaveBeenCalled();
     expect(getCustomTools().tools[0]?.description).toBe('Closed sales orders');
 

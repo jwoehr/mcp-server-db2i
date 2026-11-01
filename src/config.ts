@@ -1,5 +1,5 @@
 /**
- * Configuration module for IBM DB2i MCP Server
+ * Configuration module for IBM Db2i MCP Server
  * Handles environment variables and the JDBC / ODBC connection options
  *
  * Database driver:
@@ -23,15 +23,30 @@
  * - MCP_TLS_KEY_PATH: Path to TLS private key
  * - MCP_TOKEN_EXPIRY: Token lifetime in seconds (default: 3600)
  * - MCP_MAX_SESSIONS: Maximum concurrent sessions (default: 100)
+ * - MCP_POOL_IDLE_TIMEOUT: Seconds before an unused HTTP session's connections close (default: 600, 0 = never)
  * - MCP_CORS_ORIGINS: CORS allowed origins (comma-separated, '*' for all)
  * - MCP_ALLOWED_HOSTS: Extra Host header names, added to loopback (comma-separated)
  * - MCP_ALLOW_UNAUTHENTICATED_HTTP: Allow MCP_AUTH_MODE=none on a non-loopback bind
  * - MCP_AUTH_ALLOWED_DB_HOSTS: Hosts /auth may open a database connection to
+ * - MCP_OAUTH_ENABLED: Built-in OAuth authorization server (requires MCP_AUTH_MODE=required)
+ * - MCP_PUBLIC_URL: External origin of the server, the OAuth issuer
+ * - MCP_OAUTH_REDIRECT_URIS: Redirect URIs OAuth clients may register
+ * - MCP_OAUTH_SECRET: Key that signs OAuth client IDs and login requests
+ * - MCP_OAUTH_REFRESH_EXPIRY: OAuth refresh token lifetime in seconds (default: 7 days)
+ * - MCP_OAUTH_STATE_FILE: File that keeps OAuth refresh grants across restarts
+ * - MCP_OAUTH_BRAND_NAME, MCP_OAUTH_LOGO, MCP_OAUTH_TITLE, MCP_OAUTH_SYSTEM_LABEL, MCP_OAUTH_ACCENT,
+ *   MCP_OAUTH_ACCENT_DARK, MCP_OAUTH_FONT_FAMILY, MCP_OAUTH_FONT_FILE: sign-in page branding
+ * - MCP_OAUTH_LANGUAGE, MCP_OAUTH_STRINGS: sign-in page language and wording
+ * - MCP_TRUST_PROXY: Express 'trust proxy' setting, so rate limits see the client address behind a proxy
  */
 
+import crypto from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+
+import { readSignInBranding, type SignInBranding } from './auth/signInBranding.js';
+import { readSignInText, type SignInText } from './auth/signInStrings.js';
 
 /**
  * Database drivers. `jt400` is the JDBC bridge (needs a JRE). `odbc` uses the
@@ -60,6 +75,8 @@ export interface DB2iConfig {
   odbcOptions: Record<string, string>;
   /** Transport settings from DB2I_MAPEPIRE_OPTIONS. Used when driver is mapepire. */
   mapepireOptions?: Record<string, string>;
+  /** Seconds before a statement is cancelled, from a profile's queryTimeout. Unset means QUERY_TIMEOUT. */
+  queryTimeout?: number;
 }
 
 /**
@@ -261,6 +278,15 @@ export function odbcConnectionSecurity(
 export const MAPEPIRE_TRANSPORTS = ['ssh', 'daemon'] as const;
 export type MapepireTransport = (typeof MAPEPIRE_TRANSPORTS)[number];
 
+/**
+ * How the Mapepire server started over SSH connects to Db2. `tcp` (the
+ * default) is the Toolbox (jt400) driver to the database host server on the
+ * same system. `cli` is the native JDBC driver in the SSH job, which fails
+ * when the job CCSID is 65535 on mapepire-server 2.4 and later.
+ */
+export const MAPEPIRE_TECHNIQUES = ['cli', 'tcp'] as const;
+export type MapepireTechnique = (typeof MAPEPIRE_TECHNIQUES)[number];
+
 /** How the SSH host key is checked. */
 export type HostKeyCheck = 'pinned' | 'known_hosts' | 'off';
 
@@ -286,10 +312,17 @@ export interface MapepireSshSettings extends MapepireCommonSettings {
   hostKeyCheck: HostKeyCheck;
   /** Private key file for SSH login instead of the password. */
   privateKeyFile?: string;
+  /**
+   * SSH agent for the login, passed to ssh2 as is: the agent socket path
+   * (from SSH_AUTH_SOCK when `agent=true`), a Windows named pipe, or `pageant`.
+   */
+  agent?: string;
   /** Java binary on the IBM i. Unset means the mapepire-js default. */
   javaPath?: string;
   /** Server JAR already on the IBM i. Unset means the bundled JAR is installed privately. */
   serverPath?: string;
+  /** How the server connects to Db2. Defaults to `tcp`. */
+  technique: MapepireTechnique;
 }
 
 /** Settings of every implemented transport. A daemon member is added with that transport. */
@@ -306,8 +339,10 @@ const MAPEPIRE_OPTION_KEYS = [
   'knownHostsFile',
   'insecureHostKey',
   'privateKeyFile',
+  'agent',
   'javaPath',
   'serverPath',
+  'technique',
 ] as const;
 
 /**
@@ -396,6 +431,19 @@ export function resolveMapepireSettings(
     throw new Error(`${label}: set either hostKey or insecureHostKey=true, not both`);
   }
 
+  const rawTechnique = mapepireOption(options, 'technique')?.toLowerCase();
+  if (rawTechnique !== undefined && !(MAPEPIRE_TECHNIQUES as readonly string[]).includes(rawTechnique)) {
+    throw new Error(
+      `${label}: technique must be one of: ${MAPEPIRE_TECHNIQUES.join(', ')}, got "${rawTechnique}"`
+    );
+  }
+
+  const privateKeyFile = mapepireOption(options, 'privateKeyFile');
+  const agent = mapepireAgent(options, label);
+  if (privateKeyFile !== undefined && agent !== undefined) {
+    throw new Error(`${label}: set either privateKeyFile or agent, not both`);
+  }
+
   return {
     transport,
     startupTimeout: mapepireInt(options, 'startupTimeout', 60_000, 1_000, label),
@@ -406,31 +454,76 @@ export function resolveMapepireSettings(
     hostKey: hostKey?.replace(/=$/, ''),
     knownHostsFile: mapepireOption(options, 'knownHostsFile') ?? defaultKnownHostsFile(),
     hostKeyCheck: insecureHostKey ? 'off' : hostKey !== undefined ? 'pinned' : 'known_hosts',
-    privateKeyFile: mapepireOption(options, 'privateKeyFile'),
+    privateKeyFile,
+    agent,
     javaPath: mapepireOption(options, 'javaPath'),
     serverPath: mapepireOption(options, 'serverPath'),
+    technique: (rawTechnique as MapepireTechnique | undefined) ?? 'tcp',
   };
 }
 
+/** Mapepire options that make SSH log in with a key instead of the password. */
+const SSH_KEY_LOGIN_OPTIONS = ['privateKeyFile', 'agent'] as const;
+
 /**
- * True when the mapepire driver logs in over SSH with a private key, so no
- * password is needed.
+ * The SSH agent the `agent` option asks for. `true` reads SSH_AUTH_SOCK,
+ * `false` means none, `pageant` is PuTTY's agent on Windows, and anything
+ * else must be an absolute socket path or a Windows named pipe, so a typo
+ * fails at startup instead of on the first query.
+ */
+function mapepireAgent(options: Record<string, string>, label: string): string | undefined {
+  const raw = mapepireOption(options, 'agent');
+  if (raw === undefined) {
+    return undefined;
+  }
+  const value = raw.toLowerCase();
+  if (value === 'false') {
+    return undefined;
+  }
+  if (value === 'true') {
+    const socket = process.env.SSH_AUTH_SOCK?.trim();
+    if (!socket) {
+      throw new Error(
+        `${label}: agent=true needs SSH_AUTH_SOCK in the environment. Start ssh-agent, or set agent to the socket path`
+      );
+    }
+    return socket;
+  }
+  if (value === 'pageant') {
+    return 'pageant';
+  }
+  if (/^(\/|[A-Za-z]:[\\/]|\\\\[.?]\\pipe\\)/.test(raw)) {
+    return raw;
+  }
+  throw new Error(`${label}: agent must be true, false, pageant or an absolute socket path, got "${raw}"`);
+}
+
+/**
+ * True when the mapepire driver logs in over SSH with a private key or an
+ * agent, so no password is needed. Does not resolve the agent socket, so a
+ * missing SSH_AUTH_SOCK is reported by resolveMapepireSettings with its label.
  */
 export function usesSshKeyLogin(
   driver: DbDriverName,
   mapepireOptions: Record<string, string> | undefined
 ): boolean {
-  return driver === 'mapepire' && mapepireOption(mapepireOptions ?? {}, 'privateKeyFile') !== undefined;
+  if (driver !== 'mapepire') {
+    return false;
+  }
+  const options = mapepireOptions ?? {};
+  const agent = mapepireOption(options, 'agent')?.toLowerCase();
+  return mapepireOption(options, 'privateKeyFile') !== undefined || (agent !== undefined && agent !== 'false');
 }
 
 /**
- * Mapepire options without `privateKeyFile`, so SSH logs in with the
+ * Mapepire options without `privateKeyFile` or `agent`, so SSH logs in with the
  * configured password. An HTTP /auth login checks the caller's password by
- * connecting, and the server's own key would let any password through.
+ * connecting, and the server's own key or agent would let any password through.
  */
 export function withoutSshKeyLogin(mapepireOptions: Record<string, string> | undefined): Record<string, string> {
+  const dropped = new Set<string>(SSH_KEY_LOGIN_OPTIONS.map((key) => key.toLowerCase()));
   return Object.fromEntries(
-    Object.entries(mapepireOptions ?? {}).filter(([key]) => key.toLowerCase() !== 'privatekeyfile')
+    Object.entries(mapepireOptions ?? {}).filter(([key]) => !dropped.has(key.toLowerCase()))
   );
 }
 
@@ -685,6 +778,12 @@ export function buildOdbcConnectionConfig(
   if (odbcOption(extra, 'trimchar') === undefined) {
     keywords['TRIMCHAR'] = '1';
   }
+  // node-odbc reads character data as UTF-8. Without CCSID=1208 the driver
+  // sends it in another code page, and every non-ASCII character (Ä, Ö, €)
+  // arrives as U+FFFD. JT400 and Mapepire convert to Unicode themselves.
+  if (odbcOption(extra, 'ccsid') === undefined) {
+    keywords['CCSID'] = '1208';
+  }
 
   const readOnly = options?.readOnly !== false;
 
@@ -765,6 +864,82 @@ export const DEFAULT_RATE_LIMIT: RateLimitConfig = {
 };
 
 /**
+ * A per-client-IP request limit over a fixed window
+ */
+export interface IpRateLimitConfig {
+  /** Requests allowed per IP address in the window */
+  limit: number;
+  /** Window length in milliseconds */
+  windowMs: number;
+}
+
+/**
+ * Longest window the in-memory rate limit store accepts. Its cleanup timer uses
+ * setInterval, which fires every millisecond for larger delays and would clear
+ * the counts almost at once.
+ */
+export const MAX_RATE_LIMIT_WINDOW_MS = 2 ** 31 - 1;
+
+/**
+ * Default login rate limit: POST /auth and the OAuth sign-in form share it.
+ *
+ * Environment variables:
+ * - AUTH_RATE_LIMIT_MAX_ATTEMPTS: Attempts per IP address in the window (default: 5)
+ * - AUTH_RATE_LIMIT_WINDOW_MS: Window length in milliseconds (default: 60000)
+ */
+export const DEFAULT_AUTH_RATE_LIMIT: IpRateLimitConfig = {
+  limit: 5,
+  windowMs: 60_000, // 1 minute
+};
+
+/**
+ * Default request limit across all /oauth/* endpoints. Generous, because
+ * hosted clients such as claude.ai share egress addresses.
+ *
+ * Environment variables:
+ * - OAUTH_RATE_LIMIT_MAX_REQUESTS: Requests per IP address in the window (default: 120)
+ * - OAUTH_RATE_LIMIT_WINDOW_MS: Window length in milliseconds (default: 60000)
+ */
+export const DEFAULT_OAUTH_RATE_LIMIT: IpRateLimitConfig = {
+  limit: 120,
+  windowMs: 60_000, // 1 minute
+};
+
+/**
+ * Read a per-IP rate limit from a count variable and a window variable.
+ *
+ * @throws Error if either value is not a whole number from 1 up to its maximum
+ */
+function readIpRateLimit(limitVar: string, windowVar: string, defaults: IpRateLimitConfig): IpRateLimitConfig {
+  return {
+    limit: readIntEnvInRange(limitVar, defaults.limit, 1, Number.MAX_SAFE_INTEGER),
+    windowMs: readIntEnvInRange(windowVar, defaults.windowMs, 1, MAX_RATE_LIMIT_WINDOW_MS),
+  };
+}
+
+/**
+ * Get the login rate limit (POST /auth and the OAuth sign-in form) from
+ * environment variables. There is deliberately no switch to turn this limit
+ * off, and RATE_LIMIT_ENABLED does not affect it, because it guards against
+ * password guessing.
+ *
+ * @throws Error if either value is out of range
+ */
+export function getAuthRateLimitConfig(): IpRateLimitConfig {
+  return readIpRateLimit('AUTH_RATE_LIMIT_MAX_ATTEMPTS', 'AUTH_RATE_LIMIT_WINDOW_MS', DEFAULT_AUTH_RATE_LIMIT);
+}
+
+/**
+ * Get the OAuth endpoint rate limit from environment variables. Like the login
+ * limit, it has no off switch and RATE_LIMIT_ENABLED does not affect it.
+ *
+ * @throws Error if either value is out of range
+ */
+export function getOAuthRateLimitConfig(): IpRateLimitConfig {
+  return readIpRateLimit('OAUTH_RATE_LIMIT_MAX_REQUESTS', 'OAUTH_RATE_LIMIT_WINDOW_MS', DEFAULT_OAUTH_RATE_LIMIT);
+}
+
+/**
  * Query limit configuration interface
  */
 export interface QueryLimitConfig {
@@ -787,6 +962,44 @@ export function readIntEnv(name: string, fallback: number): number {
     throw new Error(`${name} must be a whole number, got "${raw}"`);
   }
   return Number.parseInt(raw, 10);
+}
+
+/**
+ * Read an integer environment variable that must fall within [min, max].
+ *
+ * @throws Error if the value is not a whole number or is out of range
+ */
+export function readIntEnvInRange(name: string, fallback: number, min: number, max: number): number {
+  const value = readIntEnv(name, fallback);
+  // The messages leave out the value, so config values never reach an error log
+  if (value < min) {
+    throw new Error(`${name} must be at least ${min}`);
+  }
+  if (value > max) {
+    throw new Error(`${name} must be at most ${max}`);
+  }
+  return value;
+}
+
+/** Longest QUERY_TIMEOUT or profile queryTimeout, in seconds: one day. */
+export const MAX_QUERY_TIMEOUT_SECONDS = 86_400;
+
+/**
+ * Seconds a statement may run before it is cancelled on the IBM i, from
+ * QUERY_TIMEOUT. The default is 120, and 0 turns the limit off.
+ *
+ * @throws Error if the value is not a whole number from 0 to one day
+ */
+export function getQueryTimeoutSeconds(): number {
+  return readIntEnvInRange('QUERY_TIMEOUT', 120, 0, MAX_QUERY_TIMEOUT_SECONDS);
+}
+
+/**
+ * The statement time limit for a system in milliseconds: the profile's
+ * queryTimeout, else QUERY_TIMEOUT. 0 means no limit.
+ */
+export function queryTimeoutMs(config: DB2iConfig): number {
+  return (config.queryTimeout ?? getQueryTimeoutSeconds()) * 1000;
 }
 
 /**
@@ -830,6 +1043,8 @@ export function applyQueryLimit(
  */
 export const TOOL_NAMES = [
   'execute_query',
+  // Registered only when EXPORT_ENABLED is set as well
+  'export_query',
   'list_schemas',
   'list_tables',
   'search_tables',
@@ -838,12 +1053,16 @@ export const TOOL_NAMES = [
   'list_views',
   'list_indexes',
   'get_table_constraints',
+  'list_routines',
+  'describe_routine',
   'validate_query',
   'get_object_ddl',
   'get_related_objects',
   'get_journal_info',
+  'index_advice',
   'profile_table',
   'get_business_context',
+  'search_ibmi_services',
 ] as const;
 
 /**
@@ -1002,6 +1221,40 @@ export function isQueryParseCheckEnabled(): boolean {
   return value !== 'false' && value !== '0';
 }
 
+const BUILD_ID = /^[A-Za-z0-9._+-]{1,64}$/;
+
+/**
+ * Build identifier written to every audit line, such as the git commit the image
+ * was built from. Undefined when unset.
+ *
+ * Environment variable:
+ * - MCP_BUILD_ID: 1 to 64 letters, digits and `._+-`
+ */
+export function getBuildId(): string | undefined {
+  const value = process.env.MCP_BUILD_ID?.trim();
+  if (!value) {
+    return undefined;
+  }
+  if (!BUILD_ID.test(value)) {
+    // The message leaves out the value, so config values never reach an error log
+    throw new Error('MCP_BUILD_ID must be 1 to 64 letters, digits and . _ + -');
+  }
+  return value;
+}
+
+/** Default for QUERY_MAX_LENGTH, in characters. */
+export const DEFAULT_QUERY_MAX_LENGTH = 32_768;
+
+/**
+ * Longest SQL statement the security validator accepts.
+ *
+ * Environment variable:
+ * - QUERY_MAX_LENGTH: characters, default 32768, from 1 to 2097152 (the CLOB(2M) that PARSE_STATEMENT takes)
+ */
+export function getQueryMaxLength(): number {
+  return readIntEnvInRange('QUERY_MAX_LENGTH', DEFAULT_QUERY_MAX_LENGTH, 1, 2_097_152);
+}
+
 /**
  * Whether YAML tool files are re-read when they change.
  *
@@ -1011,6 +1264,29 @@ export function isQueryParseCheckEnabled(): boolean {
 export function isCustomToolsWatchEnabled(): boolean {
   const value = process.env.MCP_CUSTOM_TOOLS_WATCH?.trim().toLowerCase();
   return value === 'true' || value === '1';
+}
+
+/**
+ * Whether every tool takes an optional `context` argument: the model's one-sentence
+ * reason for the call. The server strips it before the tool runs and writes it to the
+ * audit log as `intent`. Off by default, because the text comes from the user's prompt.
+ *
+ * Environment variable:
+ * - MCP_TOOL_INTENT: `true` or `1` turns it on. Anything else, including unset, leaves it off.
+ */
+export function isToolIntentEnabled(): boolean {
+  const value = process.env.MCP_TOOL_INTENT?.trim().toLowerCase();
+  return value === 'true' || value === '1';
+}
+
+/**
+ * MCP_UI_ENABLED: offer the result view (ui://db2i/result), a grid and chart
+ * that hosts with MCP Apps support show next to row results, and the
+ * execute_query `chart` argument. On unless set to false or 0.
+ */
+export function isUiEnabled(): boolean {
+  const value = process.env.MCP_UI_ENABLED?.trim().toLowerCase();
+  return value !== 'false' && value !== '0';
 }
 
 /**
@@ -1058,6 +1334,75 @@ export function getAuditConfig(): AuditConfig | undefined {
     target: target === 'stderr' ? 'stderr' : { path: target },
     sql,
     params: process.env.MCP_AUDIT_PARAMS?.trim().toLowerCase() === 'true',
+  };
+}
+
+export interface ExportConfig {
+  /** Directory export files are written to. */
+  dir: string;
+  maxRows: number;
+  /** Largest export file in bytes. */
+  maxBytes: number;
+  /** Seconds an export may take, the open and every fetch together. 0 means no limit. */
+  timeoutSeconds: number;
+  /** Minutes a finished export can be downloaded. */
+  ttlMinutes: number;
+  /** Downloads a link allows before it stops working. HEAD requests do not count. */
+  maxDownloads: number;
+  /** Exports running at the same time. Each holds a connection or job. */
+  maxConcurrent: number;
+  /** Bytes all export files in the directory may take together. */
+  dirMaxBytes: number;
+  /** MCP_PUBLIC_URL, the origin download links use in HTTP mode. */
+  publicUrl?: string;
+}
+
+/** 100 MB. */
+const DEFAULT_EXPORT_MAX_BYTES = 100 * 1024 * 1024;
+/** 1 GB. */
+const DEFAULT_EXPORT_DIR_MAX_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Query exports (export_query). Off unless EXPORT_ENABLED is true and
+ * EXPORT_DIR is set.
+ *
+ * - EXPORT_ENABLED: `true` or `1` turns exports on.
+ * - EXPORT_DIR: directory for export files, created with mode 0700.
+ * - EXPORT_MAX_ROWS: rows per export (default 100000).
+ * - EXPORT_MAX_BYTES: bytes per export file (default 100 MB).
+ * - EXPORT_TIMEOUT: seconds per export (default QUERY_TIMEOUT, 0 for none).
+ * - EXPORT_TTL_MINUTES: minutes a file can be downloaded (default 15).
+ * - EXPORT_MAX_DOWNLOADS: downloads per link before it stops working (default 3).
+ * - EXPORT_MAX_CONCURRENT: exports at the same time (default 2).
+ * - EXPORT_DIR_MAX_BYTES: bytes all export files may take (default 1 GB).
+ *
+ * @returns The settings, or undefined when exports are off
+ * @throws Error when exports are on and a setting is invalid
+ */
+export function getExportConfig(): ExportConfig | undefined {
+  const enabled = process.env.EXPORT_ENABLED?.trim().toLowerCase();
+  if (enabled !== 'true' && enabled !== '1') {
+    return undefined;
+  }
+  const dir = process.env.EXPORT_DIR?.trim();
+  if (!dir) {
+    throw new Error('EXPORT_DIR is required when EXPORT_ENABLED is set');
+  }
+  return {
+    dir,
+    maxRows: readIntEnvInRange('EXPORT_MAX_ROWS', 100_000, 1, 10_000_000),
+    maxBytes: readIntEnvInRange('EXPORT_MAX_BYTES', DEFAULT_EXPORT_MAX_BYTES, 1024, Number.MAX_SAFE_INTEGER),
+    timeoutSeconds: readIntEnvInRange(
+      'EXPORT_TIMEOUT',
+      getQueryTimeoutSeconds(),
+      0,
+      MAX_QUERY_TIMEOUT_SECONDS
+    ),
+    ttlMinutes: readIntEnvInRange('EXPORT_TTL_MINUTES', 15, 1, 1440),
+    maxDownloads: readIntEnvInRange('EXPORT_MAX_DOWNLOADS', 3, 1, 100),
+    maxConcurrent: readIntEnvInRange('EXPORT_MAX_CONCURRENT', 2, 1, 100),
+    dirMaxBytes: readIntEnvInRange('EXPORT_DIR_MAX_BYTES', DEFAULT_EXPORT_DIR_MAX_BYTES, 1024, Number.MAX_SAFE_INTEGER),
+    publicUrl: readPublicUrl(),
   };
 }
 
@@ -1125,6 +1470,8 @@ export interface HttpConfig {
   tokenExpiry: number;
   /** Maximum concurrent sessions (default: 100) */
   maxSessions: number;
+  /** Seconds an HTTP session's pools may sit unused before their connections close. 0 = never. */
+  poolIdleTimeout: number;
   /** CORS allowed origins (comma-separated, '*' for all, empty for none) */
   corsOrigins: string[];
   /** Host header names that may reach this server. Always includes loopback. */
@@ -1136,6 +1483,203 @@ export interface HttpConfig {
    * nor DB2I_HOSTNAME is set, so any host is accepted.
    */
   authAllowedDbHosts: string[] | null;
+  /** Login attempt limit for POST /auth and the OAuth sign-in form */
+  authRateLimit: IpRateLimitConfig;
+  /** Request limit across the /oauth/* endpoints. The defaults, unread, when MCP_OAUTH_ENABLED is off. */
+  oauthRateLimit: IpRateLimitConfig;
+  /** Built-in OAuth authorization server. Null when MCP_OAUTH_ENABLED is off. */
+  oauth: OAuthConfig | null;
+  /**
+   * Express 'trust proxy' setting from MCP_TRUST_PROXY: false (default), true,
+   * a hop count, or a comma-separated list of proxy addresses or subnets.
+   */
+  trustProxy: boolean | number | string;
+}
+
+/**
+ * Built-in OAuth 2.1 authorization server for remote MCP clients.
+ */
+export interface OAuthConfig {
+  /** External base URL (origin only). Issuer of the authorization server. */
+  publicUrl: string;
+  /** Protected resource identifier: `${publicUrl}/mcp`. */
+  resource: string;
+  /** Redirect URIs clients may register: exact URLs, or prefixes ending in `*`. */
+  redirectUris: string[];
+  /** Key that signs client IDs and login requests. */
+  secret: Buffer;
+  /** True when MCP_OAUTH_SECRET is unset and the key is random for this process. */
+  ephemeralSecret: boolean;
+  /** Refresh token lifetime in seconds. 0 turns refresh tokens off. */
+  refreshExpiry: number;
+  /** Encrypted file that keeps refresh grants across restarts. Unset keeps them in memory only. */
+  stateFile?: string;
+  /** Company branding of the sign-in page. Empty keeps the default look. */
+  branding: SignInBranding;
+  /** Sign-in page text in each available language. */
+  text: SignInText;
+}
+
+/**
+ * Callbacks of the Claude web and desktop connectors, and of Cursor. Cursor
+ * returns through its own URL scheme, so the code only reaches the Cursor app
+ * on the user's machine, like a loopback redirect.
+ */
+export const DEFAULT_OAUTH_REDIRECT_URIS = [
+  'https://claude.ai/api/mcp/auth_callback',
+  'https://claude.com/api/mcp/auth_callback',
+  'cursor://anysphere.cursor-mcp/oauth/callback',
+];
+
+/** Variables of the sign-in page. Its files are read again only when one of these changes. */
+const SIGN_IN_PAGE_VARIABLES = [
+  'MCP_OAUTH_BRAND_NAME',
+  'MCP_OAUTH_LOGO',
+  'MCP_OAUTH_TITLE',
+  'MCP_OAUTH_SYSTEM_LABEL',
+  'MCP_OAUTH_ACCENT',
+  'MCP_OAUTH_ACCENT_DARK',
+  'MCP_OAUTH_FONT_FAMILY',
+  'MCP_OAUTH_FONT_FILE',
+  'MCP_OAUTH_LANGUAGE',
+  'MCP_OAUTH_STRINGS',
+];
+
+/** Random signing key used when MCP_OAUTH_SECRET is unset. Stable for the process. */
+let ephemeralOAuthSecret: Buffer | undefined;
+
+/** Last parsed OAuth settings, reused while the variables they come from are unchanged. */
+let oauthConfigCache: { key: string; config: OAuthConfig | null } | undefined;
+
+/**
+ * Read the OAuth authorization server settings.
+ *
+ * - MCP_OAUTH_ENABLED: true or 1 turns it on. Requires MCP_AUTH_MODE=required.
+ * - MCP_PUBLIC_URL: external origin, https unless loopback. Required.
+ * - MCP_OAUTH_REDIRECT_URIS: comma-separated redirect URIs or `prefix*` entries.
+ * - MCP_OAUTH_SECRET: signing key, at least 32 characters.
+ * - MCP_OAUTH_REFRESH_EXPIRY: refresh token lifetime in seconds (default: 7 days).
+ * - MCP_OAUTH_STATE_FILE: encrypted file for refresh grants. Requires MCP_OAUTH_SECRET.
+ * - Sign-in page branding and language: see signInBranding.ts and signInStrings.ts.
+ *
+ * @param authMode - The configured MCP_AUTH_MODE
+ * @returns The settings, or null when OAuth is off
+ * @throws Error when OAuth is on and a setting is missing or invalid
+ */
+export function getOAuthConfig(authMode: AuthMode): OAuthConfig | null {
+  // getHttpConfig() runs on every authenticated request, so skip the parsing when nothing changed
+  const key = JSON.stringify([
+    authMode,
+    process.env.MCP_OAUTH_ENABLED,
+    process.env.MCP_PUBLIC_URL,
+    process.env.MCP_OAUTH_REDIRECT_URIS,
+    process.env.MCP_OAUTH_SECRET,
+    process.env.MCP_OAUTH_REFRESH_EXPIRY,
+    process.env.MCP_OAUTH_STATE_FILE,
+    ...SIGN_IN_PAGE_VARIABLES.map((name) => process.env[name]),
+  ]);
+  if (oauthConfigCache?.key !== key) {
+    oauthConfigCache = { key, config: parseOAuthConfig(authMode) };
+  }
+  return oauthConfigCache.config;
+}
+
+/**
+ * MCP_PUBLIC_URL, the server's external origin: https unless loopback, with no
+ * path, query or credentials. Read only by the features that need it (OAuth
+ * and export download links), so an unused value never stops startup.
+ *
+ * @returns The origin, or undefined when the variable is unset
+ * @throws Error when the value is set but not a valid origin
+ */
+export function readPublicUrl(): string | undefined {
+  const rawUrl = process.env.MCP_PUBLIC_URL?.trim();
+  if (!rawUrl) {
+    return undefined;
+  }
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error('MCP_PUBLIC_URL is not a valid URL');
+  }
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHost(url.hostname))) {
+    throw new Error('MCP_PUBLIC_URL must use https, except for a loopback address');
+  }
+  if ((url.pathname !== '/' && url.pathname !== '') || url.search || url.hash || url.username || url.password) {
+    throw new Error('MCP_PUBLIC_URL must be an origin only, without a path, query or credentials');
+  }
+  return url.origin;
+}
+
+function parseOAuthConfig(authMode: AuthMode): OAuthConfig | null {
+  const enabled = process.env.MCP_OAUTH_ENABLED?.trim().toLowerCase();
+  if (enabled !== 'true' && enabled !== '1') {
+    return null;
+  }
+
+  if (authMode !== 'required') {
+    throw new Error('MCP_OAUTH_ENABLED requires MCP_AUTH_MODE=required');
+  }
+
+  const publicUrl = readPublicUrl();
+  if (!publicUrl) {
+    throw new Error('MCP_PUBLIC_URL is required when MCP_OAUTH_ENABLED is set, for example https://mcp.example.com');
+  }
+
+  const redirectUris = (process.env.MCP_OAUTH_REDIRECT_URIS ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  // Errors name the entry by position, so the configured value never reaches a log line
+  redirectUris.forEach((entry, index) => {
+    try {
+      new URL(entry.endsWith('*') ? entry.slice(0, -1) : entry);
+    } catch {
+      throw new Error(`MCP_OAUTH_REDIRECT_URIS entry ${index + 1} is not a valid URL`);
+    }
+    // Without a slash, https://app.example.com* would also match https://app.example.com.evil.net
+    if (entry.endsWith('*') && !entry.endsWith('/*')) {
+      throw new Error(`MCP_OAUTH_REDIRECT_URIS entry ${index + 1}: a prefix must end with "/*"`);
+    }
+  });
+
+  const rawSecret = process.env.MCP_OAUTH_SECRET?.trim();
+  if (rawSecret && rawSecret.length < 32) {
+    throw new Error('MCP_OAUTH_SECRET must be at least 32 characters. Generate with: openssl rand -hex 32');
+  }
+  if (!rawSecret) {
+    ephemeralOAuthSecret ??= crypto.randomBytes(32);
+  }
+
+  const refreshExpiry = readIntEnv('MCP_OAUTH_REFRESH_EXPIRY', 7 * 24 * 3600);
+  if (refreshExpiry < 0) {
+    throw new Error('MCP_OAUTH_REFRESH_EXPIRY must be 0 or more seconds');
+  }
+
+  const stateFile = process.env.MCP_OAUTH_STATE_FILE?.trim() || undefined;
+  if (stateFile && !rawSecret) {
+    // A random key could never read the file again after a restart
+    throw new Error('MCP_OAUTH_STATE_FILE requires MCP_OAUTH_SECRET. Generate with: openssl rand -hex 32');
+  }
+
+  const branding = readSignInBranding();
+  const text = readSignInText({
+    ...(branding.title ? { heading: branding.title } : {}),
+    ...(branding.systemLabel ? { systemLabel: branding.systemLabel } : {}),
+  });
+
+  return {
+    publicUrl,
+    resource: `${publicUrl}/mcp`,
+    redirectUris: redirectUris.length > 0 ? redirectUris : DEFAULT_OAUTH_REDIRECT_URIS,
+    secret: rawSecret ? Buffer.from(rawSecret, 'utf8') : (ephemeralOAuthSecret as Buffer),
+    ephemeralSecret: !rawSecret,
+    refreshExpiry,
+    ...(stateFile ? { stateFile: resolve(stateFile) } : {}),
+    branding,
+    text,
+  };
 }
 
 /**
@@ -1205,7 +1749,7 @@ export function isLoopbackHost(host: string): boolean {
  * Loopback is always included. The bind address is included unless it is
  * 0.0.0.0 or ::. MCP_ALLOWED_HOSTS adds more names.
  */
-function getAllowedHosts(bindHost: string): string[] {
+function getAllowedHosts(bindHost: string, publicUrl?: string): string[] {
   const configured = (process.env.MCP_ALLOWED_HOSTS ?? '')
     .split(',')
     .map((entry) => hostnameOf(entry))
@@ -1218,6 +1762,9 @@ function getAllowedHosts(bindHost: string): string[] {
   }
   for (const host of configured) {
     allowed.add(host);
+  }
+  if (publicUrl) {
+    allowed.add(new URL(publicUrl).hostname.replace(/^\[|\]$/g, '').toLowerCase());
   }
   return [...allowed];
 }
@@ -1248,6 +1795,26 @@ export function getAuthAllowedDbHosts(): string[] | null {
 /** Lowercase a host name and drop a trailing dot, for comparing hosts. */
 export function normalizeDbHost(host: string): string {
   return host.trim().replace(/\.$/, '').toLowerCase();
+}
+
+/**
+ * Parse MCP_TRUST_PROXY into Express's 'trust proxy' value.
+ * Unset, false or 0 trusts no proxy. A number is a hop count. Any other value
+ * is passed through as a comma-separated list of addresses or subnets.
+ */
+function getTrustProxy(): boolean | number | string {
+  const raw = process.env.MCP_TRUST_PROXY?.trim();
+  if (!raw || raw.toLowerCase() === 'false') {
+    return false;
+  }
+  if (raw.toLowerCase() === 'true') {
+    return true;
+  }
+  if (/^\d+$/.test(raw)) {
+    const hops = Number(raw);
+    return hops === 0 ? false : hops;
+  }
+  return raw;
 }
 
 function allowUnauthenticatedHttp(): boolean {
@@ -1353,6 +1920,7 @@ export function getHttpConfig(): HttpConfig {
   }
 
   const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+  const oauth = getOAuthConfig(authMode);
 
   return {
     transport: getTransportMode(),
@@ -1364,10 +1932,17 @@ export function getHttpConfig(): HttpConfig {
     tls: getTlsConfig(),
     tokenExpiry: readIntEnv('MCP_TOKEN_EXPIRY', 3600),
     maxSessions: readIntEnv('MCP_MAX_SESSIONS', 100),
+    poolIdleTimeout: readIntEnvInRange('MCP_POOL_IDLE_TIMEOUT', 600, 0, 86_400),
     corsOrigins: getCorsOrigins(),
-    allowedHosts: getAllowedHosts(host),
+    // Export download links point at MCP_PUBLIC_URL too, so its host must pass the Host check
+    allowedHosts: getAllowedHosts(host, oauth?.publicUrl ?? getExportConfig()?.publicUrl),
     allowUnauthenticatedHttp: allowUnauthenticatedHttp(),
     authAllowedDbHosts: getAuthAllowedDbHosts(),
+    authRateLimit: getAuthRateLimitConfig(),
+    // Read only with OAuth on, so an unused variable cannot stop startup
+    oauthRateLimit: oauth ? getOAuthRateLimitConfig() : DEFAULT_OAUTH_RATE_LIMIT,
+    oauth,
+    trustProxy: getTrustProxy(),
   };
 }
 
@@ -1388,7 +1963,7 @@ export function isStdioEnabled(): boolean {
 }
 
 /**
- * Load partial DB2i config from optional parameters with env fallbacks.
+ * Load partial Db2i config from optional parameters with env fallbacks.
  * Used by HTTP auth to build session-specific configs.
  * 
  * @param overrides - Optional overrides for config values

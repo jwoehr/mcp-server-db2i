@@ -5,6 +5,7 @@
  * get_object_ddl returns DDL from QSYS2.GENERATE_SQL.
  * get_related_objects lists dependents from SYSTOOLS.RELATED_OBJECTS.
  * get_journal_info reports journal state from QSYS2.OBJECT_STATISTICS.
+ * search_ibmi_services searches the service catalog in QSYS2.SERVICES_INFO.
  */
 
 import { applyQueryLimit } from '../config.js';
@@ -15,22 +16,29 @@ import {
   inspectStatement,
   isJournalColumnMissing,
   isParseStatementMissing,
+  isServicesInfoMissing,
   JOURNAL_INFO_UNAVAILABLE,
   listJournalInfo,
   listRelatedObjects,
+  listServices,
   PARSE_STATEMENT_UNAVAILABLE,
   schemaExists,
+  SERVICES_INFO_UNAVAILABLE,
+  type IbmiService,
   type JournalInfoRow,
   type RelatedObject,
   type StatementInspection,
 } from '../db/sqlServices.js';
+import { sqlErrorFields, type SqlErrorDetails } from '../db/sqlErrorInfo.js';
 import { validateQuery } from '../utils/security/sqlSecurityValidator.js';
-import { checkQuerySchemas, isSchemaAllowed } from '../utils/security/schemaAllowlist.js';
+import { isSchemaAllowed } from '../utils/security/schemaAllowlist.js';
+import { checkRowFilters } from '../customTools/filters.js';
+import { getCustomTools } from '../customTools/registry.js';
 
 const RELATED_OBJECTS_UNAVAILABLE =
   'SYSTOOLS.RELATED_OBJECTS is not available. It requires IBM i 7.3 Technology Refresh 9, IBM i 7.4 Technology Refresh 3, or a later release.';
 
-export type ValidateQueryResult = {
+export type ValidateQueryResult = SqlErrorDetails & {
   success: boolean;
   error?: string;
   valid?: boolean;
@@ -39,6 +47,9 @@ export type ValidateQueryResult = {
   missingColumns?: string[];
   missingRoutines?: string[];
   violations?: string[];
+  /** Annotated tables whose row filter the statement leaves out. They do not make it invalid. */
+  skippedFilters?: string[];
+  warnings?: string[];
 };
 
 export type ObjectDdlResult = {
@@ -64,6 +75,20 @@ export type JournalInfoResult = {
   data?: JournalInfoRow[];
   count?: number;
   needsAttention?: number;
+  truncated?: boolean;
+};
+
+export type ServiceCategory = {
+  category: string;
+  count: number;
+};
+
+export type SearchServicesResult = {
+  success: boolean;
+  error?: string;
+  categories?: ServiceCategory[];
+  data?: Array<Omit<IbmiService, 'example'> & { example?: string | null }>;
+  count?: number;
   truncated?: boolean;
 };
 
@@ -95,14 +120,9 @@ export async function validateQueryTool(input: {
   const security = validateQuery(input.sql);
   const violations = security.isValid ? [] : [...security.violations];
 
+  // inspectStatement checks the allowlist from the names IBM i's parser returns,
+  // so valid Db2 for i that the JavaScript parser cannot read is not marked invalid
   const allowed = allowedSchemasFor(input.target);
-  if (allowed) {
-    const schemaResult = checkQuerySchemas(input.sql, {
-      allowed,
-      defaultSchema: input.defaultSchema,
-    });
-    violations.push(...schemaResult.violations);
-  }
 
   let inspection: StatementInspection;
   try {
@@ -115,7 +135,7 @@ export async function validateQueryTool(input: {
     if (isParseStatementMissing(error)) {
       return { success: false, error: PARSE_STATEMENT_UNAVAILABLE };
     }
-    return { success: false, error: messageOf(error) };
+    return { success: false, error: messageOf(error), ...sqlErrorFields(error) };
   }
 
   violations.push(...inspection.violations);
@@ -127,6 +147,7 @@ export async function validateQueryTool(input: {
     inspection.missingTables.length === 0 &&
     inspection.missingColumns.length === 0 &&
     inspection.missingRoutines.length === 0;
+  const filters = checkRowFilters(inspection.names, getCustomTools().annotations, input.defaultSchema);
 
   return {
     success: true,
@@ -136,6 +157,8 @@ export async function validateQueryTool(input: {
     missingColumns: inspection.missingColumns,
     missingRoutines: inspection.missingRoutines,
     violations: findings,
+    ...(inspection.parseError ?? {}),
+    ...(filters.tables.length > 0 ? { skippedFilters: filters.tables, warnings: filters.warnings } : {}),
   };
 }
 
@@ -234,6 +257,71 @@ export async function getJournalInfoTool(input: {
   } catch (error) {
     if (isJournalColumnMissing(error)) {
       return { success: false, error: JOURNAL_INFO_UNAVAILABLE };
+    }
+    return { success: false, error: messageOf(error) };
+  }
+}
+
+function byCategoryThenName(a: IbmiService, b: IbmiService): number {
+  return a.category.localeCompare(b.category) || a.service_name.localeCompare(b.service_name);
+}
+
+/**
+ * Search the IBM i service catalog. With no query and no category, list the
+ * categories with a count each, so an agent can browse before it searches.
+ */
+export async function searchIbmiServicesTool(input: {
+  query?: string;
+  category?: string;
+  includeExample?: boolean;
+  searchExamples?: boolean;
+  limit?: number;
+  target?: DbTarget;
+}): Promise<SearchServicesResult> {
+  try {
+    const terms = (input.query ?? '').toUpperCase().split(/\s+/).filter((term) => term.length > 0);
+    const category = input.category?.trim().toUpperCase();
+    const services = await listServices(input.target);
+
+    if (terms.length === 0 && !category) {
+      const counts = new Map<string, number>();
+      for (const service of services) {
+        counts.set(service.category, (counts.get(service.category) ?? 0) + 1);
+      }
+      const categories = [...counts]
+        .map(([name, count]) => ({ category: name, count }))
+        .sort((a, b) => a.category.localeCompare(b.category));
+      return { success: true, categories, count: categories.length };
+    }
+
+    const matches = services
+      .filter((service) => {
+        if (category && service.category.toUpperCase() !== category) {
+          return false;
+        }
+        const haystack = [
+          service.service_name,
+          service.category,
+          input.searchExamples ? (service.example ?? '') : '',
+        ].join('\n').toUpperCase();
+        return terms.every((term) => haystack.includes(term));
+      })
+      .sort(byCategoryThenName);
+
+    const limit = applyQueryLimit(input.limit);
+    const includeExample = input.includeExample ?? true;
+    const data = matches.slice(0, limit).map((service) => {
+      if (includeExample) {
+        return service;
+      }
+      const { example: _example, ...rest } = service;
+      return rest;
+    });
+
+    return { success: true, data, count: data.length, truncated: matches.length > limit };
+  } catch (error) {
+    if (isServicesInfoMissing(error)) {
+      return { success: false, error: SERVICES_INFO_UNAVAILABLE };
     }
     return { success: false, error: messageOf(error) };
   }

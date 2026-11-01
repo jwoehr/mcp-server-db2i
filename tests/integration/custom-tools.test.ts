@@ -10,11 +10,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Client, InMemoryTransport, type CallToolResult } from '@modelcontextprotocol/client';
 
 const mockQuery = vi.fn();
-vi.mock('node-jt400', () => ({
-  pool: vi.fn(() => ({
-    query: mockQuery,
-  })),
-}));
+vi.mock('node-jt400', async () => {
+  const { withExecute } = await import('../helpers/jt400Fake.js');
+  return {
+    pool: vi.fn(() => withExecute({
+      query: mockQuery,
+    })),
+  };
+});
 
 vi.mock('../../src/utils/rateLimiter.js', async (importOriginal) => {
   const original = await importOriginal<typeof import('../../src/utils/rateLimiter.js')>();
@@ -34,9 +37,10 @@ vi.mock('../../src/utils/rateLimiter.js', async (importOriginal) => {
 
 import { TOOL_NAMES } from '../../src/config.js';
 import { loadCustomTools } from '../../src/customTools/loader.js';
-import { resetCustomTools, setCustomTools } from '../../src/customTools/registry.js';
+import { getCustomTools, resetCustomTools, setCustomTools } from '../../src/customTools/registry.js';
+import type { DB2iConfig } from '../../src/config.js';
 import { initializePool } from '../../src/db/connection.js';
-import { createServer } from '../../src/server.js';
+import { createServer, TOOL_META_KEY, type SessionContext } from '../../src/server.js';
 
 function textOf(result: CallToolResult): string {
   return (result.content[0] as { type: 'text'; text: string }).text;
@@ -112,6 +116,16 @@ describe('Custom ERP tools', () => {
     expect(search?.description).toContain('customer');
   });
 
+  it('marks business tools and their toolset in _meta, and leaves built-in tools unmarked', async () => {
+    const { tools } = await client.listTools();
+
+    const search = tools.find((tool) => tool.name === 'search_sales_orders');
+    expect(search?._meta?.[TOOL_META_KEY]).toEqual({ kind: 'business', toolset: 'sales' });
+
+    const executeQuery = tools.find((tool) => tool.name === 'execute_query');
+    expect(executeQuery?._meta?.[TOOL_META_KEY]).toBeUndefined();
+  });
+
   it('runs a sales-order search with bound parameters', async () => {
     mockQuery.mockResolvedValueOnce([
       { ORDERNO: 1001, CUSTNO: '1001', ORDERDATE: '2024-01-15', STATUS: 'O' },
@@ -130,8 +144,24 @@ describe('Custom ERP tools', () => {
 
     const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]];
     expect(sql).toContain('MYLIB.ORDERHDR');
-    expect(sql).toContain('FETCH FIRST 50 ROWS ONLY');
+    expect(sql).toContain('FETCH FIRST 51 ROWS ONLY');
     expect(params).toContain('1001');
+  });
+
+  it('returns BIGINT columns from a YAML tool', async () => {
+    mockQuery.mockResolvedValueOnce([
+      { ORDERNO: 1001n, CUSTNO: '1001', ORDERDATE: '2024-01-15', STATUS: 'O', LINES: 9007199254740993n },
+    ]);
+
+    const result = await client.callTool({
+      name: 'search_sales_orders',
+      arguments: { text: '1001' },
+    }) as CallToolResult;
+
+    expect(result.isError).toBeUndefined();
+    const body = JSON.parse(textOf(result)) as { data: Record<string, unknown>[] };
+    expect(body.data[0]).toMatchObject({ ORDERNO: 1001, LINES: '9007199254740993' });
+    expect(result.structuredContent).toMatchObject({ data: [{ ORDERNO: 1001, LINES: '9007199254740993' }] });
   });
 
   it('returns annotations from get_business_context and describe_table', async () => {
@@ -170,6 +200,7 @@ describe('Custom ERP tools', () => {
       arguments: { schema: 'MYLIB', table: 'ORDERHDR' },
     }) as CallToolResult;
     const describedBody = JSON.parse(textOf(described)) as {
+      filters: unknown[];
       business_description: string;
       relations: unknown[];
       data: Array<{ column_name: string; business_description?: string }>;
@@ -177,6 +208,11 @@ describe('Custom ERP tools', () => {
     expect(describedBody.business_description).toContain('Sales order header');
     expect(describedBody.relations.length).toBeGreaterThan(0);
     expect(describedBody.data[0].business_description).toContain('open');
+    // The row filter comes before the column list, so it is read first
+    expect(Object.keys(describedBody).slice(0, 3)).toEqual(['success', 'filters', 'data']);
+    expect(describedBody.filters).toEqual([
+      { sql: "TRIM(STATFLG) <> 'D'", columns: ['STATFLG'], reason: 'D rows are deleted orders' },
+    ]);
   });
 
   it('adds a business description when listing tables', async () => {
@@ -195,6 +231,92 @@ describe('Custom ERP tools', () => {
 
     expect(body.data[0].business_description).toContain('Sales order header');
     expect(body.data[1].business_description).toBeUndefined();
+  });
+
+  describe('server instructions', () => {
+    async function connectOther(session?: SessionContext): Promise<{ instructions?: string; queryDescription?: string }> {
+      const [otherClientTransport, otherServerTransport] = InMemoryTransport.createLinkedPair();
+      const otherServer = createServer(session);
+      await otherServer.connect(otherServerTransport);
+      const otherClient = new Client({ name: 'instructions-test', version: '1.0.0' });
+      await otherClient.connect(otherClientTransport);
+      const instructions = otherClient.getInstructions();
+      const { tools } = await otherClient.listTools();
+      await otherClient.close();
+      await otherClientTransport.close();
+      await otherServerTransport.close();
+      return {
+        instructions,
+        queryDescription: tools.find((tool) => tool.name === 'execute_query')?.description,
+      };
+    }
+
+    it('sends the built-in part and the file text', () => {
+      const instructions = client.getInstructions() ?? '';
+
+      expect(instructions).toContain('get_business_context');
+      expect(instructions).toContain('Business SQL tools');
+      expect(instructions).toContain("TRIM(STATFLG) <> 'D'");
+    });
+
+    it('names only the context tools that are registered', async () => {
+      process.env.MCP_TOOLS_DISABLED = 'get_business_context';
+
+      const { instructions } = await connectOther();
+
+      expect(instructions).not.toContain('get_business_context');
+      expect(instructions).toContain('with describe_table,');
+      expect(instructions).toContain("TRIM(STATFLG) <> 'D'");
+    });
+
+    it('leaves out the text of a file whose tools are all disabled', async () => {
+      expect(client.getInstructions()).toContain('Use search_sales_orders');
+
+      process.env.MCP_TOOLS_DISABLED = 'toolset:sales';
+      const { instructions } = await connectOther();
+
+      expect(instructions).not.toContain('search_sales_orders');
+      expect(instructions).toContain("TRIM(STATFLG) <> 'D'");
+    });
+
+    it('leaves out the business tool parts in a session bound to another system', async () => {
+      const loaded = getCustomTools();
+      setCustomTools({ ...loaded, tools: loaded.tools.map((tool) => ({ ...tool, system: 'other' })) });
+
+      const { instructions } = await connectOther({
+        sessionId: 'instructions-token',
+        binding: { system: 'default', config: { username: 'test-user' } as DB2iConfig },
+      });
+
+      expect(instructions).not.toContain('Business SQL tools');
+      expect(instructions).not.toContain('search_sales_orders');
+      expect(instructions).toContain("TRIM(STATFLG) <> 'D'");
+    });
+
+    it('sends no instructions without custom files', async () => {
+      resetCustomTools();
+
+      expect((await connectOther()).instructions).toBeUndefined();
+    });
+
+    it('points execute_query at get_business_context', async () => {
+      const { tools } = await client.listTools();
+
+      expect(tools.find((tool) => tool.name === 'execute_query')?.description)
+        .toContain('call get_business_context');
+    });
+
+    it('keeps the plain execute_query description without annotations or a context tool', async () => {
+      process.env.MCP_TOOLS_DISABLED = 'get_business_context';
+      expect((await connectOther()).queryDescription).toContain('call describe_table');
+
+      process.env.MCP_TOOLS_DISABLED = 'get_business_context,describe_table';
+      expect((await connectOther()).queryDescription).not.toContain('Some tables have business rules');
+
+      delete process.env.MCP_TOOLS_DISABLED;
+      resetCustomTools();
+      expect((await connectOther()).queryDescription).not.toContain('Some tables have business rules');
+    });
   });
 
   it('limits registration to one toolset', async () => {

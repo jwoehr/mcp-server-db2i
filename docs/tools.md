@@ -1,0 +1,217 @@
+---
+title: Tools, resources, and prompts
+sidebarTitle: Tools
+description: The built-in MCP tools, resources, and prompts that mcp-server-db2i registers.
+---
+
+Every tool is read-only. Each one can be turned off with `MCP_TOOLS_DISABLED`, or the list narrowed with `MCP_TOOLS_ENABLED` (see [Tool selection](configuration.md#tool-selection)). With several systems configured, every tool takes an optional `system` argument (see [Multiple systems](configuration.md#multiple-systems)). With `MCP_TOOL_INTENT=true`, every tool also takes an optional `context` argument: one sentence on why the call is made, written to the audit log and not used by the tool (see [Intent](security.md#intent)). [Business SQL tools](custom-tools.md) loaded from YAML appear next to these.
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `execute_query` | Execute read-only SELECT queries, with an optional `chart` hint for the [result view](#result-view) |
+| `export_query` | Write every row of a read-only query to a CSV or XLSX file: a path over stdio, a short-lived download link over HTTP. Off unless `EXPORT_ENABLED` is set |
+| `list_schemas` | List schemas/libraries (with optional filter) |
+| `list_tables` | List tables in a schema (with optional filter) |
+| `search_tables` | Find tables by name or description across libraries |
+| `search_columns` | Find columns by name or description across libraries |
+| `describe_table` | Get detailed column information |
+| `list_views` | List views in a schema (with optional filter) |
+| `list_indexes` | List SQL indexes for a table |
+| `get_table_constraints` | Get primary keys, foreign keys, unique constraints |
+| `list_routines` | List SQL procedures and functions in a library, with language, external program, and SQL data access |
+| `describe_routine` | Parameters, return value or result columns, and a call template for a procedure or function |
+| `validate_query` | Check a statement without running it, including catalog names |
+| `get_object_ddl` | Return the SQL DDL that recreates an object |
+| `get_related_objects` | List objects that depend on a table |
+| `get_journal_info` | List journal, images, and primary key per table, and flag tables a replication tool cannot read |
+| `index_advice` | List the indexes the query optimizer asked for in a library, merged and ranked by temporary index use |
+| `profile_table` | Row count, last change, and per-column distinct and null counts from stored statistics or a scan |
+| `get_business_context` | List business descriptions, row filters and relations loaded from YAML |
+| `search_ibmi_services` | Find IBM i services by keyword or category, with the release that added each one and an example query |
+
+> **Note:** `list_indexes` and `get_table_constraints` query the `QSYS2` SQL catalog views and only return SQL-defined objects. Legacy DDS Logical Files and Physical File constraints are not included.
+
+### Procedures and functions
+
+`list_routines` reads `QSYS2.SYSROUTINES` for one library and returns one row per specific routine, so each overload of a name is its own row. `filter` uses the same wildcards as `list_tables`, and `type` narrows the list to `PROCEDURE` or `FUNCTION`.
+
+| Field | Meaning |
+|-------|---------|
+| `type` | `PROCEDURE`, `SCALAR FUNCTION`, or `TABLE FUNCTION` |
+| `language` | `SQL` for an SQL routine, otherwise the external language such as `RPGLE`, `CLLE`, or `C` |
+| `external_name` | The program or service program an external routine calls |
+| `sql_data_access` | `NO SQL`, `CONTAINS SQL`, `READS SQL DATA`, or `MODIFIES SQL DATA` |
+| `result_sets` | Result sets a procedure can return. Null for functions |
+| `parameter_count`, `text`, `last_altered` | Number of parameters, the routine's text, and when it last changed |
+
+`describe_routine` reads `QSYS2.SYSPARMS` for a routine. An overloaded name returns every overload unless `specific_name` picks one. Each result has the fields above plus:
+
+| Field | Meaning |
+|-------|---------|
+| `parameters` | In order, with `mode` (`IN`, `OUT`, or `INOUT`), `data_type`, `length`, `precision`, `scale`, `nullable`, and `default` as SQL text |
+| `returns` | The return value of a scalar function |
+| `result_columns` | The result columns of a table function |
+| `call_template` | A statement with a `?` marker per parameter, with named arguments when every parameter has a name |
+| `callable_with_execute_query` | Whether `execute_query` can run the template. `note` says why not |
+
+Templates look like `CALL MYLIB.GET_ORDER(ORDERNO => ?)`, `SELECT MYLIB.ORDER_TOTAL(ORDERNO => ?) FROM SYSIBM.SYSDUMMY1`, and `SELECT * FROM TABLE(MYLIB.OPEN_ORDERS(CUSTNO => ?)) X`. `execute_query` runs only `SELECT`, so procedures and functions that modify SQL data are never callable through it. While `QUERY_ALLOWED_SCHEMAS` is set, statements are parsed to check their libraries, and the parser does not read named arguments in a scalar call. A scalar function's template then uses positional markers and is callable only when `SYSIBM` is in the list too, because it reads `SYSIBM.SYSDUMMY1`. A table function's template, `TABLE(MYLIB.OPEN_ORDERS(CUSTNO => ?))`, passes the check.
+
+### Index advice
+
+`index_advice` reads the IBM i index advisor (`QSYS2.SYSIXADV`) for one library, or one table in it. The advisor keeps a row per reason code and variant, so the tool merges rows with the same table, key columns, and index type and sums their counts. `rows_merged` says how many advisor rows each result stands for.
+
+| Field | Meaning |
+|-------|---------|
+| `key_columns` | Keys in `CREATE INDEX` order. A key can end in `DESC` |
+| `index_type` | `RADIX` or `ENCODED VECTOR` |
+| `times_advised` | How often the optimizer asked for this index |
+| `mti_used`, `mti_created` | How often it used and built a maintained temporary index (MTI) instead |
+| `last_advised`, `last_mti_used` | Latest advice and latest MTI use, in the system's local time |
+| `reasons` | Reason codes with IBM's description, such as `I1` (row selection) and `I2` (ordering or grouping) |
+
+Results are sorted by `mti_used`, then `times_advised`. Advice the optimizer kept building a temporary index for is the strongest candidate for a permanent one. `since` keeps only advisor rows last given on or after that date or timestamp, also in the system's local time. The tool only reads the advice. Review it before creating an index, because the advisor does not check whether an existing index or keyed logical file already covers the keys.
+
+### Row limit
+
+`execute_query` returns at most `limit` rows (default `QUERY_DEFAULT_LIMIT`, never above `QUERY_MAX_LIMIT`), and a business SQL tool at most its `maxRows`. The result has `limitApplied` and `truncated`. The server asks Db2 for one row more than the limit, so `truncated: true` means more rows match than were returned, and `truncated: false` means the result is complete. A `FETCH FIRST` in the statement that is smaller than the limit is kept, and reaching it is not reported as truncation. The server adds its `FETCH FIRST` before clauses that Db2 for i requires after it, such as `FOR READ ONLY`, `OPTIMIZE FOR n ROWS` or an isolation clause like `WITH UR`, and ignores a limit written inside a comment or a string.
+
+### Warnings
+
+A successful `execute_query` or business SQL tool result can carry `warnings`, which the agent should pass on to the user:
+
+- A result cut at the row limit (`truncated: true`) says so and suggests narrowing the filter or aggregating.
+- A query that reads an annotated table without using its row filter, such as the flag for deleted rows. The table is also listed in `skippedFilters`. See [Row filters](custom-tools.md#row-filters).
+- With the `odbc` driver, `DECIMAL` and `NUMERIC` columns whose values have more than 15 digits and were rounded. See [Values that differ by driver](configuration.md#values-that-differ-by-driver).
+
+### Result view
+
+`execute_query`, `profile_table` and business SQL tools point to the resource `ui://db2i/result` (an [MCP Apps](https://modelcontextprotocol.io/extensions/apps) view). Hosts that support MCP Apps, such as Claude and the [example web app](web-app.md), show the rows under the tool call as a chart and a sortable, filterable grid. Other hosts ignore it and show the text result. `MCP_UI_ENABLED=false` turns the view off.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/result-view-dark.png" />
+    <img src="assets/result-view.png" alt="Three result views: stacked bars of order lines by warehouse and status, a line chart of monthly totals for three statuses, and a doughnut of orders by status with the total in the middle" width="900" />
+  </picture>
+</p>
+
+Results with rows also carry `columns`, each column's `name` and `kind` (`int`, `bigint`, `decimal`, `float`, `string`, `date`, `time`, `timestamp`, `binary` or `other`), whatever the setting. A masked column is reported as `string`.
+
+`execute_query` takes an optional `chart` argument. The model passes it only when the user asks for a chart or graph:
+
+```json
+{
+  "sql": "SELECT MONTH(ORDDATE) AS MONTH, SUM(AMOUNT) AS TOTAL FROM MYLIB.ORDERS WHERE YEAR(ORDDATE) = 2026 GROUP BY MONTH(ORDDATE) ORDER BY 1",
+  "chart": { "type": "line", "x": "MONTH", "y": ["TOTAL"] }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `type` | `bar`, `line`, `area`, `pie`, `doughnut`, `scatter`, `pareto`, `waterfall`, `histogram`, `kpi`, or `table` for no chart |
+| `x` | Column for categories or time |
+| `y` | Measure columns, up to 3. Without it the chart draws the first measure |
+| `series` | Column whose values become separate series, such as `STATUS` |
+| `stacked`, `horizontal` | Stack bar or area series; draw bars horizontally |
+| `target` | Column with a target or budget, drawn as a line over the bars |
+| `title` | Chart title, up to 120 characters |
+
+Every field but `type` is optional, and the view fills in the rest. Column names match without regard to case and come back as the result spells them. When a column is not in the result, the rows are still returned, the hint is dropped, and `chartError` says why. A [business SQL tool](custom-tools.md#tools) can set the same object as its `chart:` block.
+
+With a hint, from the model or a YAML `chart:` block, the view opens on the chart. Without one it opens on the grid, and the Chart tab holds a chart picked from the columns:
+
+| Result | Chart |
+|--------|-------|
+| One row of up to three numbers | KPI tiles |
+| A date or period column and numbers | Line of the first number, split by a category with up to four values |
+| Two category columns and a number | Stacked bars, the smaller category as the series when it has up to four values |
+| One category column and numbers | Bars of the first number, horizontal for more than 12 rows or long labels |
+| Two numbers and no category | Scatter |
+| One number over 10 rows or more | Histogram |
+
+A chart draws one measure unless the hint names more, up to three. A split shows the four largest series and sums the rest into "Other". Numeric codes such as `ORDERNO` or `ITEMNO` are labels, never summed. Dates stored as numbers, `YYYYMMDD` or `CYYMMDD` in a date-named column, are read as dates. A user's choice in the view wins over a hint, and a YAML `chart:` block wins over the rules.
+
+The view is one HTML page built into the server. It reads only the tool result the host gives it and makes no network requests.
+
+### Query exports
+
+`export_query` is for results the user wants as a file, such as "all open orders for customer 1001 as a spreadsheet". It runs a SELECT with the same checks as `execute_query` and writes every row to a file on the server host, instead of returning the rows to the model. It is registered only when `EXPORT_ENABLED=true` and `EXPORT_DIR` are set. See [Query exports](configuration.md#query-exports) for the settings.
+
+| Argument | Meaning |
+|----------|---------|
+| `sql`, `params` | The query, checked like `execute_query`: read-only statements, `QUERY_ALLOWED_SCHEMAS`, the parse check, and column masking |
+| `format` | `xlsx` (default) or `csv` |
+| `filename` | Name for the file, without extension. Letters, digits, `.`, `_` and `-` are kept |
+| `max_rows` | Most rows to write, capped by `EXPORT_MAX_ROWS` |
+
+The result tells the model where the file is and what is in it:
+
+| Field | Meaning |
+|-------|---------|
+| `path` | Over stdio: the file on this machine |
+| `url` | Over HTTP: a download link under `MCP_PUBLIC_URL`, also sent as a `resource_link` |
+| `downloadsAllowed` | How many downloads the link allows (`EXPORT_MAX_DOWNLOADS`, 3 by default) |
+| `expiresAt` | When the file is deleted, after `EXPORT_TTL_MINUTES` |
+| `rowCount`, `bytes`, `columns` | What was written |
+| `truncated` | `rows` or `bytes` when the file stops at the row or size cap, otherwise `false` |
+| `sample` | The first five rows, masked, so the model can check the export looks right |
+| `warnings` | Things to pass on to the user: decimals the driver may have rounded, or text with characters lost in decoding |
+
+- **XLSX** has one sheet with a bold, frozen header row and a filter. Numbers, dates, times and timestamps are typed cells. A decimal column with digits after the point gets a number format with its scale, so `72.5` in a `DECIMAL(9,2)` column shows as `72.50` and still adds up. A decimal or `BIGINT` wider than 15 digits is written as text so it keeps every digit. Text is always text, so a value that starts with `=` never becomes a formula. One sheet holds at most 1,048,575 rows.
+- **CSV** is UTF-8 with a byte order mark, so Excel opens accented characters correctly, and fields are quoted as in RFC 4180. A text value that starts with `=`, `+`, `-` or `@` gets a leading `'`, so a spreadsheet does not run it as a formula. Numbers are never changed.
+- With the `odbc` driver, node-odbc reads `DECIMAL` and `NUMERIC` values as JavaScript numbers, so digits past the 15th are rounded. When a value in the export has 15 or more significant digits, the result has a `warnings` entry naming the column. Use the `jt400` or `mapepire` driver when such values must be exact.
+- Text that contains the replacement character `�` means characters were lost when the driver decoded it. The result then has a `warnings` entry naming the columns. With the `odbc` driver, set `CCSID=1208` in `DB2I_ODBC_OPTIONS`.
+- CHAR padding is removed. Binary columns are written as upper-case hex, unless `translate binary=true` is set for `jt400` or `mapepire` (see [Values that differ by driver](configuration.md#values-that-differ-by-driver)).
+- Give every column a unique name. A result with two columns of the same name, such as `a.ORDERNO` and `b.ORDERNO`, is rejected; use `AS`.
+
+### Failed statements
+
+When Db2 rejects a statement in `execute_query`, a business SQL tool, `validate_query` or `profile_table`, the error result also has these fields:
+
+| Field | Example |
+|-------|---------|
+| `sqlstate` | `42704` |
+| `sqlcode` | `-204` |
+| `cause` | `&1 in &2 type *&3 was not found. ...` |
+| `recovery` | `Change the name and try the request again. ...` |
+
+`cause` and `recovery` also follow the message in the text content, and come from the second-level text of the SQL message (`SYSTOOLS.SQLCODE_INFO`). `&1`, `&2` and so on stand for the values in the first-level message in `error`. With the JDBC option `errors=full`, the `jt400` and `mapepire` drivers return the text with the values filled in. If the text cannot be read, the error comes without `cause` and `recovery`. Rejections by the SQL validator, the schema allowlist or column masking explain themselves and have none of these fields.
+
+A statement the [parse check](security.md#statement-parse-check) cannot parse gets these fields too. `QSYS2.PARSE_STATEMENT` gives no reason of its own, so the server prepares the statement on the read-only connection without running it, and returns Db2's error, for example `The statement could not be parsed: [42000] SQL0104 - Token EXISTS was not valid.` This works on the `odbc` and `mapepire` drivers. `jt400` has no way to prepare a statement without running it, so it keeps the generic message. `validate_query` puts the same message in `violations`.
+
+When `execute_query` or `export_query` names a column the table does not have (SQLCODE `-206`, SQLSTATE `42703`, or `42S22` through ODBC), `recovery` starts with a hint such as `Check the column names with describe_table for MYLIB.ORDERS before trying again, and put text values in single quotes, not double quotes.` The tables come from parsing the statement on the server, with no extra database call. When the statement cannot be parsed, the hint says "the tables in the query" instead, and when `describe_table` is disabled, it is not named. Business SQL tools do not get the hint, since the caller cannot change their SQL.
+
+## Filter syntax
+
+The list tools support pattern matching:
+
+| Pattern | Matches |
+|---------|---------|
+| `CUST` | Contains "CUST" |
+| `CUST*` | Starts with "CUST" |
+| `*LOG` | Ends with "LOG" |
+| `ORD*FILE` | Starts with "ORD", ends with "FILE" |
+
+## Resources
+
+Clients that support MCP resources can read a table's context without a tool call, and complete library and table names as you type.
+
+| Resource | Contents | Registered when |
+|----------|----------|-----------------|
+| `db2i://{schema}/{table}` | Columns from the catalog, plus the YAML business description, column notes, and relations | `describe_table` is enabled |
+| `db2i://{schema}/{table}/ddl` | SQL from `QSYS2.GENERATE_SQL` that recreates the table, view, or alias | `get_object_ddl` is enabled |
+| `db2i://business-context` | Every annotation loaded from `MCP_CUSTOM_TOOLS` | `get_business_context` is enabled |
+| `ui://db2i/result` | The [result view](#result-view): an HTML page (`text/html;profile=mcp-app`) that MCP Apps hosts show under tool results | `MCP_UI_ENABLED` is on and `execute_query`, `profile_table` or a business SQL tool is enabled |
+
+`resources/list` offers the annotated tables, for example `db2i://MYLIB/ORDERS`. Percent-encode `#` and other reserved characters in names (`ORD%23X` for `ORD#X`). A library outside `QUERY_ALLOWED_SCHEMAS` is rejected with the same message `execute_query` gives, and completion offers only allowed libraries. Reads and completions that query IBM i count against the rate limit, and reads are written to the audit log. Completion fetches a library's name list once and reuses it for 60 seconds, so typing a name costs one query rather than one per keystroke.
+
+## Prompts
+
+| Prompt | Arguments | What it asks for |
+|--------|-----------|------------------|
+| `explore_library` | `schema` | List the tables, describe the central ones, and summarize how they join |
+| `explain_table` | `schema`, `table` | Explain rows, columns, keys, and relations in plain language |
+| `write_query` | `question`, `schema`, `table` | Write one SELECT from the table's real columns and YAML relations, then validate and run it when those tools are enabled |
+
+A prompt is listed only when the tools it tells the model to call are enabled: `explore_library` needs `list_tables` and `describe_table`, and the other two need `describe_table`. None of them asks for a write.

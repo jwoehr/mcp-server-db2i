@@ -4,6 +4,8 @@
 
 import { z } from 'zod';
 
+import { chartSpecSchema } from '../ui/chartSpec.js';
+
 const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const PARAM_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const SQL_NAME = /^[A-Za-z_@#$][A-Za-z0-9_@#$]{0,127}$/;
@@ -121,6 +123,12 @@ const relationSchema = z.strictObject({
 
 export type RelationDef = z.infer<typeof relationSchema>;
 
+const filterSchema = z.strictObject({
+  sql: z.string().trim().min(1),
+  columns: z.array(z.string().regex(SQL_NAME, 'Filter column must be an unquoted SQL name')).min(1, 'List the columns the filter uses'),
+  reason: z.string().trim().min(1).optional(),
+});
+
 const annotationSchema = z.strictObject({
   entity: z.string().regex(TOOL_NAME, 'Entity name must be snake_case').optional(),
   description: z.string().min(1).optional(),
@@ -129,6 +137,8 @@ const annotationSchema = z.strictObject({
     z.string().min(1),
   ).optional(),
   relations: z.array(relationSchema).optional(),
+  /** Row filters most queries on the table need, such as leaving out deleted rows. */
+  filters: z.array(filterSchema).optional(),
 });
 
 export type AnnotationDef = z.infer<typeof annotationSchema>;
@@ -144,6 +154,8 @@ const toolSchema = z.strictObject({
   ).optional(),
   maxRows: z.number().int().positive().optional(),
   system: z.string().regex(SYSTEM_NAME, 'System must be a profile name from DB2I_PROFILES').optional(),
+  /** How the result view charts the rows. Column names are checked when the tool runs. */
+  chart: chartSpecSchema.optional(),
   sql: z.string().min(1),
 });
 
@@ -161,8 +173,15 @@ const maskingSchema = z.record(
   ),
 );
 
+/** Longest instructions text, counted over all files together. It rides on every session, so keep it to the rules. */
+export const MAX_INSTRUCTIONS_LENGTH = 4000;
+
 export const customToolsFileSchema = z.strictObject({
   version: z.literal(1),
+  instructions: z.string().trim().min(1).max(
+    MAX_INSTRUCTIONS_LENGTH,
+    `instructions must be at most ${MAX_INSTRUCTIONS_LENGTH} characters. Put table detail in annotations`,
+  ).optional(),
   tools: z.array(toolSchema).optional(),
   annotations: z.record(
     z.string().regex(TABLE_REF, 'Annotation key must be SCHEMA.TABLE'),
@@ -173,10 +192,10 @@ export const customToolsFileSchema = z.strictObject({
   const toolCount = file.tools?.length ?? 0;
   const annotationCount = file.annotations ? Object.keys(file.annotations).length : 0;
   const maskingCount = file.masking ? Object.keys(file.masking).length : 0;
-  if (toolCount === 0 && annotationCount === 0 && maskingCount === 0) {
+  if (toolCount === 0 && annotationCount === 0 && maskingCount === 0 && !file.instructions) {
     ctx.addIssue({
       code: 'custom',
-      message: 'Add at least one tool, annotation, or masking rule',
+      message: 'Add at least one tool, annotation, masking rule, or instructions',
     });
   }
 });

@@ -8,8 +8,60 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 
-import { getAuditConfig, type AuditConfig } from '../config.js';
+import { getAuditConfig, getBuildId, type AuditConfig } from '../config.js';
+import { SERVER_VERSION } from '../version.js';
 import { logger } from './logger.js';
+
+/** Why a tool call failed, for grouping failures without parsing the error text. */
+export type AuditErrorKind =
+  | 'security_validation'
+  | 'allowlist_parse'
+  | 'allowlist_denied'
+  | 'parse_check'
+  | 'masking'
+  | 'bad_params'
+  | 'sql_error'
+  | 'not_found'
+  | 'unknown_system'
+  | 'rate_limited'
+  | 'exception'
+  | 'other';
+
+/**
+ * Which check refused a statement: one of the server's own checks, or Db2.
+ * `parse_check` is QSYS2.PARSE_STATEMENT with no reason from Db2; when a prepare
+ * found Db2's reason, the statement is invalid Db2 and counts as `db2`.
+ */
+export type AuditRejectedBy = 'validator' | 'allowlist' | 'parse_check' | 'masking' | 'db2';
+
+/**
+ * The check behind a failed call, from its error kind and whether Db2 gave a SQLSTATE.
+ * Undefined for failures that are not about the statement, such as bad parameters.
+ */
+export function rejectedByOf(errorKind: AuditErrorKind | undefined, sqlstate?: string): AuditRejectedBy | undefined {
+  switch (errorKind) {
+    case 'security_validation':
+      return 'validator';
+    case 'allowlist_parse':
+    case 'allowlist_denied':
+      return 'allowlist';
+    case 'parse_check':
+      return sqlstate ? 'db2' : 'parse_check';
+    case 'masking':
+      return 'masking';
+    case 'sql_error':
+      return 'db2';
+    default:
+      return undefined;
+  }
+}
+
+/** The MCP client that made a call, from its client info or, failing that, the HTTP User-Agent. */
+export interface AuditClient {
+  name?: string;
+  version?: string;
+  userAgent?: string;
+}
 
 export interface AuditCall {
   tool: string;
@@ -19,14 +71,36 @@ export interface AuditCall {
   sql?: string | null;
   params?: unknown[];
   args?: Record<string, unknown>;
+  /** The model's reason for the call, from the `context` argument (MCP_TOOL_INTENT). */
+  intent?: string;
+  client?: AuditClient;
+  /** Short hash of the session key, so calls can be grouped without logging the key. */
+  session?: string;
   rowCount?: number;
+  /** The result stopped at a row or size limit and more rows matched. */
+  truncated?: boolean;
+  /** Annotated tables whose row filter the statement left out (execute_query, export_query, validate_query). */
+  skippedFilters?: string[];
+  /** Size of the file an export wrote. */
+  bytes?: number;
   durationMs?: number;
   outcome: 'success' | 'error' | 'rate_limited';
   error?: string;
+  errorKind?: AuditErrorKind;
+  sqlstate?: string;
+  sqlcode?: number;
+  /** Rule violations the security validator or schema allowlist reported, or validate_query's findings. */
+  violations?: string[];
+  /** Which check refused the statement (failed calls). */
+  rejectedBy?: AuditRejectedBy;
+  /** validate_query's verdict, so a call that ran a statement after `valid: false` can be traced. */
+  valid?: boolean;
 }
 
 let config: AuditConfig | undefined;
 let fd: number | undefined;
+// MCP_BUILD_ID, read when the audit log opens
+let build: string | undefined;
 let writeFailureReported = false;
 
 /** Open the file sink when MCP_AUDIT_LOG is a path. Throws when that path is not writable. */
@@ -34,6 +108,7 @@ export function initAuditLog(): void {
   closeAuditLog();
   writeFailureReported = false;
   config = getAuditConfig();
+  build = getBuildId();
   if (!config || config.target === 'stderr') {
     return;
   }
@@ -57,6 +132,12 @@ export function closeAuditLog(): void {
     fd = undefined;
   }
   config = undefined;
+  build = undefined;
+}
+
+/** Short, stable hash of a session key. The key itself can be a bearer token, so it is never logged. */
+export function auditSessionId(sessionKey: string): string {
+  return createHash('sha256').update(sessionKey).digest('hex').slice(0, 12);
 }
 
 /** Append one audit line. No-op when the audit log is off. Never throws. */
@@ -64,7 +145,51 @@ export function writeAudit(entry: AuditCall): void {
   if (!config) {
     return;
   }
-  const line = `${JSON.stringify(formatEntry(entry, config))}\n`;
+  writeLine(formatEntry(entry, config));
+}
+
+/** A server event that is not a tool call. */
+export type AuditEvent =
+  | { event: 'shutdown'; reason: string }
+  | {
+      /** A request for an export download link. */
+      event: 'export_download';
+      /** The first 8 characters of the export id. The full id is the link, so it is never logged. */
+      exportId: string;
+      /** Who ran the export. */
+      identity: string;
+      ip?: string;
+      outcome: 'success' | 'not_found' | 'error';
+      bytes?: number;
+      rowCount?: number;
+    }
+  | {
+      /** An IBM i sign-in at the OAuth sign-in page (`oauth`) or POST /auth (`password`). */
+      event: 'sign_in';
+      method: 'oauth' | 'password';
+      /** The user name as entered. A failed sign-in may carry a mistyped name. */
+      identity: string;
+      system?: string;
+      /** OAuth client name, as the client registered it. */
+      client?: string;
+      ip?: string;
+      outcome: 'success' | 'failure' | 'rate_limited' | 'error';
+      reason?: string;
+    };
+
+/** Append one event line, such as why the server shut down. No-op when the audit log is off. Never throws. */
+export function writeAuditEvent(entry: AuditEvent): void {
+  if (!config) {
+    return;
+  }
+  writeLine({ time: new Date().toISOString(), ...versionFields(), ...entry });
+}
+
+function writeLine(record: Record<string, unknown>): void {
+  if (!config) {
+    return;
+  }
+  const line = `${JSON.stringify(record)}\n`;
   try {
     if (config.target === 'stderr') {
       process.stderr.write(line);
@@ -85,12 +210,22 @@ export function writeAudit(entry: AuditCall): void {
 function formatEntry(entry: AuditCall, current: AuditConfig): Record<string, unknown> {
   const line: Record<string, unknown> = {
     time: new Date().toISOString(),
+    ...versionFields(),
     tool: entry.tool,
     identity: entry.identity,
     ...(entry.system ? { system: entry.system } : {}),
     sql: formatSql(entry.sql, current.sql),
     outcome: entry.outcome,
   };
+  if (entry.intent !== undefined) {
+    line.intent = entry.intent;
+  }
+  if (entry.client) {
+    line.client = entry.client;
+  }
+  if (entry.session !== undefined) {
+    line.session = entry.session;
+  }
   if (entry.params) {
     line.paramCount = entry.params.length;
     if (current.params) {
@@ -103,13 +238,45 @@ function formatEntry(entry: AuditCall, current: AuditConfig): Record<string, unk
   if (entry.rowCount !== undefined) {
     line.rowCount = entry.rowCount;
   }
+  if (entry.truncated) {
+    line.truncated = true;
+  }
+  if (entry.skippedFilters && entry.skippedFilters.length > 0) {
+    line.skippedFilters = entry.skippedFilters;
+  }
+  if (entry.bytes !== undefined) {
+    line.bytes = entry.bytes;
+  }
   if (entry.durationMs !== undefined) {
     line.durationMs = entry.durationMs;
   }
   if (entry.error !== undefined) {
     line.error = entry.error;
   }
+  if (entry.errorKind !== undefined) {
+    line.errorKind = entry.errorKind;
+  }
+  if (entry.sqlstate !== undefined) {
+    line.sqlstate = entry.sqlstate;
+  }
+  if (entry.sqlcode !== undefined) {
+    line.sqlcode = entry.sqlcode;
+  }
+  if (entry.violations && entry.violations.length > 0) {
+    line.violations = entry.violations;
+  }
+  if (entry.rejectedBy !== undefined) {
+    line.rejectedBy = entry.rejectedBy;
+  }
+  if (entry.valid !== undefined) {
+    line.valid = entry.valid;
+  }
   return line;
+}
+
+/** The server version, and the build when MCP_BUILD_ID is set, so lines can be grouped by release or deploy. */
+function versionFields(): { serverVersion: string; build?: string } {
+  return build ? { serverVersion: SERVER_VERSION, build } : { serverVersion: SERVER_VERSION };
 }
 
 function formatSql(sql: string | null | undefined, mode: AuditConfig['sql']): string | null {

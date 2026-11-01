@@ -11,6 +11,9 @@ updates:
       # Majors are chosen by hand to stay close to the Node runtime in .nvmrc
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
+      # typescript-eslint supports TypeScript <6.1; remove once it supports 7
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
     groups:
       # Packages that must move in lockstep, including majors.
       # Dependabot assigns each dependency to the first group it matches.
@@ -18,11 +21,37 @@ updates:
         patterns: ["eslint", "@eslint/*"]
       vitest:
         patterns: ["vitest", "@vitest/*"]
+      # Database driver packages. Users install the newest ones with npx, and
+      # the tests mock them, so a bump needs the real-system check before merge.
+      drivers:
+        patterns: ["odbc", "node-jt400", "@ibm/mapepire-js", "ssh2"]
       production:
         dependency-type: production
         update-types: [minor, patch]
       development:
         dependency-type: development
+        update-types: [minor, patch]
+
+  # The example web app has its own lockfile and is not part of the npm package
+  - package-ecosystem: npm
+    directory: /examples/web-app
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore(web-app)
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # typescript-eslint (via eslint-config-next) does not support TypeScript 7
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+    groups:
+      ai-sdk:
+        patterns: ["ai", "@ai-sdk/*"]
+      next:
+        patterns: ["next", "eslint-config-next", "react", "react-dom", "@types/react", "@types/react-dom"]
+      web-app:
+        patterns: ["*"]
         update-types: [minor, patch]
 
   - package-ecosystem: github-actions

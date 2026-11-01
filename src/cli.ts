@@ -1,7 +1,7 @@
 /**
  * Command-line entry points that do not start a transport.
  *
- * `validate-tools` checks YAML tool files and exits.
+ * `validate-tools` checks YAML tool files and exits. `--help` and `--version` print and exit.
  */
 
 import { parseArgs } from 'node:util';
@@ -12,6 +12,7 @@ import {
   validateCustomToolFiles,
   type FileValidationResult,
   type LoadCustomToolsOptions,
+  type StoredAnnotation,
   type StoredTool,
 } from './customTools/loader.js';
 import { closeGlobalPool, initializePool } from './db/connection.js';
@@ -20,16 +21,57 @@ import {
   isParseStatementMissing,
   parseStatement,
   PARSE_STATEMENT_REQUIREMENT,
+  tableColumnNames,
 } from './db/sqlServices.js';
 
 const USAGE = `Usage: mcp-server-db2i [validate-tools [--connect] <path...>]
 
+  (no arguments)             Start the MCP server (stdio unless MCP_TRANSPORT is set)
   validate-tools <path...>   Check YAML tool files and exit
   --connect                   Also parse each statement with QSYS2.PARSE_STATEMENT
+                              and check that annotation filter columns exist
+  -h, --help                 Show this help
+  -v, --version              Show the version
+
+Docs: https://docs.db2i-mcp.com
+`;
+
+const SETUP = `mcp-server-db2i is an MCP server. An MCP client such as Claude, Cursor or VS Code
+starts it and talks to it over stdin/stdout, so running it by hand only checks the setup.
+
+No IBM i connection is configured. Set these environment variables:
+
+  DB2I_HOSTNAME   IBM i host name or IP address
+  DB2I_USERNAME   IBM i user profile
+  DB2I_PASSWORD   Password (or DB2I_PASSWORD_FILE)
+  DB2I_SCHEMA     Default library (optional)
+
+Or point DB2I_PROFILES at a YAML file that lists several systems.
+
+Example client config (Claude Desktop, Cursor):
+
+  {
+    "mcpServers": {
+      "db2i": {
+        "command": "npx",
+        "args": ["-y", "mcp-server-db2i@latest"],
+        "env": {
+          "DB2I_HOSTNAME": "ibmi.example.com",
+          "DB2I_USERNAME": "MYUSER",
+          "DB2I_PASSWORD": "..."
+        }
+      }
+    }
+  }
+
+The default driver needs the IBM i Access ODBC Driver. Quickstart and other drivers:
+https://docs.db2i-mcp.com/quickstart
 `;
 
 export type CliCommand =
   | { kind: 'serve' }
+  | { kind: 'help'; message: string }
+  | { kind: 'version' }
   | { kind: 'validate-tools'; paths: string[]; connect: boolean }
   | { kind: 'usage'; message: string };
 
@@ -42,6 +84,12 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   }
 
   const [command, ...rest] = argv;
+  if (command === '-h' || command === '--help' || command === 'help') {
+    return { kind: 'help', message: USAGE };
+  }
+  if (command === '-v' || command === '--version') {
+    return { kind: 'version' };
+  }
   if (command !== 'validate-tools') {
     return { kind: 'usage', message: `Unknown command: ${command}\n\n${USAGE}` };
   }
@@ -72,6 +120,22 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   };
 }
 
+/**
+ * A setup guide when stdio would start with no connection settings at all, else null.
+ * A first `npx mcp-server-db2i` lands here, so it gets instructions instead of a stack trace.
+ * Partial settings still get the specific error from config loading.
+ */
+export function missingConnectionHelp(env: NodeJS.ProcessEnv = process.env): string | null {
+  const transport = env.MCP_TRANSPORT?.toLowerCase();
+  if (transport === 'http') {
+    return null;
+  }
+  if (env.DB2I_PROFILES?.trim() || env.DB2I_HOSTNAME?.trim()) {
+    return null;
+  }
+  return SETUP;
+}
+
 export async function runValidateTools(options: {
   paths: string[];
   connect: boolean;
@@ -94,7 +158,7 @@ export async function runValidateTools(options: {
   let failed = reportFiles(results, stdout, stderr);
 
   if (options.connect && !failed) {
-    const connectFailed = await checkOnServer(loaded.tools, stderr);
+    const connectFailed = await checkOnServer(loaded.tools, loaded.annotations, stderr);
     failed = failed || connectFailed;
   }
 
@@ -104,7 +168,7 @@ export async function runValidateTools(options: {
     ? `${fileCount} files checked, all passed.`
     : staticFailures > 0
       ? `${fileCount} files checked, ${staticFailures} failed.`
-      : `${fileCount} files checked, PARSE_STATEMENT check failed.`;
+      : `${fileCount} files checked, the checks on the IBM i failed.`;
   stdout.write(`${summary}\n`);
   return failed ? 1 : 0;
 }
@@ -121,24 +185,32 @@ function reportFiles(
       const where = result.path ? `${result.path}: ` : '';
       stderr.write(`FAIL ${where}${result.error}\n`);
     } else {
-      stdout.write(`ok  ${result.path} (${result.tools} tools, ${result.annotations} annotations)\n`);
+      const instructions = result.instructions ? ', instructions' : '';
+      stdout.write(`ok  ${result.path} (${result.tools} tools, ${result.annotations} annotations${instructions})\n`);
     }
   }
   return failed;
 }
 
 /**
- * Run each statement through QSYS2.PARSE_STATEMENT on the tool's system.
+ * Run each statement through QSYS2.PARSE_STATEMENT on the tool's system, and
+ * check that annotation filter columns exist on the default system.
  * A missing function stops the command and names the host.
  */
-async function checkOnServer(tools: StoredTool[], stderr: NodeJS.WritableStream): Promise<boolean> {
+async function checkOnServer(
+  tools: StoredTool[],
+  annotations: StoredAnnotation[],
+  stderr: NodeJS.WritableStream,
+): Promise<boolean> {
   const targets: DbTarget[] = [];
+  let annotationTarget: DbTarget;
   try {
     const fallback = defaultSystem();
     initializePool(fallback.config, fallback.name);
     for (const tool of tools) {
       targets.push(resolveTarget(STDIO_POOL_KEY, tool.system));
     }
+    annotationTarget = resolveTarget(STDIO_POOL_KEY);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not load database configuration';
     stderr.write(`FAIL ${message}\n`);
@@ -169,8 +241,43 @@ async function checkOnServer(tools: StoredTool[], stderr: NodeJS.WritableStream)
         stderr.write(`FAIL ${tool.source}: tool ${tool.name}: ${message}\n`);
       }
     }
-    return failed;
+    const filterFailed = await checkFilterColumns(annotations, annotationTarget, stderr);
+    return failed || filterFailed;
   } finally {
     await closeGlobalPool();
   }
+}
+
+/** Each annotation filter column must be a column of its table. */
+async function checkFilterColumns(
+  annotations: StoredAnnotation[],
+  target: DbTarget,
+  stderr: NodeJS.WritableStream,
+): Promise<boolean> {
+  let failed = false;
+  for (const annotation of annotations) {
+    const wanted = [...new Set((annotation.filters ?? []).flatMap((filter) => filter.columns))];
+    if (wanted.length === 0) {
+      continue;
+    }
+    const [schema, table] = annotation.table.split('.');
+    try {
+      const columns = await tableColumnNames(schema, table, target);
+      if (!columns) {
+        failed = true;
+        stderr.write(`FAIL annotation ${annotation.table}: table not found, so its filters cannot be checked\n`);
+        continue;
+      }
+      const missing = wanted.filter((column) => !columns.has(column));
+      if (missing.length > 0) {
+        failed = true;
+        stderr.write(`FAIL annotation ${annotation.table}: filter column ${missing.join(', ')} is not a column of the table\n`);
+      }
+    } catch (error) {
+      failed = true;
+      const message = error instanceof Error ? error.message : 'Unknown error occurred';
+      stderr.write(`FAIL annotation ${annotation.table}: ${message}\n`);
+    }
+  }
+  return failed;
 }

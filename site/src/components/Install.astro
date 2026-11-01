@@ -1,0 +1,105 @@
+---
+import CodeBlock from './CodeBlock.astro';
+import { links } from '../lib/links';
+
+const clientConfig = `{
+  "mcpServers": {
+    "db2i": {
+      "command": "npx",
+      "args": ["-y", "mcp-server-db2i@latest"],
+      "env": {
+        "DB2I_HOSTNAME": "ibmi.example.com",
+        "DB2I_USERNAME": "\${env:DB2I_USERNAME}",
+        "DB2I_PASSWORD": "\${env:DB2I_PASSWORD}",
+        "QUERY_ALLOWED_SCHEMAS": "MYLIB"
+      }
+    }
+  }
+}`;
+
+const docker = `git clone https://github.com/Strom-Capital/mcp-server-db2i
+cd mcp-server-db2i
+docker build -t mcp-server-db2i .
+
+# stdio: your MCP client starts the container
+docker run -i --rm --env-file .env mcp-server-db2i
+
+# HTTP for a team: uncomment "ports" in docker-compose.yml
+docker-compose up -d`;
+
+const oauth = `MCP_TRANSPORT=http
+MCP_OAUTH_ENABLED=true
+MCP_PUBLIC_URL=https://mcp.example.com
+MCP_OAUTH_SECRET=<a long random string>
+
+# Then, in claude.ai: Settings > Connectors > Add custom connector
+#   URL: https://mcp.example.com/mcp`;
+
+const tabs = [
+  { id: 'npx', label: 'npx', lang: 'json', title: 'MCP client config', intro: 'Add the server to your MCP client config. Claude Desktop, Cursor and Claude Code all use this shape.', code: clientConfig, more: links.clientSetup, moreLabel: 'Client setup guide' },
+  { id: 'docker', label: 'Docker', lang: 'bash', title: 'Shell', intro: 'Run it as a container: started by your MCP client over stdio, or as a shared HTTP server for your team.', code: docker, more: links.docker, moreLabel: 'Docker guide' },
+  { id: 'connector', label: 'claude.ai connector', lang: 'dotenv', title: '.env', intro: 'Run the server over HTTPS with OAuth. Everyone else adds one URL and signs in with their own IBM i profile. The same connector works in Claude for Excel.', code: oauth, more: links.oauth, moreLabel: 'Remote clients and OAuth', extra: links.claudeForExcel, extraLabel: 'Claude for Excel' },
+];
+---
+<section class="section" id="install">
+  <div class="container">
+    <div class="sec-head">
+      <p class="label">Install</p>
+      <div>
+        <h2>Pick how you run it.</h2>
+        <p class="lead">The default ODBC driver needs unixODBC and the IBM i Access ODBC Driver on the machine that runs the server. Nothing is installed on the IBM i.</p>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <div class="tablist" role="tablist" aria-label="Install options">
+        {tabs.map((t, i) => (
+          <button type="button" role="tab" id={`tab-${t.id}`} aria-controls={`panel-${t.id}`} aria-selected={i === 0 ? 'true' : 'false'} tabindex={i === 0 ? 0 : -1}>{t.label}</button>
+        ))}
+      </div>
+      {tabs.map((t, i) => (
+        <div class="panel" role="tabpanel" id={`panel-${t.id}`} aria-labelledby={`tab-${t.id}`} hidden={i !== 0}>
+          <p>{t.intro}</p>
+          <CodeBlock code={t.code} lang={t.lang as 'json'} title={t.title} />
+          <div class="more">
+            <a class="link-rule" href={t.more}>{t.moreLabel} <span aria-hidden="true">→</span></a>
+            {t.extra && <a class="link-rule" href={t.extra}>{t.extraLabel} <span aria-hidden="true">→</span></a>}
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
+
+<script>
+  const tabs = [...document.querySelectorAll<HTMLButtonElement>('.tablist [role="tab"]')];
+  function select(tab: HTMLButtonElement) {
+    for (const t of tabs) {
+      const on = t === tab;
+      t.setAttribute('aria-selected', String(on));
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')!)!.hidden = !on;
+    }
+    tab.focus();
+  }
+  tabs.forEach((tab, i) => {
+    tab.addEventListener('click', () => select(tab));
+    tab.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight') select(tabs[(i + 1) % tabs.length]);
+      if (e.key === 'ArrowLeft') select(tabs[(i - 1 + tabs.length) % tabs.length]);
+    });
+  });
+</script>
+
+<style>
+  .tabs { border-top: 1px solid var(--line-strong); }
+  .tablist { display: flex; gap: 28px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  [role='tab'] { font: 500 12px/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent; padding: 18px 0 14px; margin-bottom: -1px; cursor: pointer; white-space: nowrap; }
+  [role='tab']:hover { color: var(--fg); }
+  [role='tab'][aria-selected='true'] { color: var(--fg); border-bottom-color: var(--accent); }
+  .tabs .panel { background: none; border: 0; padding: 24px 0 0; display: grid; gap: 16px; max-width: 860px; }
+  .tabs .panel[hidden] { display: none; }
+  .tabs .panel p { margin: 0; color: var(--muted); }
+  .tabs .panel :global(.code) { margin: 0; }
+  .tabs .panel .more { display: flex; flex-wrap: wrap; gap: 12px 28px; }
+</style>

@@ -1,4 +1,7 @@
-# Business SQL tools
+---
+title: "Business SQL tools"
+description: "Add read-only ERP queries and table notes as MCP tools, defined in YAML."
+---
 
 Administrators can add read-only tools, and notes about tables the catalog does not explain, without changing the server code. The tools are SELECT and WITH statements. Parameter values are bound. They are never pasted into the SQL text.
 
@@ -6,7 +9,7 @@ Set `MCP_CUSTOM_TOOLS` to a YAML file, a directory, or a comma-separated list of
 
 An empty or unset `MCP_CUSTOM_TOOLS` loads nothing. The built-in tools keep working.
 
-See [examples/erp-tools](../examples/erp-tools) for a generic pack: sales orders, purchase orders, service orders, manufacturing orders, a bill of materials, the general ledger, and item and customer master data. The statements show patterns that show up on real order files: a numeric date, a derived status, a header with jobs and lines, and a text search. Every library, table, and column name in that pack is a placeholder. Point them at your own files before you load the directory.
+See [examples/erp-tools](https://github.com/Strom-Capital/mcp-server-db2i/tree/main/examples/erp-tools) for a generic pack: sales orders, purchase orders, service orders, manufacturing orders, a bill of materials, the general ledger, and item and customer master data. The statements show patterns that show up on real order files: a numeric date, a derived status, a header with jobs and lines, and a text search. Every library, table, and column name in that pack is a placeholder. Point them at your own files before you load the directory.
 
 ## File format
 
@@ -32,6 +35,10 @@ annotations:
     description: Sales order header
     columns:
       STATUS: "O = open, C = closed"
+    filters:
+      - sql: "TRIM(STATFLG) <> 'D'"
+        columns: [STATFLG]
+        reason: D rows are deleted orders
     relations:
       - table: MYLIB.ORDERS
         join: { ORDERNO: ORDERNO }
@@ -39,7 +46,7 @@ annotations:
         description: Order lines
 ```
 
-`version` must be `1`. A file needs at least one tool, one annotation, or one masking rule.
+`version` must be `1`. A file needs at least one tool, one annotation, one masking rule, or `instructions`.
 
 ### Tools
 
@@ -50,8 +57,9 @@ annotations:
 | `description` | yes | What the tool returns, and how to choose arguments |
 | `toolset` | no | snake_case group. `MCP_TOOLS_ENABLED=toolset:sales` registers only that group. |
 | `parameters` | no | Named arguments. Every parameter must appear as `:name` in the SQL, and every `:name` must be declared. |
-| `maxRows` | no | Row cap for this tool. The server also applies `QUERY_MAX_LIMIT`, and uses the smaller of the two. When `maxRows` is omitted, `QUERY_DEFAULT_LIMIT` is used. |
+| `maxRows` | no | Row cap for this tool. The server also applies `QUERY_MAX_LIMIT`, and uses the smaller of the two. When `maxRows` is omitted, `QUERY_DEFAULT_LIMIT` is used. A result that stops at the cap has `truncated: true` and a warning. |
 | `system` | no | Profile from `DB2I_PROFILES` the tool always runs on. See [Running on one system](#running-on-one-system). |
+| `chart` | no | How the [result view](tools.md#result-view) charts the rows, for example `{ type: bar, x: STATUS, y: [TOTAL] }`. Same fields as the `chart` argument of `execute_query`. Column names are checked against each result. |
 | `sql` | yes | One read-only statement. It must start with `SELECT` or `WITH`. |
 
 Parameter types are `string` (optional `maxLength`), `integer`, `number`, `boolean`, `date`, and `enum`. A `string` parameter may also set `enum` to a list of allowed values. `date` values are `YYYY-MM-DD`.
@@ -59,6 +67,8 @@ Parameter types are `string` (optional `maxLength`), `integer`, `number`, `boole
 A parameter with a `default` may be omitted, and the default is bound. `required: false` with no default may be omitted, and NULL is bound. Anything else must be sent by the client.
 
 Boolean values bind as `1` and `0`.
+
+In `tools/list`, every business tool carries `_meta["db2i-mcp/tool"]` with `kind: "business"` and its `toolset`, when it has one. Built-in tools have no such entry. A client can use it to list business tools on their own, grouped by toolset.
 
 `:name` is replaced with a `?` marker. The same name may appear more than once, and the same value is bound each time. Placeholders inside string literals, quoted identifiers, and comments are left as text. A hand-written `?` is rejected so the bind order stays unambiguous.
 
@@ -98,10 +108,47 @@ Keys are `SCHEMA.TABLE`. Names are folded to uppercase.
 | `description` | What the table is, in business words |
 | `columns` | Meaning of a column, including status codes |
 | `relations` | A link the catalog does not declare as a foreign key |
+| `filters` | Row filters most queries on the table need, such as leaving out deleted rows |
 
 A relation names the other `SCHEMA.TABLE`, a `join` map of local column to remote column, an optional `cardinality` (`one-to-one`, `one-to-many`, `many-to-one`, `many-to-many`), and an optional description.
 
-`get_business_context` returns these notes. Filter with `entity`, `table` (`ORDERHDR` or `MYLIB.ORDERHDR`), or omit both to list every annotation. `describe_table` adds `business_description` and `relations` when the table is annotated, and a `business_description` on columns that have one. `list_tables` adds `business_description` on annotated tables.
+`get_business_context` returns these notes. Filter with `entity`, `table` (`ORDERHDR` or `MYLIB.ORDERHDR`), or omit both to list every annotation. The entity filter ignores case and treats spaces and hyphens as underscores. When no entity has the requested name, it returns the entities whose names partly match it (one name contains the other, or they share the most word parts, such as `order` and `line`) with `partial_match: true` and a `hint`. When nothing matches, it returns empty `data` with `available_entities`, plus `available_tables` for a table filter, and a `hint` to pick one of them or omit the filters. The table filter itself stays exact. `describe_table` adds `filters`, `business_description` and `relations` when the table is annotated, and a `business_description` on columns that have one. `list_tables` adds `business_description` on annotated tables.
+
+#### Row filters
+
+A filter has the SQL a query should include (`sql`), the `columns` it uses, and an optional `reason`. Use it for rules that are easy to miss and change the answer, such as a flag that marks deleted rows. Deleted child rows often sit under a live header, so annotate the line table too, not only the header.
+
+- `get_business_context` lists `filters` first in each table, and `describe_table` puts them before the column list.
+- With `QUERY_PARSE_CHECK` on (the default), `execute_query`, `export_query` and `validate_query` check each statement against the filters of the annotated tables it reads. When none of a filter's columns appears in the statement, qualified with that table or unqualified, the query still runs. The result lists the table in `skippedFilters` and adds a warning that quotes the filter and its reason. The check looks for the column, not the exact predicate, and never blocks a query, since some questions need deleted rows. With the parse check off, there is no filter check.
+- `validate_query` reports `skippedFilters` and `warnings` without changing `valid`.
+- `validate-tools --connect` checks that each filter column exists on its table.
+- Business SQL tools are not checked. Put the filter in their SQL.
+
+### Instructions
+
+`instructions` is an optional top-level text. All files together may hold at most 4000 characters of it. The server sends it to clients as MCP server instructions: in the `initialize` result for 2025-era clients, and in the `server/discover` result on protocol 2026-07-28, which has no `initialize`. Either way the model has it for the whole session without calling a tool first. Use it for the few rules no query may miss, such as which flag marks a deleted row. Table and column detail belongs in annotations. Put a deleted-row flag in the table's `filters` too: the instructions arrive once at the start, while a filter is checked against every query.
+
+```yaml
+version: 1
+instructions: |
+  MYLIB.ORDERHDR: always filter TRIM(STATFLG) <> 'D'. D rows are deleted orders.
+  STATUS 60 is invoiced.
+```
+
+A file may hold only `instructions`. Texts from several files are joined in file order.
+
+A file that also defines tools sends its text only to sessions that have at least one of those tools. `MCP_TOOLS_ENABLED`, `MCP_TOOLS_DISABLED` and a tool's `system:` decide that. So write guidance about a file's tools, such as "use search_sales_orders for order questions", in that file, and put rules that every query must follow in a file without tools. The example pack keeps them in `rules.yaml`.
+
+When custom files are loaded, the server puts a short built-in part first:
+
+- with annotations and `get_business_context` or `describe_table` enabled: read a table's business context with the enabled ones before writing SQL against it
+- with a business tool registered for the session: prefer a business tool when one answers the question
+
+A server without `MCP_CUSTOM_TOOLS` sends no instructions.
+
+Some clients do not pass server instructions to the model. So when annotations are loaded and `get_business_context` or `describe_table` is enabled, the descriptions of `execute_query` and `export_query` also end with a sentence that asks the model to call that tool for a table before querying it. Tool descriptions reach the model in every client.
+
+Clients read instructions when they connect, from the `initialize` or `server/discover` result. With `MCP_CUSTOM_TOOLS_WATCH`, a change reaches the next such request over HTTP, because the default stateless mode builds the server for each request. A stdio server, and a session in the deprecated `MCP_SESSION_MODE=stateful` mode, keep the text they started with. The sentence in the `execute_query` and `export_query` descriptions follows the reload, and stdio servers and stateful sessions also get `notifications/tools/list_changed`. Clients decide what to do with server instructions. Claude Code adds them to the model's context. Check your client if the rules do not seem to reach the model.
 
 ### Masking
 
@@ -232,7 +279,7 @@ At startup the server runs the same read-only check as `execute_query`. When `QU
 
 When `QUERY_PARSE_CHECK` is on, the first call of each tool asks `QSYS2.PARSE_STATEMENT` whether the statement is a query. That result is cached for the life of the process. A missing function rejects the tool until you set `QUERY_PARSE_CHECK=false`.
 
-`mcp-server-db2i validate-tools <path...>` runs those startup checks and exits, without a database. Add `--connect` to run the `PARSE_STATEMENT` check as well. That needs credentials and a reachable host. See [Validating tool files](development.md#validating-tool-files).
+`mcp-server-db2i validate-tools <path...>` runs those startup checks and exits, without a database. Add `--connect` to run the `PARSE_STATEMENT` check as well, and to check that annotation filter columns exist. That needs credentials and a reachable host. See [Validating tool files](development.md#validating-tool-files).
 
 `MCP_CUSTOM_TOOLS_WATCH=true` runs the same checks again when a watched file changes. A valid set replaces the registry and clients are told to refresh `tools/list`. A bad save is logged and does not replace the tools that are already running. The default is off. Watching with an empty `MCP_CUSTOM_TOOLS` stops startup.
 

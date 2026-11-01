@@ -5,7 +5,7 @@
  * checks the behaviour every driver must share: positional parameter binding,
  * the read-only default on the query connection, a separate connection
  * without the read-only setting for QSYS2.GENERATE_SQL, retry after a failed
- * pool creation, and shutdown.
+ * pool creation, shutdown, and the statement time limit (QUERY_TIMEOUT).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
@@ -23,15 +23,72 @@ const created = vi.hoisted(() => ({
   jt400: [] as Array<{ config: Record<string, string>; pool: FakePool }>,
   odbc: [] as Array<{ connectionString: string; options: Record<string, unknown>; pool: FakePool }>,
   // mapepire: one entry per started job, which is what a query runs on.
-  mapepire: [] as Array<{ jdbcOptions: Record<string, string>; pool: FakePool }>,
+  mapepire: [] as Array<{ config: Record<string, unknown>; jdbcOptions: Record<string, string>; pool: FakePool }>,
+  // mapepire: the message the next job start fails with
+  mapepireStartError: undefined as string | undefined,
   sshClients: [] as Array<{ config: Record<string, unknown>; end: Mock<() => void> }>,
   failNext: { jt400: false, odbc: false, mapepire: false },
   rows: [] as Record<string, unknown>[],
+  // jt400: a fixed result for execute(), for duplicate column names
+  jt400Result: undefined as { columns: string[]; rows: unknown[][] } | undefined,
+  jt400MetadataFails: false,
+  jt400Closes: 0,
+  // jt400: statements run through execute(), in order
+  jt400Executed: [] as string[],
+  // Column definitions the odbc fake reports with each result
+  odbcColumns: [] as Array<Record<string, unknown>>,
+  // Statement time limit: the next statement waits until something cancels it
+  hangNext: false,
+  hanging: [] as Array<(rows: Record<string, unknown>[]) => void>,
+  cancelFails: false,
+  odbcCancels: 0,
+  // prepare(): statements prepared without running, and how Db2 answers them
+  prepared: [] as string[],
+  prepareFailure: undefined as { sqlstate: string; sqlcode: number; text: string } | undefined,
+  prepareHangs: false,
 }));
+
+/** Record a prepare-only call and answer it the way the test asked. */
+async function fakePrepare(sql: string): Promise<{ sqlstate: string; sqlcode: number; text: string } | undefined> {
+  created.prepared.push(sql);
+  if (created.prepareHangs) {
+    await new Promise(() => undefined);
+  }
+  // Only the statement under test fails; the SQLCODE lookup prepares too on odbc
+  return sql.includes('SQLCODE_INFO') ? undefined : created.prepareFailure;
+}
+
+const JOB_NAME = '123456/QUSER/QZDASOINIT';
+const CANCEL_REFUSED = '[42501] Not authorized to QSYS2.CANCEL_SQL';
+
+/** End every waiting statement the way a cancelled QCMDEXC wait ends: with -1. */
+function finishHanging(): void {
+  for (const finish of created.hanging.splice(0)) {
+    finish([{ '00001': -1 }]);
+  }
+}
 
 function makeFakePool(): FakePool {
   return {
-    query: vi.fn(async () => created.rows),
+    query: vi.fn(async (sql: unknown) => {
+      if (sql === 'CALL QSYS2.CANCEL_SQL(?)') {
+        if (created.cancelFails) {
+          throw new Error(CANCEL_REFUSED);
+        }
+        finishHanging();
+        return [];
+      }
+      if (sql === 'VALUES QSYS2.JOB_NAME') {
+        return [{ '00001': JOB_NAME }];
+      }
+      if (created.hangNext) {
+        created.hangNext = false;
+        return new Promise((resolve) => {
+          created.hanging.push(resolve);
+        });
+      }
+      return created.rows;
+    }),
     close: vi.fn(async () => undefined),
   };
 }
@@ -44,7 +101,51 @@ vi.mock('node-jt400', () => ({
     }
     const pool = makeFakePool();
     created.jt400.push({ config, pool });
-    return pool;
+    // transaction() keeps one connection for its callback
+    // update() is executeUpdate, for a CALL without a result set; it logs to query
+    const update = vi.fn(async (sql: string, params: unknown[]) => {
+      await pool.query(sql, params);
+      return 0;
+    });
+    // Like JT400, reading a CALL without a result set as a query fails after the CALL ran
+    const query = vi.fn(async (sql: string, params: unknown[]) => {
+      const rows = await pool.query(sql, params);
+      if (sql === 'CALL QSYS2.CANCEL_SQL(?)') {
+        throw new Error('Cursor state not valid.');
+      }
+      return rows;
+    });
+    // execute() prepares the statement; it runs through the pool's query fake
+    // so tests see one call log. Columns come from the row keys unless a test
+    // sets created.jt400Result.
+    const execute = vi.fn(async (sql: string, params: unknown[]) => {
+      created.jt400Executed.push(sql);
+      const rows = (await pool.query(sql, params)) as Record<string, unknown>[];
+      const fixed = created.jt400Result;
+      const names = fixed ? fixed.columns : Object.keys(rows[0] ?? {});
+      return {
+        metadata: vi.fn(async () => {
+          if (created.jt400MetadataFails) {
+            throw new Error('metadata failed');
+          }
+          return names.map((name) => ({ name, typeName: 'VARCHAR', precision: 0, scale: 0 }));
+        }),
+        asArray: vi.fn(async () => fixed?.rows ?? rows.map((row) => names.map((name) => row[name]))),
+        close: vi.fn(() => {
+          created.jt400Closes += 1;
+        }),
+      };
+    });
+    return {
+      query,
+      update,
+      execute,
+      close: pool.close,
+      transaction: vi.fn(
+        async (fn: (t: { query: typeof query; update: typeof update; execute: typeof execute }) => Promise<unknown>) =>
+          fn({ query, update, execute })
+      ),
+    };
   }),
 }));
 
@@ -63,7 +164,7 @@ vi.mock('odbc', () => ({
         const rows = (await inner.query(...args)) as Record<string, unknown>[];
         const result = Object.assign([...rows], {
           count: rows.length,
-          columns: [],
+          columns: created.odbcColumns,
           statement: args[0],
           parameters: args[1],
           return: undefined,
@@ -71,6 +172,46 @@ vi.mock('odbc', () => ({
         return result;
       }),
       close: inner.close,
+      // One connection per statement when a time limit is set; its statement
+      // runs through the pool's query fake so tests see one call log.
+      connect: vi.fn(async () => ({
+        async createStatement() {
+          let sql = '';
+          let params: unknown[] = [];
+          let executed = false;
+          return {
+            async prepare(text: string) {
+              sql = text;
+              if (created.prepareFailure || created.prepareHangs) {
+                const failure = await fakePrepare(text);
+                if (failure && !executed) {
+                  throw Object.assign(new Error('[odbc] Error preparing the sql statement'), {
+                    odbcErrors: [{ state: failure.sqlstate, code: failure.sqlcode, message: failure.text }],
+                  });
+                }
+              } else {
+                created.prepared.push(text);
+              }
+            },
+            async bind(values: unknown[]) {
+              params = values;
+            },
+            execute: () => {
+              executed = true;
+              return pool.query(sql, params);
+            },
+            async cancel() {
+              created.odbcCancels += 1;
+              if (created.cancelFails) {
+                throw new Error('[HY008] Operation canceled failed');
+              }
+              finishHanging();
+            },
+            async close() {},
+          };
+        },
+        async close() {},
+      })),
     };
     created.odbc.push({ connectionString: options.connectionString, options, pool: pool as FakePool });
     return pool;
@@ -95,26 +236,43 @@ vi.mock('ssh2', async () => {
 vi.mock('@ibm/mapepire-js', () => ({
   createSSH2Connection: vi.fn(() => ({ exec: vi.fn(), upload: vi.fn() })),
   SQLJob: {
-    withConfig: vi.fn((_config: unknown, jdbcOptions: Record<string, string>) => {
+    withConfig: vi.fn((config: Record<string, unknown>, jdbcOptions: Record<string, string>) => {
       const pool = makeFakePool();
       let status = 'notStarted';
       return {
+        id: undefined as string | undefined,
         async connect() {
           if (created.failNext.mapepire) {
             created.failNext.mapepire = false;
             throw new Error('mapepire job failed to start');
           }
+          if (created.mapepireStartError !== undefined) {
+            const message = created.mapepireStartError;
+            created.mapepireStartError = undefined;
+            throw new Error(message);
+          }
           status = 'ready';
-          created.mapepire.push({ jdbcOptions, pool });
+          this.id = JOB_NAME;
+          created.mapepire.push({ config, jdbcOptions, pool });
           return { success: true };
         },
         getStatus: () => status,
         getTransport: () => ({ isConnected: () => status === 'ready' }),
+        async send(request: { id: string; type: string; sql?: string }) {
+          if (request.type !== 'prepare_sql') {
+            return { id: request.id, success: true };
+          }
+          const failure = await fakePrepare(request.sql ?? '');
+          return failure
+            ? { id: request.id, success: false, error: failure.text, sql_state: failure.sqlstate, sql_rc: failure.sqlcode }
+            : { id: request.id, success: true };
+        },
         query(sql: string, opts: { parameters?: unknown[] }) {
           return {
             async execute() {
-              const rows = await pool.query(sql, opts.parameters ?? []);
-              return { data: rows, is_done: true };
+              const rows = (await pool.query(sql, opts.parameters ?? [])) as Record<string, unknown>[];
+              const columns = Object.keys(rows[0] ?? {}).map((name) => ({ name, label: name, type: 'VARCHAR', precision: 0, scale: 0 }));
+              return { data: rows, is_done: true, metadata: { column_count: columns.length, columns } };
             },
             async fetchMore() {
               return { data: [], is_done: true };
@@ -161,6 +319,8 @@ interface DriverProbe {
   pools(): FakePool[];
   isReadOnly(index: number): boolean;
   failNext(): void;
+  /** A failed statement, shaped the way this driver's package reports it. */
+  sqlError(sqlstate: string, sqlcode: number, text: string): Error;
 }
 
 const probes: DriverProbe[] = [
@@ -171,6 +331,13 @@ const probes: DriverProbe[] = [
     failNext: () => {
       created.failNext.jt400 = true;
     },
+    // node-jt400: Oops error, then node-java's error, then the Java SQLException
+    sqlError: (sqlstate, sqlcode, text) =>
+      new Error(`[SQL${String(-sqlcode).padStart(4, '0')}] ${text}`, {
+        cause: new Error('Error running instance method', {
+          cause: { getSQLStateSync: () => sqlstate, getErrorCodeSync: () => sqlcode },
+        }),
+      }),
   },
   {
     name: 'odbc',
@@ -179,6 +346,10 @@ const probes: DriverProbe[] = [
     failNext: () => {
       created.failNext.odbc = true;
     },
+    sqlError: (sqlstate, sqlcode, text) =>
+      Object.assign(new Error('[odbc] Error executing the sql statement'), {
+        odbcErrors: [{ state: sqlstate, code: sqlcode, message: text }],
+      }),
   },
   {
     name: 'mapepire',
@@ -187,6 +358,7 @@ const probes: DriverProbe[] = [
     failNext: () => {
       created.failNext.mapepire = true;
     },
+    sqlError: (sqlstate, sqlcode, text) => new Error(`${text}, ${sqlstate}, ${sqlcode}`),
   },
 ];
 
@@ -202,12 +374,20 @@ describe.each(probes)('driver contract: $name', (probe) => {
     created.failNext.odbc = false;
     created.failNext.mapepire = false;
     created.rows = [{ SCHEMA_NAME: 'MYLIB', N: 1 }];
+    created.hangNext = false;
+    created.hanging.length = 0;
+    created.cancelFails = false;
+    created.odbcCancels = 0;
+    created.prepared.length = 0;
+    created.prepareFailure = undefined;
+    created.prepareHangs = false;
     // connection.ts keeps module state, so each test gets a fresh copy.
     vi.resetModules();
     connection = await import('../../src/db/connection.js');
   });
 
   afterEach(async () => {
+    finishHanging();
     await connection.closeGlobalPool();
     await connection.closeAllSessionPools();
   });
@@ -233,6 +413,23 @@ describe.each(probes)('driver contract: $name', (probe) => {
     expect(result.rows).toEqual([{ SCHEMA_NAME: 'MYLIB', N: 1 }]);
     expect(Array.isArray(result.rows)).toBe(true);
     expect(Object.keys(result.rows)).toEqual(['0']);
+  });
+
+  it('returns the result columns with each query', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    created.odbcColumns = [
+      { name: 'SCHEMA_NAME', dataType: 12, dataTypeName: 'VARCHAR', columnSize: 128, decimalDigits: 0, nullable: true },
+      { name: 'N', dataType: 4, dataTypeName: 'INTEGER', columnSize: 10, decimalDigits: 0, nullable: true },
+    ];
+    try {
+      const result = await connection.executeQuery('SELECT SCHEMA_NAME, N FROM QSYS2.SYSSCHEMAS');
+      expect(result.columns?.map((column) => column.name)).toEqual(['SCHEMA_NAME', 'N']);
+      if (probe.name === 'odbc') {
+        expect(result.columns?.map((column) => column.kind)).toEqual(['string', 'int']);
+      }
+    } finally {
+      created.odbcColumns = [];
+    }
   });
 
   it('opens the query connection read only and reuses it', async () => {
@@ -280,6 +477,118 @@ describe.each(probes)('driver contract: $name', (probe) => {
     );
   });
 
+  it('reports the SQLSTATE, SQLCODE, cause and recovery of a failed statement', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    const [pool] = probe.pools();
+    pool.query.mockImplementation(async (sql: unknown) => {
+      if (typeof sql === 'string' && sql.includes('SQLCODE_INFO')) {
+        return [{
+          MESSAGE_SECOND_LEVEL_TEXT:
+            'Cause . . . . . :   &1 in &2 type *&3 was not found. Recovery  . . . :   Change the name and try the request again.',
+        }];
+      }
+      if (sql === 'VALUES QSYS2.JOB_NAME') {
+        return [{ '00001': JOB_NAME }];
+      }
+      throw probe.sqlError('42704', -204, 'ORDERS in MYLIB type *FILE not found.');
+    });
+
+    const error = await connection.executeQuery('SELECT * FROM MYLIB.ORDERS').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/^Database query failed: \[42704\] .*ORDERS in MYLIB type \*FILE not found\.$/);
+    expect((error as { details?: unknown }).details).toEqual({
+      sqlstate: '42704',
+      sqlcode: -204,
+      cause: '&1 in &2 type *&3 was not found.',
+      recovery: 'Change the name and try the request again.',
+    });
+    const lookup = pool.query.mock.calls.find(([sql]) => typeof sql === 'string' && sql.includes('SQLCODE_INFO'));
+    expect(lookup?.[1]).toEqual([-204]);
+  });
+
+  it('explains a statement Db2 rejects by preparing it without running it', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    const [pool] = probe.pools();
+    pool.query.mockImplementation(async (sql: unknown) => {
+      if (typeof sql === 'string' && sql.includes('SQLCODE_INFO')) {
+        return [{ MESSAGE_SECOND_LEVEL_TEXT: 'Cause . . . . . :   A syntax error was detected at token &1. Recovery  . . . :   Correct the syntax.' }];
+      }
+      throw new Error(`unexpected statement: ${String(sql)}`);
+    });
+    created.prepareFailure = { sqlstate: '42000', sqlcode: -104, text: 'SQL0104 - Token EXISTS was not valid.' };
+    const statement = 'SELECT CASE WHEN EXISTS (SELECT 1 FROM MYLIB.ORDERS) THEN 1 END FROM SYSIBM.SYSDUMMY1';
+
+    const reason = await connection.explainUnparsedStatement(statement);
+
+    if (probe.name === 'jt400') {
+      // node-jt400 has no prepare-only call
+      expect(reason).toBeUndefined();
+      expect(created.prepared).toEqual([]);
+      return;
+    }
+    if (!reason || 'accepted' in reason) {
+      throw new Error(`expected Db2's reason, got ${JSON.stringify(reason)}`);
+    }
+    expect(reason.message).toMatch(/^\[42000\] .*SQL0104 - Token EXISTS was not valid\.$/);
+    expect(reason.details).toEqual({
+      sqlstate: '42000',
+      sqlcode: -104,
+      cause: 'A syntax error was detected at token &1.',
+      recovery: 'Correct the syntax.',
+    });
+    expect(created.prepared).toContain(statement);
+    // Only the SQLCODE lookup ran; the statement itself never did
+    expect(pool.query.mock.calls.map(([sql]) => sql).filter((sql) => sql === statement)).toEqual([]);
+  });
+
+  it('says when Db2 accepts the prepared statement', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    const reason = await connection.explainUnparsedStatement('VALUES 1');
+    expect(reason).toEqual(probe.name === 'jt400' ? undefined : { accepted: true });
+  });
+
+  it('gives up on a prepare that takes longer than PREPARE_TIMEOUT_MS', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    created.prepareHangs = true;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const pending = connection.explainUnparsedStatement('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+      await vi.advanceTimersByTimeAsync(connection.PREPARE_TIMEOUT_MS + 1);
+      expect(await pending).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the original error when the SQLCODE lookup fails', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    const [pool] = probe.pools();
+    pool.query.mockImplementation(async (sql: unknown) => {
+      if (typeof sql === 'string' && sql.includes('SQLCODE_INFO')) {
+        throw probe.sqlError('42704', -204, 'SQLCODE_INFO in SYSTOOLS type *N not found.');
+      }
+      if (sql === 'VALUES QSYS2.JOB_NAME') {
+        return [{ '00001': JOB_NAME }];
+      }
+      throw probe.sqlError('42601', -104, 'Token . was not valid.');
+    });
+
+    const error = await connection.executeQuery('SELECT FROM MYLIB.ORDERS').catch((e: unknown) => e);
+    expect((error as Error).message).toMatch(/^Database query failed: \[42601\] .*Token \. was not valid\.$/);
+    expect((error as { details?: unknown }).details).toEqual({ sqlstate: '42601', sqlcode: -104 });
+  });
+
+  it('returns BIGINT values as numbers, or exact strings beyond the safe range', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    created.rows = [{ SMALL: 1n, BIG: 9007199254740993n }];
+    const { rows } = await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    expect(rows).toEqual([{ SMALL: 1, BIG: '9007199254740993' }]);
+  });
+
   it('closes both global connections on shutdown', async () => {
     connection.initializePool(baseConfig(probe.name));
     await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
@@ -292,6 +601,24 @@ describe.each(probes)('driver contract: $name', (probe) => {
     await expect(connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1')).rejects.toThrow(
       'Global connection pool not initialized'
     );
+  });
+
+  it('lists a pool whose close is still waiting', async () => {
+    connection.initializePool(baseConfig(probe.name));
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    const [pool] = probe.pools();
+    let release: () => void = () => {};
+    pool.close.mockImplementationOnce(() => new Promise((resolve) => {
+      release = () => resolve(undefined);
+    }));
+
+    const closing = connection.closeGlobalPool();
+    await vi.waitFor(() => expect(pool.close).toHaveBeenCalled());
+    expect(connection.pendingPoolCloses()).toEqual(['Global connection pool (default)']);
+
+    release();
+    await closing;
+    expect(connection.pendingPoolCloses()).toEqual([]);
   });
 
   it('keeps session pools separate and closes them by id', async () => {
@@ -367,6 +694,222 @@ describe.each(probes)('driver contract: $name', (probe) => {
     expect(pools[0].close).toHaveBeenCalledTimes(1);
     expect(pools[1].close).toHaveBeenCalledTimes(1);
   });
+  describe('MCP_POOL_IDLE_TIMEOUT', () => {
+    afterEach(() => {
+      connection.setSessionPoolIdleTimeout(0);
+    });
+
+    it('closes idle session connections, keeps the session, and reconnects on its next query', async () => {
+      connection.setSessionPoolIdleTimeout(1_000);
+      connection.initializePool(baseConfig(probe.name));
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+      connection.initializeSessionPool('session-a');
+      const a = target('session-a', 'default', baseConfig(probe.name));
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], a);
+      await connection.executeProcedure("CALL QSYS2.GENERATE_SQL('T', 'MYLIB', 'TABLE')", [], a);
+      const [stdio, query, procedure] = probe.pools();
+
+      await connection.closeIdleSessionPools(Date.now() + 500);
+      expect(query.close).not.toHaveBeenCalled();
+
+      await connection.closeIdleSessionPools(Date.now() + 2_000);
+      expect(query.close).toHaveBeenCalledTimes(1);
+      expect(procedure.close).toHaveBeenCalledTimes(1);
+      expect(stdio.close).not.toHaveBeenCalled();
+      expect(connection.hasSessionPool('session-a')).toBe(true);
+
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], a);
+      expect(probe.pools()).toHaveLength(4);
+      expect(probe.pools()[3].close).not.toHaveBeenCalled();
+    });
+
+    it('never closes a pool under a running statement', async () => {
+      connection.setSessionPoolIdleTimeout(1_000);
+      connection.initializeSessionPool('session-a');
+      const a = target('session-a', 'default', baseConfig(probe.name));
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], a);
+      const [pool] = probe.pools();
+
+      created.hangNext = true;
+      const running = connection.executeQuery('SELECT 2 FROM SYSIBM.SYSDUMMY1', [], a);
+      await vi.waitFor(() => expect(created.hanging).toHaveLength(1));
+      await connection.closeIdleSessionPools(Date.now() + 60_000);
+      expect(pool.close).not.toHaveBeenCalled();
+
+      finishHanging();
+      await running;
+      await connection.closeIdleSessionPools(Date.now() + 60_000);
+      expect(pool.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets a handed-over pool replace a session whose pools closed while idle', async () => {
+      connection.setSessionPoolIdleTimeout(1_000);
+      connection.initializeSessionPool('session-a');
+      const a = target('session-a', 'default', baseConfig(probe.name));
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], a);
+
+      // An open pool is never replaced
+      connection.initializeSessionPool('check-1');
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], target('check-1', 'default', baseConfig(probe.name)));
+      expect(connection.moveSessionPool('check-1', 'session-a')).toBe(false);
+      await connection.closeSessionPool('check-1');
+
+      await connection.closeIdleSessionPools(Date.now() + 60_000);
+      connection.initializeSessionPool('check-2');
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], target('check-2', 'default', baseConfig(probe.name)));
+      expect(connection.moveSessionPool('check-2', 'session-a')).toBe(true);
+      expect(connection.hasSessionPool('check-2')).toBe(false);
+
+      // The session's next query runs on the handed-over pool
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], a);
+      expect(probe.pools()).toHaveLength(3);
+    });
+
+    it('closes nothing when set to 0', async () => {
+      connection.setSessionPoolIdleTimeout(0);
+      connection.initializeSessionPool('session-a');
+      await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1', [], target('session-a', 'default', baseConfig(probe.name)));
+
+      await connection.closeIdleSessionPools(Date.now() + 86_400_000);
+      expect(probe.pools()[0].close).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('statement time limit', () => {
+    // queryTimeout is in whole seconds, so these tests wait about a second each.
+    const limited = (): DB2iConfig => ({ ...baseConfig(probe.name), queryTimeout: 1 });
+    const canceller = probe.name === 'odbc' ? 'SQLCancel' : 'QSYS2.CANCEL_SQL';
+
+    /** CANCEL_SQL calls, and the pools they ran on. */
+    function cancelCalls(): Array<{ pool: number; params: unknown[] }> {
+      return probe.pools().flatMap((pool, index) =>
+        pool.query.mock.calls
+          .filter(([sql]) => sql === 'CALL QSYS2.CANCEL_SQL(?)')
+          .map(([, params]) => ({ pool: index, params: params as unknown[] }))
+      );
+    }
+
+    it('returns the rows of a statement that ends in time', async () => {
+      connection.initializePool(limited());
+      const result = await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+      expect(result.rows).toEqual([{ SCHEMA_NAME: 'MYLIB', N: 1 }]);
+      expect(cancelCalls()).toEqual([]);
+      expect(created.odbcCancels).toBe(0);
+    });
+
+    it(`cancels a statement that runs past the limit with ${canceller}, and the pool still works`, async () => {
+      connection.initializePool(limited());
+      created.hangNext = true;
+      await expect(connection.executeQuery('SELECT * FROM MYLIB.ORDERS')).rejects.toThrow(
+        'Database query failed: Query cancelled on the IBM i after 1 seconds (QUERY_TIMEOUT)'
+      );
+
+      if (probe.name === 'odbc') {
+        expect(created.odbcCancels).toBe(1);
+        expect(cancelCalls()).toEqual([]);
+      } else {
+        // On the connection without the read-only setting, which the CALL needs
+        const calls = cancelCalls();
+        expect(calls).toHaveLength(1);
+        expect(calls[0].params).toEqual([JOB_NAME]);
+        expect(probe.isReadOnly(calls[0].pool)).toBe(false);
+      }
+
+      const again = await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+      expect(again.rows).toHaveLength(1);
+    });
+
+    it('says when the IBM i refused the cancel, and the pool still works', async () => {
+      connection.initializePool(limited());
+      created.hangNext = true;
+      created.cancelFails = true;
+      await expect(connection.executeQuery('SELECT * FROM MYLIB.ORDERS')).rejects.toThrow(
+        /^Database query failed: Query stopped after 1 seconds \(QUERY_TIMEOUT\), but it could not be cancelled and may still be running on the IBM i\./
+      );
+      if (probe.name === 'mapepire') {
+        // The job may still be running the statement, so it is not reused
+        expect(probe.pools()[0].close).toHaveBeenCalledTimes(1);
+      }
+
+      created.cancelFails = false;
+      const again = await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+      expect(again.rows).toHaveLength(1);
+    });
+  });
+});
+
+describe('driver contract: jt400 specifics', () => {
+  let connection: Connection;
+
+  beforeEach(async () => {
+    created.jt400.length = 0;
+    created.failNext.jt400 = false;
+    created.rows = [];
+    created.jt400Result = undefined;
+    created.jt400MetadataFails = false;
+    created.jt400Closes = 0;
+    created.jt400Executed = [];
+    vi.resetModules();
+    connection = await import('../../src/db/connection.js');
+  });
+
+  afterEach(async () => {
+    await connection.closeGlobalPool();
+  });
+
+  it('reads rows through a prepared statement, so BLOB values come back as hex', async () => {
+    connection.initializePool(baseConfig('jt400'));
+    // asArray() returns what getString gives, which is hex for BLOB; query() would give base64
+    created.rows = [{ BL: '0102', BNULL: null, C: 'a' }];
+    const { rows } = await connection.executeQuery('SELECT BL, BNULL, C FROM SYSIBM.SYSDUMMY1');
+    expect(rows).toEqual([{ BL: '0102', BNULL: null, C: 'a' }]);
+    expect(created.jt400Executed).toEqual(['SELECT BL, BNULL, C FROM SYSIBM.SYSDUMMY1']);
+    expect(created.jt400Closes).toBe(0);
+  });
+
+  it('keeps the last value of a duplicate column name, like query()', async () => {
+    connection.initializePool(baseConfig('jt400'));
+    created.jt400Result = { columns: ['IBMREQD', 'IBMREQD', 'N'], rows: [['Y', 'N', '1']] };
+    const { rows } = await connection.executeQuery('SELECT A.IBMREQD, B.IBMREQD, 1 AS N FROM SYSIBM.SYSDUMMY1 A, SYSIBM.SYSDUMMY1 B');
+    expect(rows).toEqual([{ IBMREQD: 'N', N: '1' }]);
+  });
+
+  it('closes the statement once when its metadata cannot be read', async () => {
+    connection.initializePool(baseConfig('jt400'));
+    created.jt400MetadataFails = true;
+    await expect(connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1')).rejects.toThrow('metadata failed');
+    expect(created.jt400Closes).toBe(1);
+  });
+
+  it('uses a prepared statement on the pinned connection when a time limit is set', async () => {
+    connection.initializePool({ ...baseConfig('jt400'), queryTimeout: 30 });
+    created.rows = [{ BL: '0102' }];
+    const { rows } = await connection.executeQuery('SELECT BL FROM SYSIBM.SYSDUMMY1');
+    expect(rows).toEqual([{ BL: '0102' }]);
+    const [pool] = created.jt400.map((c) => c.pool);
+    const sqls = pool.query.mock.calls.map(([sql]) => sql);
+    expect(sqls).toEqual(['VALUES QSYS2.JOB_NAME', 'SELECT BL FROM SYSIBM.SYSDUMMY1']);
+    expect(created.jt400Executed).toEqual(['SELECT BL FROM SYSIBM.SYSDUMMY1']);
+  });
+
+  it('reads the SQLCODE from the message ID when the Java exception is not available', async () => {
+    connection.initializePool(baseConfig('jt400'));
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    const [pool] = created.jt400.map((c) => c.pool);
+    pool.query.mockImplementation(async (sql: unknown) => {
+      if (sql === 'VALUES QSYS2.JOB_NAME') {
+        return [{ '00001': JOB_NAME }];
+      }
+      if (typeof sql === 'string' && sql.includes('SQLCODE_INFO')) {
+        return [];
+      }
+      throw new Error('[SQL0204] ORDERS in MYLIB type *FILE not found.');
+    });
+
+    const error = await connection.executeQuery('SELECT * FROM MYLIB.ORDERS').catch((e: unknown) => e);
+    expect((error as Error).message).toBe('Database query failed: [SQL0204] ORDERS in MYLIB type *FILE not found.');
+    expect((error as { details?: unknown }).details).toEqual({ sqlcode: -204 });
+  });
 });
 
 describe('driver contract: odbc specifics', () => {
@@ -376,6 +919,7 @@ describe('driver contract: odbc specifics', () => {
     created.odbc.length = 0;
     created.failNext.odbc = false;
     created.rows = [{ N: 1 }];
+    created.odbcColumns = [];
     vi.resetModules();
     connection = await import('../../src/db/connection.js');
   });
@@ -389,7 +933,7 @@ describe('driver contract: odbc specifics', () => {
     await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
     const { connectionString, options } = created.odbc[0];
     expect(connectionString).toBe(
-      'DRIVER=IBM i Access ODBC Driver;SYSTEM=ibmi.example.com;UID=TESTUSER;PWD=secret;DFT=5;TRIMCHAR=1;CONNTYPE=2;DBQ=MYLIB;SSL=1;NAM=0'
+      'DRIVER=IBM i Access ODBC Driver;SYSTEM=ibmi.example.com;UID=TESTUSER;PWD=secret;DFT=5;TRIMCHAR=1;CCSID=1208;CONNTYPE=2;DBQ=MYLIB;SSL=1;NAM=0'
     );
     expect(options.initialSize).toBe(1);
     expect(options.maxSize).toBeGreaterThan(1);
@@ -403,6 +947,64 @@ describe('driver contract: odbc specifics', () => {
     expect(params).toEqual(['2026-09-24 13:45:30.123000']);
     expect(Object.keys(result.rows)).toEqual(['0']);
     expect(result.rows).toEqual([{ N: 1 }]);
+  });
+
+  it('returns binary columns, which node-odbc reads as an ArrayBuffer, as upper-case hex', async () => {
+    connection.initializePool(baseConfig('odbc'));
+    created.rows = [{ B2: new Uint8Array([0x0a, 0xff]).buffer, EMPTY: new ArrayBuffer(0), N: null }];
+    const { rows } = await connection.executeQuery('SELECT B2 FROM SYSIBM.SYSDUMMY1');
+    expect(rows).toEqual([{ B2: '0AFF', EMPTY: '', N: null }]);
+    expect(JSON.stringify(rows)).toBe('[{"B2":"0AFF","EMPTY":"","N":null}]');
+  });
+
+  describe('decimals node-odbc rounds', () => {
+    const decimal = (name: string, columnSize: number, decimalDigits: number, dataType = 3) => ({
+      name,
+      dataType,
+      dataTypeName: dataType === 3 ? 'DECIMAL' : 'NUMERIC',
+      columnSize,
+      decimalDigits,
+      nullable: true,
+    });
+
+    it('names a wide DECIMAL or NUMERIC column whose value has more than 15 digits', async () => {
+      connection.initializePool(baseConfig('odbc'));
+      created.odbcColumns = [decimal('W', 31, 2), decimal('N', 20, 0, 2), decimal('SMALL', 31, 2)];
+      created.rows = [
+        { W: 12345678901234567000, N: null, SMALL: 12.5 },
+        { W: null, N: 1234567890123456, SMALL: 9999999999999.99 },
+      ];
+      const result = await connection.executeQuery('SELECT W, N, SMALL FROM MYLIB.ORDERS');
+      expect(result.roundedColumns).toEqual(['W', 'N']);
+      expect(result.rows).toEqual(created.rows);
+    });
+
+    it('names nothing when every value fits in 15 digits, or there are no rows', async () => {
+      connection.initializePool(baseConfig('odbc'));
+      created.odbcColumns = [decimal('AMOUNT', 31, 2), decimal('NARROW', 15, 2), decimal('FRACTION', 31, 20)];
+      created.rows = [{ AMOUNT: 1234567890123.45, NARROW: 1234567890123.45, FRACTION: 0.000001 }];
+      expect((await connection.executeQuery('SELECT * FROM MYLIB.ORDERS')).roundedColumns).toBeUndefined();
+
+      created.odbcColumns = [decimal('AMOUNT', 31, 2)];
+      created.rows = [];
+      expect((await connection.executeQuery('SELECT * FROM MYLIB.ORDERS')).roundedColumns).toBeUndefined();
+    });
+
+    it('counts the scale: a DECIMAL(31,20) value from 0.00001 up may have more than 15 digits', async () => {
+      connection.initializePool(baseConfig('odbc'));
+      created.odbcColumns = [decimal('FRACTION', 31, 20)];
+      created.rows = [{ FRACTION: 0.00001 }];
+      expect((await connection.executeQuery('SELECT * FROM MYLIB.ORDERS')).roundedColumns).toEqual(['FRACTION']);
+    });
+
+    it('names rounded columns when the statement runs with a time limit', async () => {
+      connection.initializePool({ ...baseConfig('odbc'), queryTimeout: 30 });
+      created.odbcColumns = [decimal('W', 31, 2)];
+      created.rows = [{ W: 12345678901234567000 }];
+      const result = await connection.executeQuery('SELECT W FROM MYLIB.ORDERS');
+      expect(result.roundedColumns).toEqual(['W']);
+      expect(result.rows).toEqual([{ W: 12345678901234567000 }]);
+    });
   });
 
   it('surfaces the ODBC diagnostic when the pool cannot connect', async () => {
@@ -477,6 +1079,27 @@ describe('driver contract: mapepire specifics', () => {
       access: 'read only',
       libraries: 'MYLIB',
     });
+  });
+
+  it('starts the Mapepire server with technique tcp unless told otherwise', async () => {
+    connection.initializePool(baseConfig('mapepire'));
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    expect(created.mapepire[0].config).toMatchObject({ transport: 'ssh-single', sshSingleTechnique: 'tcp' });
+    await connection.closeGlobalPool();
+
+    connection.initializePool({ ...baseConfig('mapepire'), mapepireOptions: { technique: 'CLI' } });
+    await connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1');
+    expect(created.mapepire[1].config).toMatchObject({ sshSingleTechnique: 'cli' });
+  });
+
+  it('explains the CCSID 65535 failure of technique=cli', async () => {
+    const ccsidError =
+      'INTERNAL ERROR:  Creation of DB2Driver object for registering with DriverManager failed. -> com.ibm.db2.jdbc.app.DB2JDBCDataException: CCSID value is not valid.';
+    connection.initializePool({ ...baseConfig('mapepire'), mapepireOptions: { technique: 'cli' } });
+    created.mapepireStartError = ccsidError;
+    await expect(connection.executeQuery('SELECT 1 FROM SYSIBM.SYSDUMMY1')).rejects.toThrow(
+      /CCSID value is not valid\. The Mapepire server's native JDBC driver \(technique=cli\) cannot run in a job with CCSID 65535/
+    );
   });
 
   it('binds Date parameters as Db2 timestamps', async () => {

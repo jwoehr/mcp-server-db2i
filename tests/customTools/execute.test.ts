@@ -4,15 +4,18 @@ vi.mock('../../src/db/connection.js', () => ({
   executeQuery: vi.fn(async () => ({ rows: [{ ORDERNO: 1001 }] })),
 }));
 
-vi.mock('../../src/db/sqlServices.js', () => ({
+vi.mock('../../src/db/sqlServices.js', async (importOriginal) => ({
+  checkParsedSchemas: (await importOriginal<typeof import('../../src/db/sqlServices.js')>()).checkParsedSchemas,
   parseStatement: vi.fn(async () => [{ statementType: 'QUERY' }]),
+  explainParseFailure: vi.fn(async () => ({ error: 'The statement could not be parsed.', details: {} })),
   isParseStatementMissing: vi.fn(() => false),
   PARSE_STATEMENT_UNAVAILABLE: 'QSYS2.PARSE_STATEMENT is not available on this system.',
 }));
 
 import { executeQuery } from '../../src/db/connection.js';
-import { isParseStatementMissing, parseStatement } from '../../src/db/sqlServices.js';
+import { explainParseFailure, isParseStatementMissing, parseStatement } from '../../src/db/sqlServices.js';
 import { executeCustomTool } from '../../src/customTools/execute.js';
+import { DatabaseQueryError } from '../../src/db/sqlErrorInfo.js';
 import type { StoredTool } from '../../src/customTools/loader.js';
 import { resetCustomTools } from '../../src/customTools/registry.js';
 
@@ -56,9 +59,35 @@ describe('executeCustomTool', () => {
     expect(result.limitApplied).toBe(25);
     expect(executeQuery).toHaveBeenCalledTimes(1);
     const [sql, params] = vi.mocked(executeQuery).mock.calls[0];
-    expect(sql).toContain('FETCH FIRST 25 ROWS ONLY');
+    // One row past maxRows tells a full result from a cut one
+    expect(sql).toContain('FETCH FIRST 26 ROWS ONLY');
     expect(params).toEqual(['1001', 'O', null, 'O']);
     expect(parseStatement).not.toHaveBeenCalled();
+  });
+
+  it('warns about columns the driver rounded, except masked ones', async () => {
+    vi.mocked(executeQuery).mockResolvedValueOnce({
+      rows: [{ TOTAL: 12345678901234567000, BALANCE: 12345678901234567000 }],
+      roundedColumns: ['TOTAL', 'BALANCE'],
+    });
+    const wide = {
+      ...tool,
+      sql: 'SELECT TOTAL, BALANCE FROM MYLIB.CUSTOMERS',
+      parameters: {},
+      placeholderNames: [],
+      maskedColumns: { BALANCE: 'redact' as const },
+    };
+
+    const result = await executeCustomTool(wide, {});
+
+    expect(result.success).toBe(true);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings?.[0]).toContain('values in TOTAL are not exact');
+  });
+
+  it('adds no warnings when nothing was rounded', async () => {
+    const result = await executeCustomTool(tool, { customer: '1001' });
+    expect(result.warnings).toBeUndefined();
   });
 
   it('masks a plainly selected column on a YAML tool', async () => {
@@ -79,6 +108,27 @@ describe('executeCustomTool', () => {
     expect(result.data).toEqual([{ EMAIL: '****', PHONE: '****0100' }]);
   });
 
+  it('returns the SQLSTATE, SQLCODE, cause and recovery when the statement fails', async () => {
+    vi.mocked(executeQuery).mockRejectedValueOnce(
+      new DatabaseQueryError('Database query failed: [42704] [SQL0204] ORDERHDR in MYLIB type *FILE not found.', {
+        sqlstate: '42704',
+        sqlcode: -204,
+        cause: '&1 in &2 type *&3 was not found.',
+        recovery: 'Change the name and try the request again.',
+      })
+    );
+    const result = await executeCustomTool(tool, { customer: '1001' });
+
+    expect(result).toEqual({
+      success: false,
+      error: 'Database query failed: [42704] [SQL0204] ORDERHDR in MYLIB type *FILE not found.',
+      sqlstate: '42704',
+      sqlcode: -204,
+      cause: '&1 in &2 type *&3 was not found.',
+      recovery: 'Change the name and try the request again.',
+    });
+  });
+
   it('rejects a missing required parameter before querying', async () => {
     const result = await executeCustomTool(tool, {});
 
@@ -87,13 +137,32 @@ describe('executeCustomTool', () => {
     expect(executeQuery).not.toHaveBeenCalled();
   });
 
+  it('reports a result cut at maxRows', async () => {
+    const rows = Array.from({ length: 26 }, (_, index) => ({ ORDERNO: 1001 + index }));
+    vi.mocked(executeQuery).mockResolvedValueOnce({ rows } as Awaited<ReturnType<typeof executeQuery>>);
+
+    const result = await executeCustomTool(tool, { customer: '1001' });
+
+    expect(result.success).toBe(true);
+    expect(result.rowCount).toBe(25);
+    expect(result.truncated).toBe(true);
+    expect(result.warnings).toEqual([expect.stringContaining('stopped at 25 rows')]);
+  });
+
+  it('does not report truncation when every row fits', async () => {
+    const result = await executeCustomTool(tool, { customer: '1001' });
+
+    expect(result.truncated).toBe(false);
+    expect(result.warnings).toBeUndefined();
+  });
+
   it('caps maxRows at QUERY_MAX_LIMIT', async () => {
     process.env.QUERY_MAX_LIMIT = '10';
     const result = await executeCustomTool(tool, { customer: '1001', include_closed: true });
 
     expect(result.limitApplied).toBe(10);
     const [sql, params] = vi.mocked(executeQuery).mock.calls[0];
-    expect(sql).toContain('FETCH FIRST 10 ROWS ONLY');
+    expect(sql).toContain('FETCH FIRST 11 ROWS ONLY');
     expect(params).toEqual(['1001', 'O', 1, 'O']);
   });
 
@@ -103,6 +172,61 @@ describe('executeCustomTool', () => {
 
     expect(result.success).toBe(false);
     expect(result.violations?.join(' ')).toContain('MYLIB.ORDERHDR');
+    expect(executeQuery).not.toHaveBeenCalled();
+  });
+
+  it('checks the allowlist from the parsed names when the parse check is on', async () => {
+    process.env.QUERY_PARSE_CHECK = 'true';
+    process.env.QUERY_ALLOWED_SCHEMAS = 'MYLIB';
+    vi.mocked(parseStatement).mockResolvedValueOnce([
+      { nameType: 'TABLE', schema: 'MYLIB', name: 'ORDERHDR', columnName: null, statementType: 'QUERY' },
+      { nameType: 'TABLE', schema: 'OUTSIDELIB', name: 'ORDERS', columnName: null, statementType: 'QUERY' },
+    ]);
+
+    const result = await executeCustomTool(tool, { customer: '1001' }, { defaultSchema: 'MYLIB' });
+
+    expect(result.success).toBe(false);
+    expect(result.errorKind).toBe('allowlist_denied');
+    expect(result.violations?.join(' ')).toContain('OUTSIDELIB.ORDERS');
+    expect(executeQuery).not.toHaveBeenCalled();
+  });
+
+  it('runs a tool the JavaScript parser cannot read when the parsed names are allowed', async () => {
+    process.env.QUERY_PARSE_CHECK = 'true';
+    process.env.QUERY_ALLOWED_SCHEMAS = 'MYLIB';
+    vi.mocked(parseStatement).mockResolvedValueOnce([
+      { nameType: 'TABLE', schema: 'MYLIB', name: 'ORDERHDR', columnName: null, statementType: 'QUERY' },
+    ]);
+    const listagg: StoredTool = {
+      ...tool,
+      name: 'items_per_customer',
+      sql: "SELECT H.CUSTNO, LISTAGG(H.ORDERNO, ',') WITHIN GROUP (ORDER BY H.ORDERNO) FROM MYLIB.ORDERHDR H WHERE H.CUSTNO = ? AND H.STATUS = ? AND (? = 1 OR H.STATUS = ?) GROUP BY H.CUSTNO",
+    };
+
+    const result = await executeCustomTool(listagg, { customer: '1001' }, { defaultSchema: 'MYLIB' });
+
+    expect(result.success).toBe(true);
+    expect(executeQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns Db2's reason when the tool's statement does not parse, and caches it", async () => {
+    process.env.QUERY_PARSE_CHECK = 'true';
+    vi.mocked(parseStatement).mockResolvedValueOnce([]);
+    vi.mocked(explainParseFailure).mockResolvedValueOnce({
+      error: 'The statement could not be parsed: [42000] SQL0104 - Token EXISTS was not valid.',
+      details: { sqlstate: '42000', sqlcode: -104, cause: 'A syntax error.', recovery: 'Correct the syntax.' },
+    });
+
+    const first = await executeCustomTool(tool, { customer: '1001' });
+    const second = await executeCustomTool(tool, { customer: '1001' });
+
+    for (const result of [first, second]) {
+      expect(result.success).toBe(false);
+      expect(result.errorKind).toBe('parse_check');
+      expect(result.error).toContain('SQL0104');
+      expect(result).toMatchObject({ sqlstate: '42000', sqlcode: -104, cause: 'A syntax error.', recovery: 'Correct the syntax.' });
+    }
+    expect(explainParseFailure).toHaveBeenCalledTimes(1);
     expect(executeQuery).not.toHaveBeenCalled();
   });
 

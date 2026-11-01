@@ -1,36 +1,44 @@
-# mcp-server-db2i
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/svg/lockup-dark.svg">
+    <img src="docs/assets/brand/svg/lockup-primary.svg" alt="db2i/mcp logo: a route from a small round node to a blue square, next to the db2i/mcp wordmark" width="280">
+  </picture>
+</p>
+
+# Db2 for i MCP Server
 
 [![CI](https://github.com/Strom-Capital/mcp-server-db2i/actions/workflows/ci.yml/badge.svg)](https://github.com/Strom-Capital/mcp-server-db2i/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/mcp-server-db2i)](https://www.npmjs.com/package/mcp-server-db2i)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![MCP](https://img.shields.io/badge/MCP-2026--07--28-green?logo=anthropic&logoColor=white)](https://modelcontextprotocol.io/)
+[![MCP](https://img.shields.io/badge/MCP-2026--07--28-green?logo=modelcontextprotocol&logoColor=white)](https://modelcontextprotocol.io/)
 [![IBM i](https://img.shields.io/badge/IBM%20i-V7R3+-green?logo=ibm&logoColor=white)](https://www.ibm.com/products/ibm-i)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-≥22-green?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue?logo=docker&logoColor=white)](docs/docker.md)
 [![npm downloads](https://img.shields.io/npm/dm/mcp-server-db2i)](https://www.npmjs.com/package/mcp-server-db2i)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Strom-Capital/mcp-server-db2i/pulls)
-[![GitHub last commit](https://img.shields.io/github/last-commit/Strom-Capital/mcp-server-db2i)](https://github.com/Strom-Capital/mcp-server-db2i/commits/main)
+[![Sponsor](https://img.shields.io/badge/Sponsor-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/Strom-Capital)
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for IBM DB2 for i (DB2i). This server enables AI assistants like Claude and Cursor to query and inspect IBM i databases through the IBM i Access ODBC driver, or optionally the JT400 JDBC driver or Mapepire over SSH.
+`mcp-server-db2i` is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for IBM Db2 for i (Db2i) on IBM i (AS/400). It enables AI assistants like Claude and Cursor to query and inspect IBM i databases through the IBM i Access ODBC driver, or optionally the JT400 JDBC driver or Mapepire over SSH.
 
 Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.Strom-Capital/mcp-server-db2i`.
 
+**Website:** [db2i-mcp.com](https://db2i-mcp.com), with a [blog](https://db2i-mcp.com/blog) that explains each release. **Docs:** [docs.db2i-mcp.com](https://docs.db2i-mcp.com).
+
 ## Architecture
 
-AI clients connect to the MCP Server via stdio (IDEs) or HTTP (agents), which executes read-only queries against DB2 for i using the IBM i Access ODBC driver (default, no Java), the optional JT400 JDBC driver (`DB2I_DRIVER=jt400`), or Mapepire over SSH (`DB2I_DRIVER=mapepire`) for systems where only SSH is reachable. One server can reach several IBM i systems through connection profiles, each with its own driver.
+AI clients connect to the MCP Server in one of two ways. Local clients such as Claude Desktop, Claude Code and Cursor can start it as a process and talk over stdio. Remote clients connect over Streamable HTTP at `/mcp`, signing in with OAuth 2.1 (claude.ai custom connectors) or a bearer token (custom agents). Local clients can also use the HTTP endpoint. The server executes read-only queries against Db2 for i using the IBM i Access ODBC driver (default, no Java), the optional JT400 JDBC driver (`DB2I_DRIVER=jt400`), or Mapepire over SSH (`DB2I_DRIVER=mapepire`) for systems where only SSH is reachable. One server can reach several IBM i systems through connection profiles, each with its own driver.
 
 ```mermaid
 graph LR
     subgraph clients ["AI Clients"]
-        claude("Claude")
-        cursor("Cursor IDE")
+        local("Claude Desktop, Claude Code, Cursor")
+        remote("claude.ai connectors")
         agents("Custom Agents")
     end
 
     subgraph server ["MCP Server"]
         stdio["stdio"]
-        http["HTTP + Auth"]
+        http["Streamable HTTP + Auth"]
         tools[["MCP Tools"]]
         profiles{{"System profiles"}}
         odbc["IBM i Access ODBC"]
@@ -39,19 +47,21 @@ graph LR
     end
 
     subgraph prod ["IBM i: prod"]
-        db2prod[("DB2 for i")]
+        db2prod[("Db2 for i")]
     end
 
     subgraph test ["IBM i: test"]
-        db2test[("DB2 for i")]
+        db2test[("Db2 for i")]
     end
 
     subgraph dev ["IBM i: dev"]
-        db2dev[("DB2 for i")]
+        db2dev[("Db2 for i")]
     end
 
-    claude & cursor -->|MCP Protocol| stdio
-    agents -->|REST API| http
+    local -->|local process| stdio
+    local -.->|remote URL| http
+    remote -->|OAuth 2.1| http
+    agents -->|bearer token| http
     stdio & http --> tools
     tools --> profiles
     profiles --> odbc & jdbc & mapepire
@@ -62,24 +72,28 @@ graph LR
 
 ## Features
 
-- **Read-only SQL queries** - Execute SELECT statements safely with automatic result limiting
+- **Read-only SQL queries** - Execute SELECT statements safely with automatic result limiting, and a query timeout that cancels runaway statements on the IBM i
 - **Schema inspection** - List all schemas/libraries with optional filtering
 - **Table metadata** - List tables, describe columns, view indexes and constraints
 - **View inspection** - List and explore database views
 - **Secure by design** - Only SELECT queries allowed, credentials via environment variables
 - **Docker support** - Run as a container for easy deployment
-- **HTTP Transport** - REST API with token authentication for web/agent integration
+- **HTTP Transport** - MCP over Streamable HTTP with token authentication for remote clients and agents
+- **OAuth for Remote Clients** - Built-in OAuth 2.1 sign-in with the user's own IBM i profile, so claude.ai custom connectors can connect. The sign-in page can carry your company's name, logo, colors and language ([Customize for your company](docs/customization.md))
 - **Current MCP spec** - Speaks [2026-07-28](https://modelcontextprotocol.io/) and still serves stateless 2025-era clients
 - **Dual Transport** - Run stdio and HTTP simultaneously
 - **Multiple systems** - Reach several IBM i systems from one server with `DB2I_PROFILES`, each with its own driver, credentials, and library allowlist. Tools take an optional `system` argument. See [Multiple systems](docs/configuration.md#multiple-systems)
 - **SSH-only systems** - With `DB2I_DRIVER=mapepire`, reach an IBM i where only SSH is open. Mapepire starts inside the SSH session, with no server install and a host key check. See [Using the Mapepire driver](docs/configuration.md#using-the-mapepire-driver-ssh)
 - **Tool selection** - Enable or disable individual tools, e.g. a metadata-only mode without `execute_query`
 - **Business SQL tools** - Load read-only ERP queries and table notes from YAML, and check the files with `mcp-server-db2i validate-tools` before the server starts. See [Business SQL tools](docs/custom-tools.md)
+- **Server instructions** - Send the rules no query may miss, such as which flag marks a deleted row, to the model at the start of every session. See [Instructions](docs/custom-tools.md#instructions)
+- **Charts in the chat** - Hosts that support MCP Apps show query results as a sortable grid under the tool call, with a chart one click away. When the user asks for a chart, or a YAML tool sets one, it opens on the chart. See [Result view](docs/tools.md#result-view)
 - **Compact responses** - Compact JSON by default, or markdown tables to save tokens
 - **Statement checks and DDL** - Validate object names, return the SQL that recreates an object, and list what depends on a table
 - **Catalog search and profiling** - Find tables and columns across libraries, check journaling, and profile a table's row counts and value ranges
 - **Column masking** - Redact sensitive columns, or show only their last four characters, in query results. See [Column masking](docs/security.md#column-masking)
-- **Audit log** - Record every tool call as one JSON line, with the SQL hashed by default. See [Audit log](docs/security.md#audit-log)
+- **Query exports** - Hand the user a CSV or Excel file of a query's results, as a file path over stdio or a short-lived download link over HTTP. The rows never pass through the model. See [Query exports](docs/tools.md#query-exports)
+- **Audit log** - Record every tool call and sign-in as one JSON line, with the SQL hashed by default. Optionally record the model's reason for each call (`MCP_TOOL_INTENT`). See [Audit log](docs/security.md#audit-log)
 - **Tool reload** - Reload YAML tool files when they change, with `MCP_CUSTOM_TOOLS_WATCH=true`
 - **Resources and prompts** - Read table columns and DDL as MCP resources, and start from prompts that explore a library, explain a table, or write a query. See [Resources and prompts](#resources-and-prompts)
 
@@ -91,7 +105,14 @@ graph LR
 npm install -g mcp-server-db2i
 ```
 
-The default `odbc` driver needs unixODBC and the IBM i Access ODBC Driver on the machine. No Java is needed. To use the JT400 JDBC driver instead, have a JDK installed when you run `npm install` and set `DB2I_DRIVER=jt400`. If only SSH reaches the IBM i, set `DB2I_DRIVER=mapepire`: it needs SSH access and Java on the IBM i, and nothing else. See [Database Drivers](docs/configuration.md#database-drivers).
+The default `odbc` driver needs unixODBC and the IBM i Access ODBC Driver on the machine. No Java is needed. The other drivers' packages are not installed by default, so add them next to the server:
+
+```bash
+npm install -g mcp-server-db2i node-jt400              # DB2I_DRIVER=jt400, needs a JDK to install and a JRE to run
+npm install -g mcp-server-db2i @ibm/mapepire-js ssh2   # DB2I_DRIVER=mapepire, when only SSH reaches the IBM i
+```
+
+With npx, pass them with `-p`, for example `npx -y -p mcp-server-db2i@latest -p node-jt400 mcp-server-db2i`. See [Installing the jt400 and mapepire packages](docs/configuration.md#installing-the-jt400-and-mapepire-packages).
 
 Or with Docker:
 
@@ -120,7 +141,7 @@ Add to your MCP client config (e.g., `~/.cursor/mcp.json`):
   "mcpServers": {
     "db2i": {
       "command": "npx",
-      "args": ["mcp-server-db2i"],
+      "args": ["-y", "mcp-server-db2i@latest"],
       "env": {
         "DB2I_HOSTNAME": "${env:DB2I_HOSTNAME}",
         "DB2I_USERNAME": "${env:DB2I_USERNAME}",
@@ -135,11 +156,14 @@ This uses environment variable expansion to keep credentials out of config files
 
 See the [Client Setup Guide](docs/client-setup.md) for Cursor, Claude Desktop, Claude Code, and Docker setup options.
 
+No MCP client? The [example web app](examples/web-app) is a browser chat with result tables, exports and the business SQL tools. Users sign in with their IBM i user profile and bring their own model API key.
+
 ## Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `execute_query` | Execute read-only SELECT queries |
+| `execute_query` | Execute read-only SELECT queries, with an optional `chart` hint for the [result view](docs/tools.md#result-view) |
+| `export_query` | Write every row of a read-only query to a CSV or XLSX file: a path over stdio, a short-lived download link over HTTP. Off unless `EXPORT_ENABLED` is set |
 | `list_schemas` | List schemas/libraries (with optional filter) |
 | `list_tables` | List tables in a schema (with optional filter) |
 | `search_tables` | Find tables by name or description across libraries |
@@ -148,12 +172,25 @@ See the [Client Setup Guide](docs/client-setup.md) for Cursor, Claude Desktop, C
 | `list_views` | List views in a schema (with optional filter) |
 | `list_indexes` | List SQL indexes for a table |
 | `get_table_constraints` | Get primary keys, foreign keys, unique constraints |
+| `list_routines` | List SQL procedures and functions in a library, with language, external program, and SQL data access |
+| `describe_routine` | Parameters, return value or result columns, and a call template for a procedure or function |
 | `validate_query` | Check a statement without running it, including catalog names |
 | `get_object_ddl` | Return the SQL DDL that recreates an object |
 | `get_related_objects` | List objects that depend on a table |
 | `get_journal_info` | List journal, images, and primary key per table, and flag tables a replication tool cannot read |
+| `index_advice` | List the indexes the query optimizer asked for in a library, merged and ranked by temporary index use |
 | `profile_table` | Row count, last change, and per-column distinct and null counts from stored statistics or a scan |
-| `get_business_context` | List business descriptions and relations loaded from YAML |
+| `get_business_context` | List business descriptions, row filters and relations loaded from YAML |
+| `search_ibmi_services` | Find IBM i services by keyword or category, with the release that added each one and an example query |
+
+In hosts that support [MCP Apps](https://modelcontextprotocol.io/extensions/apps), results from `execute_query`, `profile_table` and business SQL tools open as a grid and a chart under the tool call. See [Result view](docs/tools.md#result-view).
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/result-view-dark.png">
+    <img src="docs/assets/result-view.png" alt="Three result views: stacked bars of order lines by warehouse and status, a line chart of monthly totals for three statuses, and a doughnut of orders by status with the total in the middle" width="900">
+  </picture>
+</p>
 
 ### Filter Syntax
 
@@ -171,6 +208,7 @@ Clients that support MCP resources can read a table's context without a tool cal
 | `db2i://{schema}/{table}` | Columns from the catalog, plus the YAML business description, column notes, and relations | `describe_table` is enabled |
 | `db2i://{schema}/{table}/ddl` | SQL from `QSYS2.GENERATE_SQL` that recreates the table, view, or alias | `get_object_ddl` is enabled |
 | `db2i://business-context` | Every annotation loaded from `MCP_CUSTOM_TOOLS` | `get_business_context` is enabled |
+| `ui://db2i/result` | The [result view](docs/tools.md#result-view) MCP Apps hosts show under tool results | `MCP_UI_ENABLED` is on (the default) |
 
 `resources/list` offers the annotated tables, for example `db2i://MYLIB/ORDERS`. Percent-encode `#` and other reserved characters in names (`ORD%23X` for `ORD#X`). A library outside `QUERY_ALLOWED_SCHEMAS` is rejected with the same message `execute_query` gives, and completion offers only allowed libraries. Reads and completions that query IBM i count against the rate limit, and reads are written to the audit log. Completion fetches a library's name list once and reuses it for 60 seconds, so typing a name costs one query rather than one per keystroke.
 
@@ -209,12 +247,14 @@ Once connected, you can ask the AI assistant:
 
 | Guide | Description |
 |-------|-------------|
+| [Tools, resources, and prompts](docs/tools.md) | Built-in tools, filter syntax, MCP resources, and prompts |
 | [HTTP Transport](docs/http-transport.md) | HTTP API, auth, and protocol versions |
 | [Configuration](docs/configuration.md) | All environment variables and driver options |
 | [Security](docs/security.md) | Credentials, rate limiting, query validation |
 | [Business SQL tools](docs/custom-tools.md) | YAML tools for orders, ledgers, and master data |
 | [Use cases](docs/use-cases.md) | REST APIs, BI pipelines, replication, and ad-hoc analysis |
 | [Client Setup](docs/client-setup.md) | Cursor, Claude, Claude Code setup |
+| [Example web app](docs/web-app.md) | Browser chat with your own model key and IBM i sign-in |
 | [Docker Guide](docs/docker.md) | Container deployment |
 | [Development](docs/development.md) | Contributing and local setup |
 
@@ -224,6 +264,8 @@ Once connected, you can ask the AI assistant:
 - `validate_query` and the `execute_query` parse check need `QSYS2.PARSE_STATEMENT` (IBM i 7.3 with Db2 PTF group SF99703 level 3, or 7.4 and later)
 - `get_related_objects` needs IBM i 7.3 Technology Refresh 9, IBM i 7.4 Technology Refresh 3, or a later release
 - `get_journal_info` needs the journal columns of `QSYS2.OBJECT_STATISTICS` (IBM i 7.3 Technology Refresh 2 or later)
+- `search_ibmi_services` needs `QSYS2.SERVICES_INFO`, which ships with the Db2 for i PTF group
+- The `cause` and `recovery` on a failed statement come from `SYSTOOLS.SQLCODE_INFO`. Without it, errors return the SQLSTATE, SQLCODE and message only
 - Node.js 22 or higher
 - unixODBC with the IBM i Access ODBC Driver for the default `odbc` driver, a JDK at install time and a JRE 11 or higher at runtime for the optional `jt400` driver, or SSH access and Java 8 or higher on the IBM i for the optional `mapepire` driver (see [Database Drivers](docs/configuration.md#database-drivers))
 - MCP spec 2026-07-28, plus stateless clients from the 2025-era revisions (through 2025-11-25)
@@ -239,6 +281,10 @@ Contributions are welcome! See the [Development Guide](docs/development.md) for 
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Trademarks
+
+IBM, IBM i and Db2 are trademarks of International Business Machines Corporation. This project is not affiliated with or endorsed by IBM.
 
 ## Acknowledgments
 

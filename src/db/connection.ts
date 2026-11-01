@@ -1,5 +1,5 @@
 /**
- * Connection pool manager for IBM DB2i.
+ * Connection pool manager for IBM Db2i.
  *
  * Pools are owned by a caller (`stdio`, or an HTTP session key) and kept per
  * IBM i system, so one caller can hold a pool on each configured system.
@@ -10,15 +10,21 @@
  */
 
 import type { DB2iConfig } from '../config.js';
+import { queryTimeoutMs } from '../config.js';
 import { DEFAULT_SYSTEM_NAME, STDIO_POOL_KEY, type DbTarget } from '../systems.js';
-import type { DbPool } from './driver.js';
-import { loadDriver, toParams } from './driver.js';
+import type { DbColumn, DbPool, DbRows, RowCursor } from './driver.js';
+import { DbError, loadDriver, QueryTimeoutError, toJsonSafeRows, toParams } from './driver.js';
+import { DatabaseQueryError, explainSqlError, LOOKUP_TIMEOUT_MS, type SqlErrorDetails } from './sqlErrorInfo.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger({ component: 'database' });
 
 export interface QueryResult {
   rows: Record<string, unknown>[];
+  /** Columns whose values the driver rounded (DECIMAL past 15 digits on ODBC). */
+  roundedColumns?: string[];
+  /** The result set's columns in order, when the driver reported them. */
+  columns?: DbColumn[];
 }
 
 /** One pool. `pool` is set by the first query and cleared on failure. */
@@ -36,9 +42,27 @@ interface PoolSlot {
 interface Owner {
   label: string;
   systems: Map<string, { query: PoolSlot; procedure?: PoolSlot }>;
+  /** Statements and open cursors running on the owner's pools. */
+  active: number;
+  /** When the owner last started or finished using a pool. */
+  lastUsed: number;
 }
 
 const owners = new Map<string, Owner>();
+
+// MCP_POOL_IDLE_TIMEOUT in milliseconds, 0 when off, and the timer that applies it
+let idleTimeoutMs = 0;
+let idleSweeper: NodeJS.Timeout | undefined;
+
+// Pools whose close() has started and not finished, for the shutdown deadline log
+const closingPools = new Set<string>();
+
+// Systems whose failed cancel was already logged, so a runaway query per call
+// does not repeat the same warning
+const cancelWarned = new Set<string>();
+
+/** Time limit for the QSYS2.CANCEL_SQL call itself. */
+const CANCEL_CALL_TIMEOUT_MS = 15_000;
 
 // The target used when a caller passes none: the stdio owner's default system.
 // Set by initializePool, for the CLI and code paths that predate systems.
@@ -97,8 +121,116 @@ export function initializeSessionPool(sessionId: string): void {
 
 function registerOwner(poolKey: string, label: string): void {
   if (!owners.has(poolKey)) {
-    owners.set(poolKey, { label, systems: new Map() });
+    owners.set(poolKey, { label, systems: new Map(), active: 0, lastUsed: Date.now() });
   }
+}
+
+/**
+ * Close the connections of HTTP session keys that ran nothing for `ms`
+ * (MCP_POOL_IDLE_TIMEOUT). The keys stay registered, and their next query
+ * opens a new pool. Without this, odbc and jt400 pools keep a connection until
+ * the token that owns them ends. The stdio pools are left alone.
+ *
+ * @param ms - Idle time in milliseconds before a key's pools close, 0 to turn it off
+ */
+export function setSessionPoolIdleTimeout(ms: number): void {
+  idleTimeoutMs = ms;
+  clearInterval(idleSweeper);
+  idleSweeper = undefined;
+  if (ms > 0) {
+    idleSweeper = setInterval(() => {
+      void closeIdleSessionPools();
+    }, Math.min(ms, 60_000));
+    idleSweeper.unref();
+  }
+}
+
+/**
+ * Close the pools of every HTTP session key idle past the timeout. Run by the
+ * timer setSessionPoolIdleTimeout starts; exported for tests.
+ *
+ * @param now - Current time
+ */
+export async function closeIdleSessionPools(now = Date.now()): Promise<void> {
+  if (idleTimeoutMs <= 0) {
+    return;
+  }
+  const closing: Promise<void>[] = [];
+  for (const [key, owner] of owners) {
+    if (key === STDIO_POOL_KEY || owner.active > 0 || now - owner.lastUsed < idleTimeoutMs) {
+      continue;
+    }
+    // Detach every open pool before the first await, so a query that arrives
+    // while they close opens a new pool rather than using a closing one
+    const open = [...owner.systems.entries()].flatMap(([system, pair]) =>
+      [pair.procedure, pair.query]
+        .filter((slot): slot is PoolSlot => slot?.pool !== undefined)
+        .map((slot) => {
+          const detached = { ...slot };
+          slot.pool = undefined;
+          return { system, slot: detached };
+        })
+    );
+    if (open.length === 0) {
+      continue;
+    }
+    log.info(
+      { sessionId: shortId(key), idleSeconds: Math.round((now - owner.lastUsed) / 1000) },
+      'Closing idle session connection pools'
+    );
+    closing.push(...open.map(({ system, slot }) => closeSlot(slot, system, key)));
+  }
+  await Promise.all(closing);
+}
+
+/** Whether any of an owner's pools has been created and not closed. */
+function hasOpenPool(owner: Owner): boolean {
+  return [...owner.systems.values()].some((pair) => pair.query.pool !== undefined || pair.procedure?.pool !== undefined);
+}
+
+/**
+ * Count a statement or cursor as use of its owner's pools until the returned
+ * function is called, so the idle timeout never closes a pool under it.
+ */
+function markActive(target: DbTarget): () => void {
+  const owner = owners.get(target.poolKey);
+  if (!owner) {
+    return () => undefined;
+  }
+  owner.active++;
+  owner.lastUsed = Date.now();
+  let done = false;
+  return () => {
+    if (!done) {
+      done = true;
+      owner.active--;
+      owner.lastUsed = Date.now();
+    }
+  };
+}
+
+/**
+ * Give the pools one session key owns to another key, keeping their open
+ * connections. Used to hand a credential check's pool to the token or OAuth
+ * grant it proved. Nothing moves when `to` already has an open pool or a
+ * statement running: the caller then closes `from`, so pools of two keys are
+ * never merged. A `to` whose pools the idle timeout closed is replaced.
+ *
+ * @returns true when the pools moved
+ */
+export function moveSessionPool(from: string, to: string): boolean {
+  const owner = owners.get(from);
+  if (!owner || from === STDIO_POOL_KEY || to === STDIO_POOL_KEY) {
+    return false;
+  }
+  const existing = owners.get(to);
+  if (existing && (existing.active > 0 || hasOpenPool(existing))) {
+    return false;
+  }
+  owners.delete(from);
+  owners.set(to, owner);
+  log.info({ from: shortId(from), sessionId: shortId(to) }, 'Session connection pool handed over');
+  return true;
 }
 
 /**
@@ -166,13 +298,25 @@ async function closeSlot(slot: PoolSlot, system: string, sessionId?: string): Pr
   const context = sessionId
     ? { sessionId: shortId(sessionId), system, poolCount: getSessionPoolCount() }
     : { system };
+  const name = sessionId ? `${slot.label} (${shortId(sessionId)}, ${system})` : `${slot.label} (${system})`;
+  closingPools.add(name);
   try {
     const pool = await pending;
     await pool.close();
     log.info(context, `${slot.label} closed`);
   } catch (err) {
     log.warn({ err, ...context }, `Error closing ${slot.label.toLowerCase()}`);
+  } finally {
+    closingPools.delete(name);
   }
+}
+
+/**
+ * Pools that started closing and have not finished, for example because a
+ * statement is still running on them.
+ */
+export function pendingPoolCloses(): string[] {
+  return [...closingPools];
 }
 
 /**
@@ -285,21 +429,254 @@ async function run(
   const resolved = resolve(target);
   const slot = getSlot(resolved, procedure);
   const kind = procedure ? 'Procedure' : 'Query';
+  let db: DbPool | undefined;
+  const release = markActive(resolved);
 
   try {
     log.debug(
       { sql: sql.substring(0, 200), paramCount: params.length, ...logContext(resolved) },
       procedure ? 'Executing procedure' : 'Executing query'
     );
-    const db = await acquire(slot, resolved);
-    const rows = await db.query(sql, toParams(params));
+    db = await acquire(slot, resolved);
+    const timeoutMs = queryTimeoutMs(slot.config);
+    const warmUp = scheduleCancelWarmUp(slot, resolved, procedure, timeoutMs);
+    let rawRows: DbRows;
+    try {
+      rawRows = await db.query(sql, toParams(params), {
+        timeoutMs,
+        cancelJob: (jobName) => cancelSql(jobName, resolved),
+      });
+    } finally {
+      clearTimeout(warmUp);
+    }
+    // BIGINT and binary values from ODBC are not JSON; convert them once, for every output path
+    const rows = toJsonSafeRows(Array.from(rawRows));
     log.debug({ rowCount: rows.length }, `${kind} completed`);
-    return { rows };
+    const { roundedColumns, columns } = rawRows;
+    return {
+      rows,
+      ...(roundedColumns ? { roundedColumns } : {}),
+      ...(columns ? { columns } : {}),
+    };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown database error';
+    if (error instanceof QueryTimeoutError) {
+      logTimeout(error, resolved, slot.config.driver, sql);
+    }
     log.debug({ err: error, sql: sql.substring(0, 200) }, procedure ? 'Procedure call failed' : 'Database query failed');
-    throw new Error(`Database query failed: ${message}`, { cause: error });
+    if (!db) {
+      const message = error instanceof Error ? error.message : 'Unknown database error';
+      throw new Error(`Database query failed: ${message}`, { cause: error });
+    }
+    const { message, details } = await explainSqlError(error, db, resolved.system);
+    throw new DatabaseQueryError(`Database query failed: ${message}`, details, { cause: error });
+  } finally {
+    release();
   }
+}
+
+/** Time limit for preparing a statement to learn why Db2 rejects it, as for the SQLCODE lookup. */
+export const PREPARE_TIMEOUT_MS = LOOKUP_TIMEOUT_MS;
+
+/**
+ * Why Db2 rejects a statement, found by preparing it on the read-only pool
+ * without running it. For a statement QSYS2.PARSE_STATEMENT could not parse,
+ * which gives no reason of its own.
+ *
+ * Never throws. Returns `{ accepted: true }` when Db2 prepares the statement
+ * without an error, and undefined when the driver cannot prepare without
+ * running (JT400), or when the prepare fails for a reason that is not a Db2
+ * error or takes longer than PREPARE_TIMEOUT_MS.
+ *
+ * @param sql - A statement that already passed the SQL validator
+ * @param target - Caller and system. Omit for the stdio default system.
+ * @returns The driver message and the SQLSTATE, SQLCODE, cause and recovery
+ */
+export async function explainUnparsedStatement(
+  sql: string,
+  target?: DbTarget
+): Promise<{ message: string; details: SqlErrorDetails } | { accepted: true } | undefined> {
+  let resolved: DbTarget;
+  try {
+    resolved = resolve(target);
+  } catch {
+    return undefined;
+  }
+  const slot = getSlot(resolved, false);
+  const release = markActive(resolved);
+  try {
+    const db = await acquire(slot, resolved);
+    if (!db.prepare) {
+      return undefined;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<'timeout'>((done) => {
+      timer = setTimeout(() => done('timeout'), PREPARE_TIMEOUT_MS);
+      timer.unref();
+    });
+    const prepared = db.prepare(sql).then(
+      () => 'prepared' as const,
+      (error: unknown) => error
+    );
+    const outcome = await Promise.race([prepared, timedOut]).finally(() => clearTimeout(timer));
+    if (outcome === 'prepared') {
+      return { accepted: true };
+    }
+    if (!(outcome instanceof DbError)) {
+      if (outcome === 'timeout') {
+        log.debug({ ...logContext(resolved) }, 'Prepare to explain a parse failure timed out');
+      }
+      return undefined;
+    }
+    return await explainSqlError(outcome, db, resolved.system);
+  } catch (error) {
+    log.debug({ err: error, ...logContext(resolved) }, 'Prepare to explain a parse failure failed');
+    return undefined;
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Open a cursor on the read-only pool, for reading a large result a batch at
+ * a time. The cursor holds one connection or job until it is closed, so the
+ * caller must close it in a `finally`. Aborting `signal` cancels the statement
+ * on the IBM i, the same way QUERY_TIMEOUT does for executeQuery.
+ *
+ * @param sql - A statement that already passed prepareReadQuery
+ * @param params - Query parameters
+ * @param target - Caller and system. Omit for the stdio default system.
+ * @param options - Rows per fetch, the caller's time limit, and the abort signal
+ */
+export async function openQueryCursor(
+  sql: string,
+  params: unknown[],
+  target: DbTarget | undefined,
+  options: { fetchSize: number; timeoutMs: number; signal?: AbortSignal }
+): Promise<RowCursor> {
+  const resolved = resolve(target);
+  const slot = getSlot(resolved, false);
+  let db: DbPool | undefined;
+  let warmUp: NodeJS.Timeout | undefined;
+  // The cursor holds a connection until it is closed, so it counts as use until then
+  const release = markActive(resolved);
+
+  const explain = async (error: unknown, pool: DbPool | undefined): Promise<Error> => {
+    log.debug({ err: error, sql: sql.substring(0, 200) }, 'Cursor query failed');
+    if (!pool) {
+      const message = error instanceof Error ? error.message : 'Unknown database error';
+      return new Error(`Database query failed: ${message}`, { cause: error });
+    }
+    const { message, details } = await explainSqlError(error, pool, resolved.system);
+    return new DatabaseQueryError(`Database query failed: ${message}`, details, { cause: error });
+  };
+
+  try {
+    log.debug(
+      { sql: sql.substring(0, 200), paramCount: params.length, ...logContext(resolved) },
+      'Opening cursor'
+    );
+    db = await acquire(slot, resolved);
+    if (!db.openCursor) {
+      throw new Error(`The ${slot.config.driver} driver cannot read results in batches`);
+    }
+    warmUp = scheduleCancelWarmUp(slot, resolved, false, options.timeoutMs);
+    const cursor = await db.openCursor(sql, toParams(params), {
+      fetchSize: options.fetchSize,
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+      cancelJob: (jobName) => cancelSql(jobName, resolved),
+    });
+    const pool = db;
+    return {
+      columns: cursor.columns,
+      async next() {
+        try {
+          return await cursor.next();
+        } catch (error) {
+          throw await explain(error, pool);
+        }
+      },
+      async close() {
+        clearTimeout(warmUp);
+        try {
+          await cursor.close();
+        } finally {
+          release();
+        }
+      },
+    };
+  } catch (error) {
+    clearTimeout(warmUp);
+    release();
+    throw await explain(error, db);
+  }
+}
+
+/**
+ * Cancel the statement running in another job with QSYS2.CANCEL_SQL. A
+ * read-only connection rejects the CALL, so it runs on the procedure pool.
+ * It needs *JOBCTL special authority or the QIBM_DB_SQLADM function usage.
+ */
+async function cancelSql(jobName: string, target: DbTarget): Promise<void> {
+  const slot = getSlot(target, true);
+  const release = markActive(target);
+  try {
+    const db = await acquire(slot, target);
+    await db.query('CALL QSYS2.CANCEL_SQL(?)', [jobName], {
+      timeoutMs: CANCEL_CALL_TIMEOUT_MS,
+      noResultSet: true,
+    });
+  } finally {
+    release();
+  }
+  log.debug({ job: jobName, ...logContext(target) }, 'Statement cancelled with QSYS2.CANCEL_SQL');
+}
+
+/**
+ * jt400 and mapepire cancel on the procedure pool, and a Mapepire job there
+ * takes seconds to start. Once a statement has used half its time limit, open
+ * that pool in the background so the cancel does not wait for it. ODBC cancels
+ * on the statement's own connection and needs nothing.
+ */
+function scheduleCancelWarmUp(
+  slot: PoolSlot,
+  target: DbTarget,
+  procedure: boolean,
+  timeoutMs: number
+): NodeJS.Timeout | undefined {
+  if (timeoutMs <= 0 || procedure || slot.config.driver === 'odbc') {
+    return undefined;
+  }
+  const timer = setTimeout(() => {
+    // getSlot throws once the session has closed, so it runs inside the chain
+    void Promise.resolve()
+      .then(() => acquire(getSlot(target, true), target))
+      .then((db) => db.query('VALUES 1', [], { timeoutMs: CANCEL_CALL_TIMEOUT_MS }))
+      .catch((err: unknown) => {
+        log.debug({ err, ...logContext(target) }, 'Could not open the pool QSYS2.CANCEL_SQL runs on');
+      });
+  }, timeoutMs / 2);
+  timer.unref();
+  return timer;
+}
+
+function logTimeout(error: QueryTimeoutError, target: DbTarget, driver: string, sql: string): void {
+  const context = { ...logContext(target), driver, timeoutMs: error.timeoutMs, sql: sql.substring(0, 200) };
+  if (error.cancelled) {
+    log.info(context, 'Statement cancelled after QUERY_TIMEOUT');
+    return;
+  }
+  if (cancelWarned.has(target.system)) {
+    log.info({ ...context, err: error.cause }, 'Statement passed QUERY_TIMEOUT and could not be cancelled');
+    return;
+  }
+  cancelWarned.add(target.system);
+  log.warn(
+    { ...context, err: error.cause },
+    'Statement passed QUERY_TIMEOUT and could not be cancelled, so it may still be running on the IBM i. ' +
+      'The jt400 and mapepire drivers cancel with QSYS2.CANCEL_SQL, which needs *JOBCTL special authority ' +
+      'or the QIBM_DB_SQLADM function usage. The odbc driver cancels without either.'
+  );
 }
 
 /**

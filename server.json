@@ -1,18 +1,19 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Strom-Capital/mcp-server-db2i",
-  "title": "IBM DB2 for i",
+  "title": "IBM Db2 for i",
   "description": "Read-only SQL queries and schema inspection for IBM Db2 for i over ODBC, JT400 or Mapepire (SSH).",
   "repository": {
     "url": "https://github.com/Strom-Capital/mcp-server-db2i",
     "source": "github"
   },
-  "version": "2.8.0",
+  "websiteUrl": "https://db2i-mcp.com",
+  "version": "3.8.5",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "mcp-server-db2i",
-      "version": "2.8.0",
+      "version": "3.8.5",
       "transport": {
         "type": "stdio"
       },
@@ -50,7 +51,7 @@
         },
         {
           "name": "DB2I_DRIVER",
-          "description": "Database driver: odbc (default, IBM i Access ODBC driver, no Java), jt400 (optional node-jt400 package, needs a JDK at install and a JRE at runtime) or mapepire (Mapepire over SSH, needs Java on the IBM i only)",
+          "description": "Database driver: odbc (default, IBM i Access ODBC driver, no Java), jt400 (install node-jt400 next to the server; needs a JDK at install and a JRE at runtime) or mapepire (install @ibm/mapepire-js and ssh2; Mapepire over SSH, needs Java on the IBM i only)",
           "isRequired": false,
           "default": "odbc"
         },
@@ -66,7 +67,7 @@
         },
         {
           "name": "DB2I_MAPEPIRE_OPTIONS",
-          "description": "SSH and Mapepire settings, semicolon-separated, e.g. hostKey=SHA256:...;maxJobs=2 (mapepire driver)",
+          "description": "SSH and Mapepire settings, semicolon-separated, e.g. hostKey=SHA256:...;agent=true;maxJobs=2 (mapepire driver)",
           "isRequired": false
         }
       ]

@@ -1,6 +1,9 @@
-# Use cases
+---
+title: "Use cases"
+description: "REST APIs, BI pipelines, journal replication, and ad-hoc analysis on IBM i ERP data."
+---
 
-These patterns come from projects where the source system was the Iptor DC1 ERP on IBM i. Nothing in them depends on that ERP. They apply to any IBM i system where the business data lives in DB2 for i files with terse names, numeric dates, and single-letter status codes.
+These patterns come from projects where the source system was the Iptor DC1 ERP on IBM i. Nothing in them depends on that ERP. They apply to any IBM i system where the business data lives in Db2 for i files with terse names, numeric dates, and single-letter status codes.
 
 Every library, table, and column name below is a placeholder.
 
@@ -14,7 +17,8 @@ With the server connected to Cursor or Claude Code, the agent does the discovery
 2. `describe_table` and `get_table_constraints` return the columns, types, and keys, so the agent knows that `MYLIB.ORDERS` joins to `MYLIB.ORDERHDR` on `ORDERNO`.
 3. The agent drafts the SQL and checks it with `validate_query`, which catches a wrong column or library name before anything runs.
 4. `execute_query` runs the statement against a few sample rows, so the response types match the real data.
-5. The agent writes the endpoint: the route, bound parameters, the SQL, and the response model.
+5. `index_advice` on the tables the endpoint reads shows whether the optimizer keeps asking for an index on the same keys. If it builds temporary indexes for them, every call to the endpoint may pay for a table scan. A person decides whether to add the index.
+6. The agent writes the endpoint: the route, bound parameters, the SQL, and the response model.
 
 A prompt that covers the whole flow:
 
@@ -32,7 +36,9 @@ The agent can do most of that groundwork:
 - **Build the staging tables.** `get_object_ddl` returns the DDL for a source table, which the agent translates to the target platform's types.
 - **Map the dependencies.** `get_related_objects` lists the views, indexes, and logical files that depend on a source table. That often points to a view someone already built for reporting.
 - **Draft the incremental extract.** The agent finds a change date or a sequence column and writes a watermark query, for example every `MYLIB.ORDERHDR` row changed since the last run.
+- **Check the extract's access paths.** `index_advice` lists the indexes the optimizer has asked for on the source tables, ranked by how often it built temporary indexes instead. A watermark query on a change date with no index behind it scans the whole file on every run.
 - **Map legacy codes to dimensions.** Status codes, order types, and warehouse codes become readable dimension attributes, using the annotations as the source of truth.
+- **Pull a test extract.** `export_query` writes the extract's rows to a CSV file, so the agent can load it with DuckDB or pandas, or a person can check it, without the rows going through the conversation. See [Query exports](tools.md#query-exports).
 
 A prompt to start with:
 
@@ -67,8 +73,9 @@ A sales manager asks which customers have open orders older than 30 days. Normal
 
 The agent finds the tables, writes the query, runs it, and summarizes the result. For questions people ask often, give the agent a vetted query instead of letting it write a new one each time:
 
-- **Business SQL tools** turn a reviewed SELECT into a named tool with typed parameters, such as `search_sales_orders`. See [Business SQL tools](custom-tools.md) and the example pack in [examples/erp-tools](../examples/erp-tools).
+- **Business SQL tools** turn a reviewed SELECT into a named tool with typed parameters, such as `search_sales_orders`. See [Business SQL tools](custom-tools.md) and the example pack in [examples/erp-tools](https://github.com/Strom-Capital/mcp-server-db2i/tree/main/examples/erp-tools).
 - **Column masking** hides fields such as email addresses or bank details from the agent. See [Masking](custom-tools.md#masking).
+- **Query exports** answer "send me that as a spreadsheet". `export_query` writes the full result to an Excel or CSV file and gives the user a download link, however many rows there are. See [Query exports](tools.md#query-exports).
 - **The HTTP transport** serves shared or hosted agents with token authentication. See [HTTP Transport](http-transport.md).
 
 ## Guardrails
@@ -77,7 +84,9 @@ The same settings keep every use case safe:
 
 - Only SELECT and WITH statements run. Everything else is rejected before it reaches the database.
 - `QUERY_DEFAULT_LIMIT` and `QUERY_MAX_LIMIT` cap the rows a query returns.
+- `QUERY_TIMEOUT` cancels a statement on the IBM i once it runs too long, 120 seconds by default.
 - `QUERY_ALLOWED_SCHEMAS` keeps queries inside the libraries you list.
+- `export_query` is off unless `EXPORT_ENABLED` is set, and its files expire.
 - `MCP_AUDIT_LOG` records every tool call.
 - Connect with a user profile that has read access only to the data the agent needs.
 

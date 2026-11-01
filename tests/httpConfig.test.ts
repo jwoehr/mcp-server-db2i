@@ -16,6 +16,23 @@ describe('HTTP Configuration', () => {
     process.env = originalEnv;
   });
 
+  describe('trustProxy', () => {
+    it('trusts no proxy by default, and parses hop counts and address lists', async () => {
+      process.env.MCP_AUTH_MODE = 'none';
+      const { getHttpConfig } = await import('../src/config.js');
+      delete process.env.MCP_TRUST_PROXY;
+      expect(getHttpConfig().trustProxy).toBe(false);
+      process.env.MCP_TRUST_PROXY = '0';
+      expect(getHttpConfig().trustProxy).toBe(false);
+      process.env.MCP_TRUST_PROXY = 'true';
+      expect(getHttpConfig().trustProxy).toBe(true);
+      process.env.MCP_TRUST_PROXY = '1';
+      expect(getHttpConfig().trustProxy).toBe(1);
+      process.env.MCP_TRUST_PROXY = 'loopback, 10.0.0.0/8';
+      expect(getHttpConfig().trustProxy).toBe('loopback, 10.0.0.0/8');
+    });
+  });
+
   describe('getTransportMode', () => {
     it('should default to stdio', async () => {
       delete process.env.MCP_TRANSPORT;
@@ -167,6 +184,18 @@ describe('HTTP Configuration', () => {
       expect(config.port).toBe(8080);
     });
 
+    it('closes idle session pools after 10 minutes by default, and accepts 0 to turn it off', async () => {
+      delete process.env.MCP_POOL_IDLE_TIMEOUT;
+      const { getHttpConfig } = await import('../src/config.js');
+      expect(getHttpConfig().poolIdleTimeout).toBe(600);
+
+      process.env.MCP_POOL_IDLE_TIMEOUT = '0';
+      expect(getHttpConfig().poolIdleTimeout).toBe(0);
+      process.env.MCP_POOL_IDLE_TIMEOUT = '-1';
+      expect(() => getHttpConfig()).toThrow('MCP_POOL_IDLE_TIMEOUT must be at least 0');
+      delete process.env.MCP_POOL_IDLE_TIMEOUT;
+    });
+
     it('should respect custom host', async () => {
       process.env.MCP_HTTP_HOST = '127.0.0.1';
 
@@ -174,6 +203,125 @@ describe('HTTP Configuration', () => {
       const config = getHttpConfig();
 
       expect(config.host).toBe('127.0.0.1');
+    });
+  });
+
+  describe('getAuthRateLimitConfig', () => {
+    it('defaults to 5 attempts per 60 seconds', async () => {
+      delete process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS;
+      delete process.env.AUTH_RATE_LIMIT_WINDOW_MS;
+
+      const { getAuthRateLimitConfig, getHttpConfig } = await import('../src/config.js');
+
+      expect(getAuthRateLimitConfig()).toEqual({ limit: 5, windowMs: 60000 });
+      expect(getHttpConfig().authRateLimit).toEqual({ limit: 5, windowMs: 60000 });
+    });
+
+    it('reads custom values', async () => {
+      process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS = ' 20 ';
+      process.env.AUTH_RATE_LIMIT_WINDOW_MS = '300000';
+
+      const { getAuthRateLimitConfig } = await import('../src/config.js');
+
+      expect(getAuthRateLimitConfig()).toEqual({ limit: 20, windowMs: 300000 });
+    });
+
+    it('is not turned off by RATE_LIMIT_ENABLED=false', async () => {
+      process.env.RATE_LIMIT_ENABLED = 'false';
+      delete process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS;
+      delete process.env.AUTH_RATE_LIMIT_WINDOW_MS;
+
+      const { getAuthRateLimitConfig } = await import('../src/config.js');
+
+      expect(getAuthRateLimitConfig()).toEqual({ limit: 5, windowMs: 60000 });
+    });
+
+    it.each([
+      ['AUTH_RATE_LIMIT_MAX_ATTEMPTS', '0', 'must be at least 1'],
+      ['AUTH_RATE_LIMIT_MAX_ATTEMPTS', '-3', 'must be at least 1'],
+      ['AUTH_RATE_LIMIT_MAX_ATTEMPTS', '2.5', 'must be a whole number'],
+      ['AUTH_RATE_LIMIT_MAX_ATTEMPTS', 'ten', 'must be a whole number'],
+      ['AUTH_RATE_LIMIT_WINDOW_MS', '0', 'must be at least 1'],
+      ['AUTH_RATE_LIMIT_WINDOW_MS', '-60000', 'must be at least 1'],
+      ['AUTH_RATE_LIMIT_WINDOW_MS', '1e3', 'must be a whole number'],
+      ['AUTH_RATE_LIMIT_WINDOW_MS', '2147483648', 'must be at most 2147483647'],
+    ])('rejects %s=%s', async (name, value, message) => {
+      delete process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS;
+      delete process.env.AUTH_RATE_LIMIT_WINDOW_MS;
+      process.env[name] = value;
+
+      const { getAuthRateLimitConfig, getHttpConfig } = await import('../src/config.js');
+
+      expect(() => getAuthRateLimitConfig()).toThrow(`${name} ${message}`);
+      expect(() => getHttpConfig()).toThrow(name);
+    });
+  });
+
+  describe('getOAuthRateLimitConfig', () => {
+    beforeEach(() => {
+      delete process.env.OAUTH_RATE_LIMIT_MAX_REQUESTS;
+      delete process.env.OAUTH_RATE_LIMIT_WINDOW_MS;
+    });
+
+    it('defaults to 120 requests per 60 seconds', async () => {
+      const { getOAuthRateLimitConfig, getHttpConfig } = await import('../src/config.js');
+
+      expect(getOAuthRateLimitConfig()).toEqual({ limit: 120, windowMs: 60000 });
+      expect(getHttpConfig().oauthRateLimit).toEqual({ limit: 120, windowMs: 60000 });
+    });
+
+    it('is read by getHttpConfig when OAuth is on', async () => {
+      process.env.MCP_AUTH_MODE = 'required';
+      process.env.MCP_OAUTH_ENABLED = 'true';
+      process.env.MCP_PUBLIC_URL = 'https://mcp.example.com';
+      process.env.OAUTH_RATE_LIMIT_MAX_REQUESTS = '600';
+
+      const { getHttpConfig } = await import('../src/config.js');
+
+      expect(getHttpConfig().oauthRateLimit).toEqual({ limit: 600, windowMs: 60000 });
+      process.env.OAUTH_RATE_LIMIT_MAX_REQUESTS = '0';
+      expect(() => getHttpConfig()).toThrow('OAUTH_RATE_LIMIT_MAX_REQUESTS must be at least 1');
+    });
+
+    it('is ignored by getHttpConfig when OAuth is off', async () => {
+      delete process.env.MCP_OAUTH_ENABLED;
+      process.env.OAUTH_RATE_LIMIT_MAX_REQUESTS = '0';
+
+      const { getHttpConfig } = await import('../src/config.js');
+
+      expect(getHttpConfig().oauthRateLimit).toEqual({ limit: 120, windowMs: 60000 });
+    });
+
+    it('reads custom values', async () => {
+      process.env.OAUTH_RATE_LIMIT_MAX_REQUESTS = ' 600 ';
+      process.env.OAUTH_RATE_LIMIT_WINDOW_MS = '300000';
+
+      const { getOAuthRateLimitConfig } = await import('../src/config.js');
+
+      expect(getOAuthRateLimitConfig()).toEqual({ limit: 600, windowMs: 300000 });
+    });
+
+    it('is not turned off by RATE_LIMIT_ENABLED=false', async () => {
+      process.env.RATE_LIMIT_ENABLED = 'false';
+
+      const { getOAuthRateLimitConfig } = await import('../src/config.js');
+
+      expect(getOAuthRateLimitConfig()).toEqual({ limit: 120, windowMs: 60000 });
+    });
+
+    it.each([
+      ['OAUTH_RATE_LIMIT_MAX_REQUESTS', '0', 'must be at least 1'],
+      ['OAUTH_RATE_LIMIT_MAX_REQUESTS', '-3', 'must be at least 1'],
+      ['OAUTH_RATE_LIMIT_MAX_REQUESTS', '2.5', 'must be a whole number'],
+      ['OAUTH_RATE_LIMIT_WINDOW_MS', '0', 'must be at least 1'],
+      ['OAUTH_RATE_LIMIT_WINDOW_MS', '1e3', 'must be a whole number'],
+      ['OAUTH_RATE_LIMIT_WINDOW_MS', '2147483648', 'must be at most 2147483647'],
+    ])('rejects %s=%s', async (name, value, message) => {
+      process.env[name] = value;
+
+      const { getOAuthRateLimitConfig } = await import('../src/config.js');
+
+      expect(() => getOAuthRateLimitConfig()).toThrow(`${name} ${message}`);
     });
   });
 

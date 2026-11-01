@@ -1,0 +1,269 @@
+---
+import Base from '../layouts/Base.astro';
+import SiteVideo from '../components/SiteVideo.astro';
+import { links, url } from '../lib/links';
+
+const questions = [
+  { area: 'Sales', items: ['Which customers ordered less this quarter than last?', 'What is still open on our ten largest orders, and when is it due?'] },
+  { area: 'Purchasing', items: ['Which purchase orders are late, and from which suppliers?', 'Which items have we bought from more than one supplier this year, and at what prices?'] },
+  { area: 'Service', items: ['Which service orders have been open longest, and for which customers?', 'Which items come back for repair most often?'] },
+  { area: 'Manufacturing', items: ['Which work orders are behind schedule this week?', 'Which components are short for the orders due next month?'] },
+  { area: 'Finance', items: ['Which customers have invoices more than 60 days overdue?', 'How do this month’s sales compare with the same month last year, by product group?'] },
+];
+
+const siteUrl = new URL(url('/'), Astro.site).href;
+
+/** The docs assistant needs the Mintlify widget. Without it, "Ask the docs" would only open the technical docs. */
+const hasDocsAssistant = Boolean(import.meta.env.PUBLIC_MINTLIFY_WIDGET_ID);
+
+const emailSubject = 'Could we try an AI assistant on our ERP data?';
+
+const summary = `Hi,
+
+I came across mcp-server-db2i, an open-source, self-hosted tool that lets AI assistants such as Claude answer questions about our ERP data in plain language. It only reads data, people sign in with their own credentials, and it also works inside Excel through Claude for Excel. It is free.
+
+I'd like to use it for the one-off questions we don't have reports for. Could you take a look and let me know if we could try it?
+
+Overview: ${siteUrl}
+Security: ${links.security}
+Setup: ${links.quickstart}
+
+Thanks!`;
+---
+<Base
+  title="For business teams"
+  description="Ask new questions of the ERP data on your IBM i in plain language, next to the screens, reports, Excel workbooks and BI tools you already use."
+  starterQuestions={[
+    'What does my IT team need to set up?',
+    'How is our data kept read-only and private?',
+    'Can everyone sign in with their own user?',
+  ]}
+>
+
+  <section class="hero">
+    <div class="container">
+      <p class="label">For business teams</p>
+      <h1>For the questions that don't have a report yet.</h1>
+      <p class="lead">
+        If your ERP runs on IBM i (many still call it AS/400), years of orders, customers, items and invoices are already there.
+        Your team can ask about them in plain language, in an AI assistant such as Claude, and get the answer
+        from live data. Your reports and tools stay as they are.
+      </p>
+      <div class="btn-row">
+        <a class="btn btn--primary" href="#send-to-it">Send this to your IT team <span aria-hidden="true">↓</span></a>
+        {hasDocsAssistant && <a class="link-rule" href={links.docs} data-ask-docs="business-hero">Ask the docs</a>}
+      </div>
+    </div>
+  </section>
+
+  <SiteVideo
+    name="business"
+    title="What it is, in under two minutes."
+    lead="What your team can ask, how it fits next to your reports and Excel, and what it can and can't do with your data. With sound and captions."
+    description="Video for business teams: asking questions about ERP data on IBM i in plain language, in Claude and in Excel"
+  />
+
+  <section class="section">
+    <div class="container">
+      <div class="sec-head">
+        <p class="label">Today</p>
+        <div>
+          <h2>Next to what you already have.</h2>
+          <p class="lead">Companies with an ERP like yours usually get their answers in one of three ways. Each one handles the questions it was built for.</p>
+        </div>
+      </div>
+      <div class="cols3">
+        <div><h3>ERP screens and reports</h3><p class="muted">The system your team works in every day, with the reports that were built for it.</p></div>
+        <div><h3>Excel linked to the ERP</h3><p class="muted">Workbooks that pull data straight from the ERP, so the numbers land in a sheet your team can work with.</p></div>
+        <div><h3>A data warehouse or BI tool</h3><p class="muted">ERP data copied into a warehouse or data lake, with dashboards and reports on top.</p></div>
+      </div>
+      <p class="bridge">
+        Then there is the one-off question, such as why a large customer ordered less this month.
+        This is for those. It reads the ERP's own database directly. It doesn't connect to your reports,
+        spreadsheets or warehouse, and it doesn't replace them. If your reports use their own
+        definitions, such as what counts as an open order, your IT team can give the assistant the same ones.
+      </p>
+      <p class="erp-note">
+        Works with any business data in Db2 for i: ERPs such as JD Edwards, Infor LX, XA and System21, SAP on IBM i
+        and Iptor DC1, and also banking, insurance, warehouse and in-house systems. Not affiliated with any of these
+        vendors; product names are trademarks of their owners.
+      </p>
+    </div>
+  </section>
+
+  <section class="section section--tight">
+    <div class="container">
+      <div class="sec-head">
+        <p class="label">Examples</p>
+        <div>
+          <h2>The kind of questions people ask.</h2>
+          <p class="lead">Your team types a question. The assistant finds where the data is, looks it up, and answers with the numbers. In Claude and in a chat page of your own, people can also ask for the answer as a chart and switch between the chart and the table.</p>
+        </div>
+      </div>
+      <div class="groups">
+        {questions.map((q) => (
+          <div class="group">
+            <p class="label">{q.area}</p>
+            <ul class="rows">{q.items.map((item) => <li>“{item}”</li>)}</ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--tight">
+    <div class="container excel">
+      <div class="sec-head">
+        <p class="label">In Excel</p>
+        <div>
+          <h2>Ask from Excel, too.</h2>
+          <p class="lead">
+            With Claude for Excel, people ask the question in the Claude sidebar and the answer goes straight into the
+            sheet. It uses the same connection and sign-in, so your IT team sets it up once for both.
+          </p>
+          <a class="link-rule" href={links.claudeForOffice}>About Claude for Excel</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--tight">
+    <div class="container">
+      <div class="sec-head">
+        <p class="label">In the browser</p>
+        <div>
+          <h2>Or in a chat page of your own.</h2>
+          <p class="lead">
+            Your IT team can also run a chat page in the browser, starting from an example in the project. People sign
+            in with their own user, and nobody needs an AI subscription of their own. It uses one company account that
+            is billed by use, or a model that runs inside your network.
+          </p>
+          <a class="link-rule" href={links.webApp}>About the example chat app</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--tight">
+    <div class="container two">
+      <div>
+        <p class="label">Definitions</p>
+        <h2 class="h2s">Your definitions, not the assistant's guesses.</h2>
+        <p>
+          Every company has its own meaning of “open order”, “active customer” or “on time”. Your IT team can write
+          those definitions down once: what a status code means, which data belongs together, and how to answer common
+          questions such as “late purchase orders”.
+        </p>
+        <p>
+          The assistant then uses your definitions instead of guessing. The logic that already lives in your reports and
+          Excel queries is a good place to start.
+        </p>
+        <a class="link-rule" href={links.customTools}>How business definitions work <span aria-hidden="true">→</span></a>
+      </div>
+      <div>
+        <p class="label">Safeguards</p>
+        <h2 class="h2s">What it can and can't do with your data.</h2>
+        <ul class="rows ticks">
+          <li><strong>It only reads.</strong> It can look data up but never change it, and every request is checked before it runs. If a question takes too long, it is stopped automatically so it doesn't keep your system busy.</li>
+          <li><strong>Everyone signs in as themselves.</strong> People sign in with their own user on the system, often the same user name and password as for the ERP. The system decides what each person can read.</li>
+          <li><strong>You choose what is visible.</strong> Your IT team decides which parts of the ERP data it can see, and can hide sensitive fields such as personal details.</li>
+          <li><strong>Everything is logged.</strong> Every request is recorded, so your IT team can see what was asked.</li>
+          <li><strong>No copy of your database.</strong> Nothing is copied into a new database. The answer to each question goes to the AI assistant you use, so use one your company has approved.</li>
+        </ul>
+        <a class="link-rule" href={links.security}>Security details <span aria-hidden="true">→</span></a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--tight">
+    <div class="container">
+      <div class="sec-head">
+        <p class="label">Good to know</p>
+        <div><h2>Before you start.</h2></div>
+      </div>
+      <div class="cols3">
+        <div><p class="label">Setup</p><h3>Someone sets it up once</h3><p class="muted">Your IT team sets it up. After that, people only add a link in their assistant and sign in.</p></div>
+        <div><p class="label">Scope</p><h3>It is not your financial reporting</h3><p class="muted">Official figures still come from the reports your finance team relies on. This is for exploring and for the questions in between.</p></div>
+        <div><p class="label">Quality</p><h3>Better notes, better answers</h3><p class="muted">The assistant is only as good as what it knows about your data. A few definitions make a big difference.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--tight" id="send-to-it">
+    <div class="container next">
+      <div class="sec-head">
+        <p class="label">Next step</p>
+        <div>
+          <h2>Share it with your IT team.</h2>
+          <p class="lead">
+            Copy the email below and send it to your IT team. It links to the security and setup
+            docs, so they have what they need to decide.
+          </p>
+        </div>
+      </div>
+      <div class="panel share">
+        <div class="share-head">
+          <span class="label">Email to your IT team</span>
+          <button type="button" class="copy" data-copy-summary data-track="it_email_copied">Copy email</button>
+        </div>
+        <p class="subject"><span class="label">Subject</span> {emailSubject}</p>
+        <pre id="summary">{summary}</pre>
+      </div>
+    </div>
+  </section>
+</Base>
+
+<script>
+  const button = document.querySelector<HTMLButtonElement>('[data-copy-summary]');
+  button?.addEventListener('click', async () => {
+    const text = document.getElementById('summary')?.textContent ?? '';
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = 'Copied';
+    } catch {
+      button.textContent = 'Select and copy';
+    }
+    setTimeout(() => (button.textContent = 'Copy email'), 1600);
+  });
+</script>
+
+<style>
+  .hero { padding-block: 112px 72px; }
+  .hero h1 { margin: 18px 0 28px; max-width: 16ch; }
+  .hero .lead { margin-bottom: 36px; }
+  .cols3 { display: grid; border-top: 1px solid var(--line-strong); }
+  @media (min-width: 900px) { .cols3 { grid-template-columns: repeat(3, 1fr); } }
+  .cols3 > div { display: grid; gap: 10px; align-content: start; padding: 22px 0 28px; }
+  .cols3 > div + div { border-top: 1px solid var(--line); }
+  @media (min-width: 900px) {
+    .cols3 > div { padding-right: 28px; }
+    .cols3 > div + div { border-top: 0; border-left: 1px solid var(--line); padding-left: 28px; }
+  }
+  .cols3 h3 { margin: 0; font-size: 1.4rem; font-weight: 400; letter-spacing: -0.02em; }
+  .cols3 p.muted { margin: 0; }
+  .bridge { max-width: 52ch; margin-top: var(--space-7); font-size: 1.3rem; line-height: 1.45; letter-spacing: -0.01em; }
+  .erp-note { max-width: 70ch; margin: var(--space-5) 0 0; font-size: 0.9rem; color: var(--muted); }
+  .groups { border-top: 1px solid var(--line-strong); }
+  .group { display: grid; gap: 8px 64px; padding-block: 20px 24px; border-bottom: 1px solid var(--line); }
+  @media (min-width: 1000px) { .group { grid-template-columns: 200px minmax(0, 1fr); } }
+  .group .rows li { padding: 8px 0; font-size: 1.1rem; }
+  .group .rows li:first-child { padding-top: 0; }
+  .two { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-7); padding-top: var(--space-6); position: relative; }
+  @media (min-width: 900px) { .two { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 64px; } }
+  .two > div > .label { margin-bottom: var(--space-4); }
+  .h2s { font-size: clamp(1.8rem, 3.4vw, 2.6rem); max-width: 18ch; margin-bottom: var(--space-5); }
+  .two p { max-width: 58ch; }
+  .ticks { margin: 0 0 var(--space-5); }
+  .ticks li { padding: 12px 0 12px 22px; position: relative; }
+  .ticks li::before { content: ''; position: absolute; left: 0; top: 20px; width: 7px; height: 7px; background: var(--accent); }
+  .next { padding-top: var(--space-6); position: relative; }
+  /* The top rule spans the content, not the container's side padding */
+  .two::before, .next::before { content: ''; position: absolute; top: 0; left: var(--gutter); right: var(--gutter); height: 1px; background: var(--line-strong); }
+  .share { max-width: 760px; padding: var(--space-5) var(--space-6) var(--space-6); }
+  .share-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-3); }
+  .copy { font: 500 11px/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; background: var(--fg); color: var(--bg); border: 0; border-radius: var(--radius-btn); padding: 8px 12px; cursor: pointer; }
+  .copy:hover { background: var(--accent); color: var(--on-accent); }
+  .subject { margin: 0 0 var(--space-3); padding-bottom: var(--space-3); border-bottom: 1px solid var(--line); font-size: 0.9rem; }
+  .subject .label { margin-right: 8px; }
+  .share pre { margin: 0; padding: 0; border: 0; background: none; white-space: pre-wrap; overflow-wrap: anywhere; font: 15px/1.6 var(--font-sans); }
+</style>

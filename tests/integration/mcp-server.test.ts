@@ -10,11 +10,14 @@ import { Client, InMemoryTransport, type CallToolResult } from '@modelcontextpro
 
 // Mock node-jt400 before importing modules that use it
 const mockQuery = vi.fn();
-vi.mock('node-jt400', () => ({
-  pool: vi.fn(() => ({
-    query: mockQuery,
-  })),
-}));
+vi.mock('node-jt400', async () => {
+  const { withExecute } = await import('../helpers/jt400Fake.js');
+  return {
+    pool: vi.fn(() => withExecute({
+      query: mockQuery,
+    })),
+  };
+});
 
 // Mock the rate limiter to control its behavior in tests
 vi.mock('../../src/utils/rateLimiter.js', async (importOriginal) => {
@@ -100,9 +103,11 @@ describe('MCP Server Integration', () => {
     it('should list every built-in tool', async () => {
       const { tools } = await client.listTools();
 
-      expect(tools).toHaveLength(TOOL_NAMES.length);
+      // export_query stays off until EXPORT_ENABLED is set
+      expect(tools).toHaveLength(TOOL_NAMES.length - 1);
 
       const toolNames = tools.map((t) => t.name);
+      expect(toolNames).not.toContain('export_query');
       expect(toolNames).toContain('execute_query');
       expect(toolNames).toContain('get_business_context');
       expect(toolNames).toContain('list_schemas');
@@ -117,7 +122,34 @@ describe('MCP Server Integration', () => {
       expect(toolNames).toContain('get_object_ddl');
       expect(toolNames).toContain('get_related_objects');
       expect(toolNames).toContain('get_journal_info');
+      expect(toolNames).toContain('index_advice');
+      expect(toolNames).toContain('list_routines');
+      expect(toolNames).toContain('describe_routine');
       expect(toolNames).toContain('profile_table');
+      expect(toolNames).toContain('search_ibmi_services');
+    });
+
+    it('adds the optional context argument to every tool only with MCP_TOOL_INTENT', async () => {
+      const { tools } = await client.listTools();
+      expect(tools.some((t) => 'context' in ((t.inputSchema.properties ?? {}) as object))).toBe(false);
+
+      process.env.MCP_TOOL_INTENT = 'true';
+      const [intentClientTransport, intentServerTransport] = InMemoryTransport.createLinkedPair();
+      await createServer().connect(intentServerTransport);
+      const intentClient = new Client({ name: 'intent-client', version: '1.0.0' });
+      await intentClient.connect(intentClientTransport);
+      try {
+        const { tools: withIntent } = await intentClient.listTools();
+        for (const tool of withIntent) {
+          const properties = (tool.inputSchema.properties ?? {}) as Record<string, unknown>;
+          expect(properties.context, tool.name).toBeDefined();
+          expect((properties.context as { maxLength?: number }).maxLength, tool.name).toBeUndefined();
+          expect(tool.inputSchema.required ?? []).not.toContain('context');
+        }
+        expect(intentClient.getInstructions()).toContain('optional context argument');
+      } finally {
+        await intentClient.close();
+      }
     });
 
     it('should have correct metadata for execute_query tool', async () => {
@@ -160,7 +192,7 @@ describe('MCP Server Integration', () => {
 
       const { tools } = await filteredClient.listTools();
       const toolNames = tools.map((t) => t.name);
-      expect(toolNames).toHaveLength(TOOL_NAMES.length - 1);
+      expect(toolNames).toHaveLength(TOOL_NAMES.length - 2);
       expect(toolNames).not.toContain('execute_query');
       expect(toolNames).toContain('list_schemas');
 
@@ -184,6 +216,26 @@ describe('MCP Server Integration', () => {
       const errorText = (result.content[0] as { type: 'text'; text: string }).text;
       expect(errorText).toContain('OTHERLIB.USERS');
       expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('should run a table function from an allowed library and refuse one from another', async () => {
+      process.env.QUERY_ALLOWED_SCHEMAS = 'TESTLIB,QSYS2';
+      mockQuery.mockResolvedValueOnce([{ JOB_NAME: '123456/QUSER/QZDASOINIT', JOB_STATUS: 'RUN' }]);
+
+      const allowed = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: "SELECT JOB_NAME, JOB_STATUS FROM TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => 'NONE')) X" },
+      }) as CallToolResult;
+      expect(allowed.isError).toBeFalsy();
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+
+      const refused = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM TABLE(OTHERLIB.JOBS()) X' },
+      }) as CallToolResult;
+      expect(refused.isError).toBe(true);
+      expect((refused.content[0] as { type: 'text'; text: string }).text).toContain('OTHERLIB.JOBS');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
     it.each([
@@ -229,6 +281,105 @@ describe('MCP Server Integration', () => {
       const content = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
       expect(content.data.map((row: { schema_name: string }) => row.schema_name)).toEqual(['QSYS2', 'TESTLIB']);
       expect(content.count).toBe(2);
+    });
+  });
+
+  describe('Schema allowlist from PARSE_STATEMENT names', () => {
+    const row = (nameType: string, schema: string | null, name: string) => ({
+      NAME_TYPE: nameType, SCHEMA: schema, NAME: name, COLUMN_NAME: null, SQL_STATEMENT_TYPE: 'QUERY',
+    });
+    const text = (result: CallToolResult) => (result.content[0] as { type: 'text'; text: string }).text;
+
+    beforeEach(() => {
+      process.env.QUERY_PARSE_CHECK = 'true';
+      process.env.QUERY_ALLOWED_SCHEMAS = 'MYLIB,SYSIBM';
+    });
+
+    it('runs valid Db2 for i that the JavaScript parser cannot read', async () => {
+      mockQuery
+        .mockResolvedValueOnce([row('TABLE', 'MYLIB', 'ORDERS'), row('FUNCTION', null, 'CHAR')])
+        .mockResolvedValueOnce([{ ITEMNO: 'A', L: '1001,1002' }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: {
+          sql: "SELECT ITEMNO, LISTAGG(CHAR(ORDERNO), ',') WITHIN GROUP (ORDER BY ORDERNO) AS L FROM MYLIB.ORDERS GROUP BY ITEMNO",
+        },
+      }) as CallToolResult;
+
+      expect(result.isError).toBeFalsy();
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      ['a table outside the list', [row('TABLE', 'OUTSIDELIB', 'ORDERS')], 'Table OUTSIDELIB.ORDERS'],
+      ['a qualified routine outside the list', [row('TABLE', 'MYLIB', 'ORDERS'), row('FUNCTION', 'OUTSIDELIB', 'MYFN')], 'Routine OUTSIDELIB.MYFN'],
+      ['an unqualified table in a default schema outside the list', [row('TABLE', null, 'ORDERS')], 'Table TESTLIB.ORDERS'],
+    ])('rejects %s without running the query', async (_label, rows, named) => {
+      mockQuery.mockResolvedValueOnce(rows);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'WITH ORDERS AS (SELECT * FROM OUTSIDELIB.ORDERS) SELECT * FROM ORDERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain('Schema allowlist rejected the query');
+      expect(text(result)).toContain(named);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects an unqualified table function, which resolves through the SQL path', async () => {
+      mockQuery.mockResolvedValueOnce([row('FUNCTION', null, 'DISPLAY_JOURNAL')]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: "SELECT ENTRY_DATA FROM TABLE(DISPLAY_JOURNAL('OUTSIDELIB', 'QSQJRN')) J" },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain('Table function DISPLAY_JOURNAL is not qualified with a library');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a sequence outside the list', async () => {
+      mockQuery.mockResolvedValueOnce([row('SEQUENCE', 'OUTSIDELIB', 'SEQ'), row('TABLE', 'MYLIB', 'ORDERS')]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT NEXT VALUE FOR OUTSIDELIB.SEQ FROM MYLIB.ORDERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain('Sequence OUTSIDELIB.SEQ');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('parses the statement without a trailing semicolon', async () => {
+      mockQuery.mockResolvedValueOnce([row('TABLE', 'MYLIB', 'ORDERS')]).mockResolvedValueOnce([{ ORDERNO: 1 }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT ORDERNO FROM MYLIB.ORDERS;' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBeFalsy();
+      expect(mockQuery.mock.calls[0][1]).toEqual(['SELECT ORDERNO FROM MYLIB.ORDERS']);
+    });
+
+    it('falls back to the JavaScript parser when the parse check is off', async () => {
+      process.env.QUERY_PARSE_CHECK = 'false';
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: {
+          sql: "SELECT ITEMNO, LISTAGG(CHAR(ORDERNO), ',') WITHIN GROUP (ORDER BY ORDERNO) AS L FROM MYLIB.ORDERS GROUP BY ITEMNO",
+        },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(text(result)).toContain('could not be parsed');
+      expect(mockQuery).not.toHaveBeenCalled();
     });
   });
 
@@ -296,7 +447,52 @@ describe('MCP Server Integration', () => {
       });
 
       const [sql] = mockQuery.mock.calls[0] as [string];
-      expect(sql).toContain('FETCH FIRST 5 ROWS ONLY');
+      // One row past the limit tells a full result from a cut one
+      expect(sql).toContain('FETCH FIRST 6 ROWS ONLY');
+    });
+
+    it('reports a result cut at the limit', async () => {
+      mockQuery.mockResolvedValueOnce([{ ORDERNO: 1001 }, { ORDERNO: 1002 }, { ORDERNO: 1003 }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT ORDERNO FROM MYLIB.ORDERS', limit: 2 },
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        success: true,
+        data: [{ ORDERNO: 1001 }, { ORDERNO: 1002 }],
+        rowCount: 2,
+        limitApplied: 2,
+        truncated: true,
+      });
+      const { warnings } = result.structuredContent as { warnings: string[] };
+      expect(warnings).toEqual([expect.stringContaining('stopped at 2 rows')]);
+    });
+
+    it('does not report truncation when every row fits', async () => {
+      mockQuery.mockResolvedValueOnce([{ ORDERNO: 1001 }, { ORDERNO: 1002 }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT ORDERNO FROM MYLIB.ORDERS', limit: 2 },
+      });
+
+      expect(result.structuredContent).toMatchObject({ success: true, rowCount: 2, truncated: false });
+      expect((result.structuredContent as { warnings?: string[] }).warnings).toBeUndefined();
+    });
+
+    it('keeps a smaller FETCH FIRST from the query and does not report truncation', async () => {
+      mockQuery.mockResolvedValueOnce([{ ORDERNO: 1001 }, { ORDERNO: 1002 }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT ORDERNO FROM MYLIB.ORDERS FETCH FIRST 2 ROWS ONLY', limit: 10 },
+      });
+
+      const [sql] = mockQuery.mock.calls[0] as [string];
+      expect(sql).toContain('FETCH FIRST 2 ROWS ONLY');
+      expect(result.structuredContent).toMatchObject({ success: true, rowCount: 2, truncated: false });
     });
   });
 
@@ -315,6 +511,27 @@ describe('MCP Server Integration', () => {
       expect(text).toContain('| ID | NAME |');
       expect(text).toContain('| 1 | Alice |');
       expect(result.structuredContent).toMatchObject({ success: true, data: mockRows });
+    });
+
+    // node-odbc returns BIGINT as bigint, which JSON.stringify rejects
+    it.each(['json', 'pretty', 'markdown'])('returns BIGINT columns in %s format', async (format) => {
+      process.env.MCP_RESPONSE_FORMAT = format;
+      mockQuery.mockResolvedValueOnce([{ ORDERNO: 1001n, ROWS_READ: 9007199254740993n }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT ORDERNO, ROWS_READ FROM MYLIB.ORDERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBeUndefined();
+      const expected = [{ ORDERNO: 1001, ROWS_READ: '9007199254740993' }];
+      expect(result.structuredContent).toMatchObject({ success: true, data: expected });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      if (format === 'markdown') {
+        expect(text).toContain('| 1001 | 9007199254740993 |');
+      } else {
+        expect((JSON.parse(text) as { data: unknown }).data).toEqual(expected);
+      }
     });
   });
 
@@ -387,6 +604,36 @@ describe('MCP Server Integration', () => {
       expect(errorText).toContain('Connection timeout');
     });
 
+    it('returns the SQLSTATE, SQLCODE, cause and recovery of a failed statement', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('[SQL0204] ORDERS in MYLIB type *FILE not found.'));
+      mockQuery.mockResolvedValueOnce([{
+        MESSAGE_SECOND_LEVEL_TEXT:
+          'Cause . . . . . :   &1 in &2 type *&3 was not found. Recovery  . . . :   Change the name and try the request again.',
+      }]);
+
+      const result = await client.callTool({
+        name: 'execute_query',
+        arguments: { sql: 'SELECT * FROM MYLIB.ORDERS' },
+      }) as CallToolResult;
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        success: false,
+        error: 'Database query failed: [SQL0204] ORDERS in MYLIB type *FILE not found.',
+        sqlcode: -204,
+        cause: '&1 in &2 type *&3 was not found.',
+        recovery: 'Change the name and try the request again.',
+      });
+      expect((result.content[0] as { type: 'text'; text: string }).text).toBe(
+        'Database query failed: [SQL0204] ORDERS in MYLIB type *FILE not found.\n\n' +
+          'Cause: &1 in &2 type *&3 was not found.\n\n' +
+          'Recovery: Change the name and try the request again.'
+      );
+      const [lookupSql, lookupParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(lookupSql).toContain('SYSTOOLS.SQLCODE_INFO');
+      expect(lookupParams).toEqual([-204]);
+    });
+
     it('should apply FETCH FIRST limit to queries', async () => {
       mockQuery.mockResolvedValueOnce([{ ID: 1 }]);
 
@@ -400,7 +647,7 @@ describe('MCP Server Integration', () => {
 
       // Check that the query was modified to include FETCH FIRST
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining('FETCH FIRST 50 ROWS ONLY'),
+        expect.stringContaining('FETCH FIRST 51 ROWS ONLY'),
         expect.any(Array)
       );
     });
@@ -417,7 +664,7 @@ describe('MCP Server Integration', () => {
       });
 
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining('FETCH FIRST 25 ROWS ONLY'),
+        expect.stringContaining('FETCH FIRST 26 ROWS ONLY'),
         expect.any(Array)
       );
     });
@@ -434,7 +681,7 @@ describe('MCP Server Integration', () => {
       });
 
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining('FETCH FIRST 100 ROWS ONLY'),
+        expect.stringContaining('FETCH FIRST 101 ROWS ONLY'),
         expect.any(Array)
       );
       expect(mockQuery).not.toHaveBeenCalledWith(

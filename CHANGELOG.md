@@ -1,5 +1,216 @@
 # Changelog
 
+## [3.8.5](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.4...v3.8.5) (2026-10-29)
+
+
+### Dependencies
+
+* bump @hono/node-server from 1.19.17 to 2.1.5 ([#340](https://github.com/Strom-Capital/mcp-server-db2i/issues/340)) ([1620cb9](https://github.com/Strom-Capital/mcp-server-db2i/commit/1620cb93df793f69390091ea25ad008abf6ca76a))
+* bump the production group with 3 updates ([#334](https://github.com/Strom-Capital/mcp-server-db2i/issues/334)) ([a885d54](https://github.com/Strom-Capital/mcp-server-db2i/commit/a885d54f9f61e7c525bcb7f47dd84e4875833de7))
+
+## [3.8.4](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.3...v3.8.4) (2026-10-29)
+
+
+### Bug Fixes
+
+* **mapepire:** connect through the host server so job CCSID 65535 works ([#330](https://github.com/Strom-Capital/mcp-server-db2i/issues/330)) ([e7c8ff4](https://github.com/Strom-Capital/mcp-server-db2i/commit/e7c8ff49fc92a67260bc2ed5764148d5997b6810))
+
+## [3.8.3](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.2...v3.8.3) (2026-10-25)
+
+
+### Dependencies
+
+* bump body-parser, fast-uri, undici and zod for security alerts ([#327](https://github.com/Strom-Capital/mcp-server-db2i/issues/327)) ([f9f44d7](https://github.com/Strom-Capital/mcp-server-db2i/commit/f9f44d723c078b93c80c95418dd72adb031157ad))
+
+## [3.8.2](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.1...v3.8.2) (2026-10-24)
+
+
+### Dependencies
+
+* bump dev tooling, site vite and web-app dependencies ([#317](https://github.com/Strom-Capital/mcp-server-db2i/issues/317)) ([873c24c](https://github.com/Strom-Capital/mcp-server-db2i/commit/873c24cdf6685dd0e294b696a6519bb01f8c679c))
+* bump ip-address from 10.7.2 to 10.7.4 ([#321](https://github.com/Strom-Capital/mcp-server-db2i/issues/321)) ([eb6143e](https://github.com/Strom-Capital/mcp-server-db2i/commit/eb6143e2a820bbd24f30a48b8655a55267de72ec))
+
+## [3.8.1](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.0...v3.8.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* quieter KPI tiles that fit on one line ([#306](https://github.com/Strom-Capital/mcp-server-db2i/issues/306)) ([459044a](https://github.com/Strom-Capital/mcp-server-db2i/commit/459044a44dd7f5b82cb1f8c02a18f2e7db99e07f))
+
+## [3.8.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.7.0...v3.8.0) (2026-10-15)
+
+
+### Features
+
+* show query results as a grid and chart with MCP Apps ([#303](https://github.com/Strom-Capital/mcp-server-db2i/issues/303)) ([58030bf](https://github.com/Strom-Capital/mcp-server-db2i/commit/58030bf6dada142aa4c4d2a58893a13a7fe3f055))
+
+## [3.7.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.6.1...v3.7.0) (2026-10-15)
+
+
+### Features
+
+* add an example web app with bring-your-own-model chat, business tools and light and dark themes ([#287](https://github.com/Strom-Capital/mcp-server-db2i/issues/287)) ([ef4a262](https://github.com/Strom-Capital/mcp-server-db2i/commit/ef4a2629fedf1f4e704f739f82d747bf77c4d4ff))
+* let the example web app use a company model key set on its server ([#294](https://github.com/Strom-Capital/mcp-server-db2i/issues/294)) ([f9936a7](https://github.com/Strom-Capital/mcp-server-db2i/commit/f9936a7db662ac0164867e4ac4efe956ba87b89c))
+
+
+### Dependencies
+
+* bump the production group with 3 updates ([#290](https://github.com/Strom-Capital/mcp-server-db2i/issues/290)) ([4a3a714](https://github.com/Strom-Capital/mcp-server-db2i/commit/4a3a7143b5f85a1b8fc84bbbbb2b356beb8d0d2f))
+
+## [3.6.1](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.6.0...v3.6.1) (2026-10-09)
+
+
+### Dependencies
+
+* bump the MCP SDK to 2.3.1 and fix the Dependabot alerts ([#281](https://github.com/Strom-Capital/mcp-server-db2i/issues/281)) ([e9a8a2a](https://github.com/Strom-Capital/mcp-server-db2i/commit/e9a8a2a0c2447ecc8b11fe752aa1aee80c1e7878))
+
+## [3.6.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.5.0...v3.6.0) (2026-10-09)
+
+
+### Features
+
+* **mapepire:** add SSH agent authentication support via agent option ([#270](https://github.com/Strom-Capital/mcp-server-db2i/issues/270)) ([9f8b184](https://github.com/Strom-Capital/mcp-server-db2i/commit/9f8b184868fa9727ded81953e6b9ccc5ab3dedb1))
+
+## [3.5.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.4.0...v3.5.0) (2026-10-01)
+
+
+### Features
+
+* enforce the schema allowlist from PARSE_STATEMENT names ([#260](https://github.com/Strom-Capital/mcp-server-db2i/issues/260)) ([a5f6380](https://github.com/Strom-Capital/mcp-server-db2i/commit/a5f6380274a3dc0e119a5b23e7a4c3ed57d3fd86)), closes [#256](https://github.com/Strom-Capital/mcp-server-db2i/issues/256)
+* record the server version and build in the audit log ([#266](https://github.com/Strom-Capital/mcp-server-db2i/issues/266)) ([8773a42](https://github.com/Strom-Capital/mcp-server-db2i/commit/8773a42c0fc65cdf54d8afef81cc3b8f61781e7e)), closes [#265](https://github.com/Strom-Capital/mcp-server-db2i/issues/265)
+* record which check rejected a statement, and validate_query's verdict, in the audit log ([#264](https://github.com/Strom-Capital/mcp-server-db2i/issues/264)) ([64d51e5](https://github.com/Strom-Capital/mcp-server-db2i/commit/64d51e5d88a9648b1a09800a94ee2626d49eefe4)), closes [#257](https://github.com/Strom-Capital/mcp-server-db2i/issues/257)
+* return Db2's reason when the parse check cannot parse a statement ([#262](https://github.com/Strom-Capital/mcp-server-db2i/issues/262)) ([1c4db07](https://github.com/Strom-Capital/mcp-server-db2i/commit/1c4db076260042e009e83adff11ba0c6fc571593)), closes [#140](https://github.com/Strom-Capital/mcp-server-db2i/issues/140)
+
+
+### Bug Fixes
+
+* add the row limit before FOR READ ONLY and other trailing clauses ([#263](https://github.com/Strom-Capital/mcp-server-db2i/issues/263)) ([8225685](https://github.com/Strom-Capital/mcp-server-db2i/commit/82256852aa92acdc3322e45b09cfc5af26d07402)), closes [#258](https://github.com/Strom-Capital/mcp-server-db2i/issues/258)
+* match writes by shape so the SQL validator accepts Db2 for i functions and names ([#259](https://github.com/Strom-Capital/mcp-server-db2i/issues/259)) ([7fd5b52](https://github.com/Strom-Capital/mcp-server-db2i/commit/7fd5b52b0de75d51ac9836bc22a777d012f40c80)), closes [#255](https://github.com/Strom-Capital/mcp-server-db2i/issues/255)
+
+## [3.4.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.3.0...v3.4.0) (2026-09-30)
+
+
+### Features
+
+* hint to check columns with describe_table when Db2 reports an unknown column ([#248](https://github.com/Strom-Capital/mcp-server-db2i/issues/248)) ([64908b8](https://github.com/Strom-Capital/mcp-server-db2i/commit/64908b8097d4ce277939694c5a44b42184cdb20a)), closes [#247](https://github.com/Strom-Capital/mcp-server-db2i/issues/247)
+* let companies brand and translate the OAuth sign-in page ([#240](https://github.com/Strom-Capital/mcp-server-db2i/issues/240)) ([7571b7d](https://github.com/Strom-Capital/mcp-server-db2i/commit/7571b7dd1c83afe14d7ac820c3f732e043d678bb))
+* suggest entity names when get_business_context matches nothing ([#246](https://github.com/Strom-Capital/mcp-server-db2i/issues/246)) ([ee49618](https://github.com/Strom-Capital/mcp-server-db2i/commit/ee4961899394155ad0441af9ce093d02146628de)), closes [#245](https://github.com/Strom-Capital/mcp-server-db2i/issues/245)
+
+
+### Bug Fixes
+
+* let a variable sign-in page font render medium weight ([#242](https://github.com/Strom-Capital/mcp-server-db2i/issues/242)) ([6c97ad6](https://github.com/Strom-Capital/mcp-server-db2i/commit/6c97ad6a8119f02e8e329ce47517c40e62a60909))
+* name every parser's failure when the schema allowlist cannot parse a query ([#244](https://github.com/Strom-Capital/mcp-server-db2i/issues/244)) ([b9f5662](https://github.com/Strom-Capital/mcp-server-db2i/commit/b9f5662390f42f5b649d49aff55501f11e526be9))
+
+## [3.3.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.2.0...v3.3.0) (2026-09-30)
+
+
+### Features
+
+* add optional intent, client, error category and sign-in events to the audit log ([#234](https://github.com/Strom-Capital/mcp-server-db2i/issues/234)) ([fa3ba9c](https://github.com/Strom-Capital/mcp-server-db2i/commit/fa3ba9c8d158b5703c124442a2d642a3f27da2d3))
+* let annotations declare row filters and warn when a query leaves them out ([#239](https://github.com/Strom-Capital/mcp-server-db2i/issues/239)) ([6fab2a3](https://github.com/Strom-Capital/mcp-server-db2i/commit/6fab2a31b16ada3e14eee7bebaa17cd1e74631f8)), closes [#236](https://github.com/Strom-Capital/mcp-server-db2i/issues/236)
+* say when query results stop at the row limit ([#238](https://github.com/Strom-Capital/mcp-server-db2i/issues/238)) ([9756058](https://github.com/Strom-Capital/mcp-server-db2i/commit/9756058499e5ad06e6f614bc990461e5e7668740)), closes [#237](https://github.com/Strom-Capital/mcp-server-db2i/issues/237)
+
+## [3.2.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.1.0...v3.2.0) (2026-09-30)
+
+
+### Features
+
+* send server instructions built from custom tool files ([#228](https://github.com/Strom-Capital/mcp-server-db2i/issues/228)) ([601f75e](https://github.com/Strom-Capital/mcp-server-db2i/commit/601f75ea88b5b53b13b3b592591efe4b91b17398))
+
+## [3.1.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.0.1...v3.1.0) (2026-09-29)
+
+
+### Features
+
+* **http:** close session pools that sit idle (MCP_POOL_IDLE_TIMEOUT) ([d69aa94](https://github.com/Strom-Capital/mcp-server-db2i/commit/d69aa9420c18fd0726b11cd25c5749a3d1df86fe))
+
+
+### Bug Fixes
+
+* **http:** keep one pool per OAuth sign-in across token refreshes ([#217](https://github.com/Strom-Capital/mcp-server-db2i/issues/217)) ([4a9baf9](https://github.com/Strom-Capital/mcp-server-db2i/commit/4a9baf9e4faca1dd3ecba73c0253f59a525ccbee))
+* **oauth:** do not undo a revocation that lands during a token refresh ([#218](https://github.com/Strom-Capital/mcp-server-db2i/issues/218)) ([f44a092](https://github.com/Strom-Capital/mcp-server-db2i/commit/f44a0925dd2bb19304265d3a7069e5b9e0e7113e))
+
+
+### Dependencies
+
+* bump hono from 4.13.8 to 4.13.9 in the production group ([#224](https://github.com/Strom-Capital/mcp-server-db2i/issues/224)) ([15f6f32](https://github.com/Strom-Capital/mcp-server-db2i/commit/15f6f32515e1fa50b65f980b1c325d1f9bba4397))
+
+## [3.0.1](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.0.0...v3.0.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* point npx instructions at mcp-server-db2i@latest ([#205](https://github.com/Strom-Capital/mcp-server-db2i/issues/205)) ([fdc00be](https://github.com/Strom-Capital/mcp-server-db2i/commit/fdc00befec591e8162f27c4b99d3db60dd554676))
+* return hosted OAuth clients to their callback from a page, not a form redirect ([#209](https://github.com/Strom-Capital/mcp-server-db2i/issues/209)) ([4976dac](https://github.com/Strom-Capital/mcp-server-db2i/commit/4976dac6bcb17254191c6142ec97b3acc5b25d5c))
+
+## [3.0.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.12.0...v3.0.0) (2026-09-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* the jt400 and mapepire drivers need their packages installed next to the server. With npx: `npx -y -p mcp-server-db2i -p node-jt400 mcp-server-db2i` (jt400) or `-p @ibm/mapepire-js -p ssh2` (mapepire). With npm: `npm install -g mcp-server-db2i node-jt400`.
+
+### Features
+
+* show setup help on first run and add --help and --version ([#201](https://github.com/Strom-Capital/mcp-server-db2i/issues/201)) ([d244c76](https://github.com/Strom-Capital/mcp-server-db2i/commit/d244c769fa620c16d346de7051df4e204e4a63a5))
+* stop installing node-jt400 and the mapepire packages by default ([#203](https://github.com/Strom-Capital/mcp-server-db2i/issues/203)) ([17d4497](https://github.com/Strom-Capital/mcp-server-db2i/commit/17d4497e17b559a6d2f0ed0d368900338f5b3018))
+
+## [2.12.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.11.0...v2.12.0) (2026-09-26)
+
+
+### Features
+
+* add export_query to write query results to a CSV or XLSX file or download link ([#164](https://github.com/Strom-Capital/mcp-server-db2i/issues/164)) ([a907c69](https://github.com/Strom-Capital/mcp-server-db2i/commit/a907c69a166d23a1edf712c47eebc6f304c74c5c)), closes [#160](https://github.com/Strom-Capital/mcp-server-db2i/issues/160)
+* keep OAuth refresh grants across restarts ([#181](https://github.com/Strom-Capital/mcp-server-db2i/issues/181)) ([f80a55a](https://github.com/Strom-Capital/mcp-server-db2i/commit/f80a55a631268f2050d7f7ac5649c6243cc831b9))
+* new visual identity for the site, sign-in page and docs ([#186](https://github.com/Strom-Capital/mcp-server-db2i/issues/186)) ([3defd62](https://github.com/Strom-Capital/mcp-server-db2i/commit/3defd620fd1d847ee460ac13c0dde1717c01deaa))
+
+
+### Bug Fixes
+
+* accept aliased special registers in the schema allowlist check ([#184](https://github.com/Strom-Capital/mcp-server-db2i/issues/184)) ([77018fe](https://github.com/Strom-Capital/mcp-server-db2i/commit/77018fe761e4017ee7ae84d60b458c4ed89865c8)), closes [#183](https://github.com/Strom-Capital/mcp-server-db2i/issues/183)
+* accept Db2 for i cast syntax in the schema allowlist check ([#177](https://github.com/Strom-Capital/mcp-server-db2i/issues/177)) ([b1bf1e9](https://github.com/Strom-Capital/mcp-server-db2i/commit/b1bf1e91f9359cd29afe75ed9b8db32d80cd6352))
+* read ODBC text as UTF-8 so non-ASCII characters are not lost ([#169](https://github.com/Strom-Capital/mcp-server-db2i/issues/169)) ([aa9818f](https://github.com/Strom-Capital/mcp-server-db2i/commit/aa9818fb60abfff97ea5b3d461df75e0134e1763))
+* return BLOB columns as hex on the jt400 driver ([#175](https://github.com/Strom-Capital/mcp-server-db2i/issues/175)) ([89cc133](https://github.com/Strom-Capital/mcp-server-db2i/commit/89cc13338b994221bfa3c0bc4f70025711ba82f0)), closes [#166](https://github.com/Strom-Capital/mcp-server-db2i/issues/166)
+* return ODBC binary columns as hex and warn about rounded decimals ([#165](https://github.com/Strom-Capital/mcp-server-db2i/issues/165)) ([0511de7](https://github.com/Strom-Capital/mcp-server-db2i/commit/0511de7ef3b6e3641f7bd9ea4f2c98ef42a04179)), closes [#163](https://github.com/Strom-Capital/mcp-server-db2i/issues/163)
+
+## [2.11.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.10.0...v2.11.0) (2026-09-25)
+
+
+### Features
+
+* add cause and recovery text to SQL errors ([#139](https://github.com/Strom-Capital/mcp-server-db2i/issues/139)) ([763cddc](https://github.com/Strom-Capital/mcp-server-db2i/commit/763cddc87543336ceebdbcaaf8f6870045bce93e)), closes [#116](https://github.com/Strom-Capital/mcp-server-db2i/issues/116)
+* add index_advice from the IBM i index advisor ([#142](https://github.com/Strom-Capital/mcp-server-db2i/issues/142)) ([6b31283](https://github.com/Strom-Capital/mcp-server-db2i/commit/6b3128355fc265659665297d8c1f6e0dfdc120ba))
+* add list_routines and describe_routine for procedures and functions ([#143](https://github.com/Strom-Capital/mcp-server-db2i/issues/143)) ([d4623c2](https://github.com/Strom-Capital/mcp-server-db2i/commit/d4623c260cd8083b2a7211814cef81bc75e3a5c1))
+
+
+### Bug Fixes
+
+* check schema-qualified function calls against the schema allowlist ([#145](https://github.com/Strom-Capital/mcp-server-db2i/issues/145)) ([480c8a5](https://github.com/Strom-Capital/mcp-server-db2i/commit/480c8a52624897fff94e436c5d22756003a4a2ea)), closes [#144](https://github.com/Strom-Capital/mcp-server-db2i/issues/144)
+* match the sign-in page to the README and docs branding ([#146](https://github.com/Strom-Capital/mcp-server-db2i/issues/146)) ([40c76c9](https://github.com/Strom-Capital/mcp-server-db2i/commit/40c76c9dab135f2d8ac09d3f002f760d2c893109))
+
+## [2.10.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.9.0...v2.10.0) (2026-09-25)
+
+
+### Features
+
+* add search_ibmi_services from the IBM i service catalog ([#132](https://github.com/Strom-Capital/mcp-server-db2i/issues/132)) ([384bbdc](https://github.com/Strom-Capital/mcp-server-db2i/commit/384bbdc8cfcecbb45e956a5479a03c5135d33822)), closes [#115](https://github.com/Strom-Capital/mcp-server-db2i/issues/115)
+* cancel long-running queries on IBM i with QUERY_TIMEOUT ([#130](https://github.com/Strom-Capital/mcp-server-db2i/issues/130)) ([f6fa8d3](https://github.com/Strom-Capital/mcp-server-db2i/commit/f6fa8d394c76c460b57ce33824c832e743c9857b))
+* make the login and OAuth rate limits configurable ([#119](https://github.com/Strom-Capital/mcp-server-db2i/issues/119)) ([a6a63bd](https://github.com/Strom-Capital/mcp-server-db2i/commit/a6a63bde126ae5a7405a19f9746ba871e729caf4))
+
+
+### Bug Fixes
+
+* exit stdio servers when their client goes away ([#126](https://github.com/Strom-Capital/mcp-server-db2i/issues/126)) ([1e6b6ed](https://github.com/Strom-Capital/mcp-server-db2i/commit/1e6b6edd2f1902e6d3bde2cc8c65031a0eafa931)), closes [#123](https://github.com/Strom-Capital/mcp-server-db2i/issues/123)
+* return BIGINT values from the ODBC driver ([#128](https://github.com/Strom-Capital/mcp-server-db2i/issues/128)) ([3cc0053](https://github.com/Strom-Capital/mcp-server-db2i/commit/3cc0053d228356cabc4bd6d8d907e6e9b7cce9c9)), closes [#127](https://github.com/Strom-Capital/mcp-server-db2i/issues/127)
+
+## [2.9.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.8.0...v2.9.0) (2026-09-25)
+
+
+### Features
+
+* add a built-in OAuth 2.1 authorization server with IBM i sign-in ([#122](https://github.com/Strom-Capital/mcp-server-db2i/issues/122)) ([d960444](https://github.com/Strom-Capital/mcp-server-db2i/commit/d960444d0f33f8369fac922049894754dbe943c5))
+
 ## [2.8.0](https://github.com/Strom-Capital/mcp-server-db2i/compare/v2.7.0...v2.8.0) (2026-09-24)
 
 

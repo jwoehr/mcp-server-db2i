@@ -1,6 +1,9 @@
-# Client Setup
+---
+title: "Client setup"
+description: "Configure Cursor, VS Code, Claude Desktop, and Claude Code to start mcp-server-db2i, with npx or Docker."
+---
 
-This guide covers setting up mcp-server-db2i with MCP-compatible clients. The JSON configuration format is the same for all clients - only the file location differs.
+This guide covers setting up mcp-server-db2i with MCP-compatible clients. Cursor, Claude Desktop and Claude Code use the same JSON format, and only the file location differs. VS Code uses its own format; see [VS Code](#vs-code-agent-mode).
 
 ## Configuration Paths
 
@@ -9,6 +12,13 @@ This guide covers setting up mcp-server-db2i with MCP-compatible clients. The JS
 - **macOS/Linux**: `~/.cursor/mcp.json`
 - **Windows**: `%USERPROFILE%\.cursor\mcp.json`
 - **Env var syntax**: `${env:VAR_NAME}`
+
+### VS Code
+
+- **Workspace**: `.vscode/mcp.json` in the project folder
+- **User**: run **MCP: Open User Configuration** from the Command Palette
+- **Format**: a `servers` object instead of `mcpServers`, and an optional `inputs` list
+- **Secrets**: `${input:ID}` prompts once and stores the value in VS Code's secret storage
 
 ### Claude Desktop
 
@@ -21,7 +31,7 @@ This guide covers setting up mcp-server-db2i with MCP-compatible clients. The JS
 - **All platforms**: `~/.claude.json`
 - **Project-specific**: `.mcp.json` in project root
 - **Env var syntax**: `${VAR_NAME}`
-- **CLI**: `claude mcp add --scope user db2i -- npx mcp-server-db2i`
+- **CLI**: `claude mcp add --scope user db2i -- npx -y mcp-server-db2i@latest`
 
 ## Setup Options
 
@@ -110,7 +120,7 @@ export DB2I_PASSWORD="your-password"
   "mcpServers": {
     "db2i": {
       "command": "npx",
-      "args": ["mcp-server-db2i"],
+      "args": ["-y", "mcp-server-db2i@latest"],
       "env": {
         "DB2I_HOSTNAME": "${env:DB2I_HOSTNAME}",
         "DB2I_USERNAME": "${env:DB2I_USERNAME}",
@@ -121,6 +131,22 @@ export DB2I_PASSWORD="your-password"
 }
 ```
 
+#### Choosing a version
+
+`mcp-server-db2i@latest` makes npx ask npm for the newest release each time the client starts the server, so you get fixes without doing anything. Without a version, npx keeps running whichever version it cached first and never updates it.
+
+To upgrade on your own schedule, for example on a shared or production setup, pin an exact version instead: `"args": ["-y", "mcp-server-db2i@3.0.0"]`. Major versions can change setup steps, so read the [changelog](https://github.com/Strom-Capital/mcp-server-db2i/blob/main/CHANGELOG.md) before moving to a new one.
+
+#### Drivers that need extra packages
+
+The `jt400` and `mapepire` drivers need packages that npx does not install by default. Pass them with `-p`:
+
+```json
+"args": ["-y", "-p", "mcp-server-db2i@latest", "-p", "node-jt400", "mcp-server-db2i"]
+```
+
+For `mapepire`, use `"-p", "@ibm/mapepire-js", "-p", "ssh2"` instead of `"-p", "node-jt400"`. Set `DB2I_DRIVER` in `env` as well. See [Installing the jt400 and mapepire packages](configuration.md#installing-the-jt400-and-mapepire-packages).
+
 ### Using npx with inline credentials
 
 > **Security Warning:** This stores credentials in plain text in your config file. Only use for local development or testing.
@@ -130,7 +156,7 @@ export DB2I_PASSWORD="your-password"
   "mcpServers": {
     "db2i": {
       "command": "npx",
-      "args": ["mcp-server-db2i"],
+      "args": ["-y", "mcp-server-db2i@latest"],
       "env": {
         "DB2I_HOSTNAME": "your-host",
         "DB2I_USERNAME": "your-user",
@@ -140,6 +166,39 @@ export DB2I_PASSWORD="your-password"
   }
 }
 ```
+
+### VS Code (agent mode)
+
+VS Code starts MCP servers for agent mode in Copilot Chat. Add `.vscode/mcp.json` to your project. The `inputs` entry makes VS Code ask for the password the first time the server starts, so it is not stored in the file:
+
+```json
+{
+  "inputs": [
+    { "type": "promptString", "id": "db2i-password", "description": "IBM i password", "password": true }
+  ],
+  "servers": {
+    "db2i": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "mcp-server-db2i@latest"],
+      "env": {
+        "DB2I_HOSTNAME": "ibmi.example.com",
+        "DB2I_USERNAME": "MYUSER",
+        "DB2I_PASSWORD": "${input:db2i-password}",
+        "DB2I_SCHEMA": "MYLIB",
+        "QUERY_ALLOWED_SCHEMAS": "MYLIB,QSYS2"
+      }
+    }
+  }
+}
+```
+
+Start the server from the **Start** link above `db2i` in the file, or with **MCP: List Servers**. **MCP: List Servers > db2i > Show Output** shows the server log. When it connects, VS Code lists the tools under **Configure Tools** in the Chat view.
+
+- `export_query` only appears when `EXPORT_ENABLED` is set, so VS Code lists one tool fewer than the startup log by default.
+- If the host servers use SSL, add `"DB2I_ODBC_OPTIONS": "SSL=1"` to `env`. Without it the log warns that the connection does not use TLS.
+- For the `jt400` or `mapepire` driver, change `args` as shown in [Drivers that need extra packages](#drivers-that-need-extra-packages) and set `DB2I_DRIVER`. If Code for IBM i has already deployed the Mapepire server JAR to `$HOME/.vscode` on the IBM i, the `mapepire` driver reuses it instead of uploading its own to `$HOME/.mapepire`.
+- Keep `.vscode/mcp.json` out of version control if it names a real host or user profile.
 
 ### Local Development
 
@@ -216,7 +275,7 @@ Enable debug logging for troubleshooting:
   "mcpServers": {
     "db2i": {
       "command": "npx",
-      "args": ["mcp-server-db2i"],
+      "args": ["-y", "mcp-server-db2i@latest"],
       "env": {
         "DB2I_HOSTNAME": "your-host",
         "DB2I_USERNAME": "your-user",
@@ -262,14 +321,32 @@ Once connected, you can ask the AI assistant:
 - "Count the records in ORDERS where YEAR = 2024"
 - "Find customers with no orders in the last year"
 
+## Claude for Excel
+
+Claude for Excel, the Claude add-in for Microsoft Excel, can use this server through a claude.ai connector. People ask in the Claude sidebar in Excel, and Claude queries Db2 for i and puts the results in the sheet.
+
+It needs the same setup as claude.ai:
+
+1. Run the server over HTTP with OAuth at a public HTTPS address. See [Remote clients (OAuth)](http-transport.md#remote-clients-oauth).
+2. Limit who can reach it to the clients' address ranges. See [Limiting who can reach the server](http-transport.md#limiting-who-can-reach-the-server).
+3. Add the server as a custom connector in claude.ai: **Settings > Connectors > Add custom connector**. On Team and Enterprise plans, an owner may need to add it for the organization.
+4. In Excel, open Claude with the same Claude account. The connector is available from the sidebar.
+
+Claude for Excel needs a paid Claude plan. As with any assistant, query results go to Claude; see [Where data goes](security.md#where-data-goes).
+
+## Web app
+
+For people without an MCP client or a Claude subscription, the repository has an [example web app](web-app.md). Users sign in with their IBM i user profile, bring their own model API key, and get result tables, exports and the business SQL tools in the browser.
+
 ## Troubleshooting
 
 ### Connection Issues
 
 1. **Check hostname resolution**: Ensure the IBM i hostname is reachable
 2. **Verify credentials**: Test with a known-good username/password
-3. **Check port**: Default is 446, verify firewall allows access
+3. **Check ports**: Port 446 is not used. `odbc` and `jt400` connect to the IBM i database host servers: 449 (port mapper), 8476 (sign-on) and 8471 (database), or 9476 and 9471 with TLS. `mapepire` needs only SSH (port 22, or `sshPort` in `DB2I_MAPEPIRE_OPTIONS`) open to the MCP server, but by default it still uses the database host server inside the IBM i, so that server must be running. Verify a firewall allows the ports your driver uses. See [Database Drivers](configuration.md#database-drivers)
 4. **Enable debug logging**: Set `LOG_LEVEL=debug`
+5. **`CCSID value is not valid`** (`mapepire`): `technique=cli` in `DB2I_MAPEPIRE_OPTIONS` uses the native JDBC driver, which fails when the job CCSID is 65535 (system value `QCCSID` 65535 and a user profile with `CCSID(*SYSVAL)`). Remove `technique=cli` to use the default `tcp`, or give the user profile a CCSID, for example `CHGUSRPRF CCSID(37)`. Versions of this server without the `technique` option hit it with `@ibm/mapepire-js` 1.1.0 and later: upgrade, or pin `@ibm/mapepire-js@1.0.2`. See [Using the Mapepire driver](configuration.md#using-the-mapepire-driver-ssh)
 
 ### Docker Issues
 
@@ -304,7 +381,7 @@ You can configure multiple IBM i connections:
   "mcpServers": {
     "db2i-prod": {
       "command": "npx",
-      "args": ["mcp-server-db2i"],
+      "args": ["-y", "mcp-server-db2i@latest"],
       "env": {
         "DB2I_HOSTNAME": "prod-ibmi.example.com",
         "DB2I_USERNAME": "produser",
@@ -314,7 +391,7 @@ You can configure multiple IBM i connections:
     },
     "db2i-dev": {
       "command": "npx",
-      "args": ["mcp-server-db2i"],
+      "args": ["-y", "mcp-server-db2i@latest"],
       "env": {
         "DB2I_HOSTNAME": "dev-ibmi.example.com",
         "DB2I_USERNAME": "devuser",
@@ -349,7 +426,7 @@ export DB2I_PASSWORD="your-password"
   "mcpServers": {
     "db2i": {
       "command": "npx",
-      "args": ["mcp-server-db2i"],
+      "args": ["-y", "mcp-server-db2i@latest"],
       "env": {
         "DB2I_HOSTNAME": "${DB2I_HOSTNAME}",
         "DB2I_USERNAME": "${DB2I_USERNAME}",
@@ -366,7 +443,10 @@ This keeps credentials out of config files - Claude Code expands `${VAR}` at run
 
 ```bash
 # Add server (credentials from shell environment)
-claude mcp add --scope user db2i -- npx mcp-server-db2i
+claude mcp add --scope user db2i -- npx -y mcp-server-db2i@latest
+
+# With the jt400 driver, add its package to the npx command
+claude mcp add --scope user db2i -e DB2I_DRIVER=jt400 -- npx -y -p mcp-server-db2i@latest -p node-jt400 mcp-server-db2i
 
 # Verify installation
 claude mcp list

@@ -1,0 +1,34 @@
+---
+/**
+ * The db2i/mcp route mark, or the mark with the outlined wordmark (the lockup),
+ * inlined from docs/assets/brand/svg. Ink follows the text color, and the end
+ * node and the slash use --accent, so both work in light and dark.
+ */
+import markSvg from '../../../docs/assets/brand/svg/mark-primary.svg?raw';
+import lockupSvg from '../../../docs/assets/brand/svg/lockup-primary.svg?raw';
+
+interface Props {
+  variant?: 'mark' | 'lockup';
+  /** Rendered height in px. */
+  height?: number;
+  class?: string;
+}
+const { variant = 'mark', height = 24, class: className } = Astro.props;
+
+/** Swap the brand colors for currentColor and the accent token, and set the size. */
+function themed(svg: string): string {
+  return svg
+    .replace(/fill="#161716"/g, 'fill="currentColor"')
+    .replace(/stroke="#161716"/g, 'stroke="currentColor"')
+    .replace(/fill="#3159E8"/g, 'style="fill:var(--accent)"')
+    .replace(/stroke="#3159E8"/g, 'style="stroke:var(--accent)"')
+    .replace(/ role="img" aria-label="[^"]*"/, ' aria-hidden="true" focusable="false"')
+    .replace('<svg ', `<svg height="${height}" class="${['logo', className].filter(Boolean).join(' ')}" `);
+}
+const html = themed(variant === 'lockup' ? lockupSvg : markSvg);
+---
+<Fragment set:html={html} />
+
+<style is:global>
+  svg.logo { display: block; width: auto; flex: none; }
+</style>

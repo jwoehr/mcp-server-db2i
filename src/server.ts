@@ -12,13 +12,15 @@
  * the tools take an optional `system` argument.
  */
 
-import { createRequire } from 'module';
-import { McpServer, type RegisteredTool } from '@modelcontextprotocol/server';
+import { CLIENT_INFO_META_KEY, McpServer, type RegisteredTool, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
-import { getEnabledTools, getResponseFormat } from './config.js';
+import { serverIcons } from './branding.js';
+import { getEnabledTools, getExportConfig, getResponseFormat, isToolIntentEnabled, isUiEnabled } from './config.js';
 import { resolveTarget, STDIO_POOL_KEY, systemNames, type DbTarget, type SystemBinding } from './systems.js';
 import { executeQueryTool } from './tools/query.js';
+import { exportQueryTool } from './tools/exportQuery.js';
+import { EXPORT_CONTENT_TYPES } from './export/store.js';
 import {
   listSchemasTool,
   listTablesTool,
@@ -33,8 +35,11 @@ import {
   getJournalInfoTool,
   getObjectDdlTool,
   getRelatedObjectsTool,
+  searchIbmiServicesTool,
   validateQueryTool,
 } from './tools/sqlServices.js';
+import { indexAdviceTool } from './tools/indexAdvice.js';
+import { describeRoutineTool, listRoutinesTool } from './tools/routines.js';
 import { profileTableTool } from './tools/profile.js';
 import { getBusinessContextTool } from './customTools/context.js';
 import { bindCustomToolArgs, executeCustomTool } from './customTools/execute.js';
@@ -42,20 +47,27 @@ import { getCustomTools, type StoredTool } from './customTools/registry.js';
 import type { LoadedCustomTools } from './customTools/loader.js';
 import { getSessionManager } from './transports/sessionManager.js';
 import { inputSchemaFor } from './customTools/schema.js';
+import { buildServerInstructions, businessContextHint } from './instructions.js';
 import { registerPrompts } from './prompts.js';
 import { registerResources } from './resources.js';
 import { SQL_OBJECT_TYPES } from './db/sqlServices.js';
 import { MAX_COMPUTED_COLUMNS } from './db/profile.js';
+import type { SqlErrorDetails } from './db/sqlErrorInfo.js';
 import { getRateLimiter } from './utils/rateLimiter.js';
-import { writeAudit, type AuditCall } from './utils/auditLog.js';
+import {
+  auditSessionId,
+  rejectedByOf,
+  writeAudit,
+  type AuditCall,
+  type AuditClient,
+  type AuditErrorKind,
+} from './utils/auditLog.js';
 import { formatToolText } from './utils/formatResult.js';
+import { SERVER_NAME, SERVER_VERSION } from './version.js';
+import { chartSpecSchema, resultColumnsSchema, type ChartSpec } from './ui/chartSpec.js';
+import { registerResultView, resultViewMeta } from './ui/resultView.js';
 
-// Read version from package.json to keep it in sync with npm releases
-const require = createRequire(import.meta.url);
-const packageJson = require('../package.json') as { name: string; version: string };
-
-export const SERVER_NAME = packageJson.name;
-export const SERVER_VERSION = packageJson.version;
+export { SERVER_NAME, SERVER_VERSION } from './version.js';
 
 /**
  * Session context for HTTP transport
@@ -69,6 +81,8 @@ export interface SessionContext {
    * one system, so every call runs there.
    */
   binding?: SystemBinding;
+  /** HTTP User-Agent of the request, for the audit log when the client sends no client info. */
+  userAgent?: string;
 }
 
 /** Systems a caller may name in a tool's `system` argument. */
@@ -94,6 +108,41 @@ function systemShape(sessionContext?: SessionContext): Record<never, never> {
 }
 
 /**
+ * Longest intent written to the audit log. Longer text is cut, not refused: the
+ * argument only feeds the audit log and must never make a tool call fail.
+ */
+const MAX_INTENT_LENGTH = 500;
+
+/**
+ * The optional `context` argument when MCP_TOOL_INTENT is on: the model's reason
+ * for the call, written to the audit log as `intent`. Typed as empty for the same
+ * reason as systemShape; withToolHandler strips the value before the handler runs.
+ */
+function contextShape(): Record<never, never> {
+  if (!isToolIntentEnabled()) {
+    return {};
+  }
+  return {
+    context: z.string().optional().describe(
+      "Why you are calling this tool: one sentence on the user's goal."
+    ),
+  };
+}
+
+/**
+ * The execute_query `chart` argument, when the result view is on. Typed as
+ * empty for the same reason as systemShape; the handler reads the value.
+ */
+function chartShape(ui: boolean): Record<never, never> {
+  if (!ui) {
+    return {};
+  }
+  return {
+    chart: chartSpecSchema.optional().describe('How to chart the rows. Column names must match the result columns.'),
+  };
+}
+
+/**
  * Standard tool result type
  */
 export interface ToolResult {
@@ -106,7 +155,10 @@ export interface ToolResult {
  * MCP tool response type
  */
 export type McpToolResponse = {
-  content: Array<{ type: 'text'; text: string }>;
+  content: Array<
+    | { type: 'text'; text: string }
+    | { type: 'resource_link'; uri: string; name: string; mimeType?: string; description?: string }
+  >;
   structuredContent?: Record<string, unknown>;
   isError?: true;
 };
@@ -121,13 +173,51 @@ const READ_ONLY_ANNOTATIONS = {
   openWorldHint: false,
 } as const;
 
+// Returned with `error` when Db2 rejected the statement (see src/db/sqlErrorInfo.ts)
+const sqlErrorOutputFields = {
+  sqlstate: z.string().optional().describe('SQLSTATE of the failed statement'),
+  sqlcode: z.number().int().optional().describe('SQLCODE of the failed statement, such as -204'),
+  cause: z.string().optional().describe('Why the statement failed. &1-style placeholders stand for values in error.'),
+  recovery: z.string().optional().describe('What to change before trying again'),
+};
+
 const queryOutputSchema = z.object({
   success: z.boolean(),
   error: z.string().optional(),
+  ...sqlErrorOutputFields,
   violations: z.array(z.string()).optional(),
   data: z.array(z.unknown()).optional(),
   rowCount: z.number().int().optional(),
   limitApplied: z.number().int().optional(),
+  truncated: z.boolean().optional().describe('True when the result stopped at limitApplied and more rows match'),
+  skippedFilters: z.array(z.string()).optional()
+    .describe('Annotated tables whose row filter, such as leaving out deleted rows, the query does not use. See warnings'),
+  warnings: z.array(z.string()).optional().describe('Tell the user these, such as columns the driver rounded'),
+  columns: resultColumnsSchema.optional().describe('Result columns in order, with the kind of value each holds'),
+  chart: chartSpecSchema.optional().describe('The chart the result view draws'),
+  chartError: z.string().optional().describe('Why the chart argument was not used'),
+});
+
+const exportOutputSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  ...sqlErrorOutputFields,
+  violations: z.array(z.string()).optional(),
+  format: z.enum(['csv', 'xlsx']).optional(),
+  filename: z.string().optional().describe('Name the download is saved as'),
+  rowCount: z.number().int().optional(),
+  bytes: z.number().int().optional(),
+  truncated: z.union([z.literal(false), z.enum(['rows', 'bytes'])]).optional()
+    .describe('rows or bytes when the file stops at max_rows / EXPORT_MAX_ROWS or EXPORT_MAX_BYTES'),
+  columns: z.array(z.object({ name: z.string(), kind: z.string() })).optional(),
+  sample: z.array(z.record(z.string(), z.unknown())).optional().describe('First rows of the file, masked'),
+  skippedFilters: z.array(z.string()).optional()
+    .describe('Annotated tables whose row filter, such as leaving out deleted rows, the query does not use. See warnings'),
+  warnings: z.array(z.string()).optional().describe('Tell the user these, such as columns the driver rounded'),
+  path: z.string().optional().describe('The file on the server host (stdio)'),
+  url: z.string().optional().describe('Download link for the user (HTTP)'),
+  expiresAt: z.string().optional(),
+  downloadsAllowed: z.number().int().optional().describe('Downloads the link allows before it stops working'),
 });
 
 const listSchemasOutputSchema = z.object({
@@ -184,9 +274,17 @@ const searchColumnsOutputSchema = z.object({
   truncated: z.boolean().optional(),
 });
 
+// Row filters from an annotation, as describe_table and get_business_context return them
+const annotationFiltersSchema = z.array(z.object({
+  sql: z.string(),
+  columns: z.array(z.string()),
+  reason: z.string().optional(),
+})).optional().describe('Row filters most queries on this table need, such as leaving out deleted rows');
+
 const describeTableOutputSchema = z.object({
   success: z.boolean(),
   error: z.string().optional(),
+  filters: annotationFiltersSchema,
   data: z.array(z.object({
     column_name: z.string(),
     ordinal_position: z.number(),
@@ -235,12 +333,16 @@ const listIndexesOutputSchema = z.object({
 const validateQueryOutputSchema = z.object({
   success: z.boolean(),
   error: z.string().optional(),
+  ...sqlErrorOutputFields,
   valid: z.boolean().optional(),
   statementType: z.string().nullable().optional(),
   missingTables: z.array(z.string()).optional(),
   missingColumns: z.array(z.string()).optional(),
   missingRoutines: z.array(z.string()).optional(),
   violations: z.array(z.string()).optional(),
+  skippedFilters: z.array(z.string()).optional()
+    .describe('Annotated tables whose row filter, such as leaving out deleted rows, the query does not use. See warnings'),
+  warnings: z.array(z.string()).optional(),
 });
 
 const objectDdlOutputSchema = z.object({
@@ -287,9 +389,116 @@ const journalInfoOutputSchema = z.object({
   truncated: z.boolean().optional(),
 });
 
+const servicesOutputSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  categories: z.array(z.object({
+    category: z.string(),
+    count: z.number().int(),
+  })).optional(),
+  data: z.array(z.object({
+    service_name: z.string(),
+    category: z.string(),
+    schema: z.string(),
+    sql_object_type: z.string().nullable(),
+    system_object_name: z.string().nullable(),
+    earliest_release: z.string().nullable(),
+    initial_db2_group_level: z.number().int().nullable(),
+    latest_db2_group_level: z.number().int().nullable(),
+    example: z.string().nullable().optional(),
+  })).optional(),
+  count: z.number().int().optional(),
+  truncated: z.boolean().optional(),
+});
+
+const indexAdviceOutputSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  ...sqlErrorOutputFields,
+  schema: z.string().optional(),
+  table: z.string().optional(),
+  since: z.string().optional(),
+  data: z.array(z.object({
+    schema: z.string(),
+    table: z.string(),
+    key_columns: z.array(z.string()),
+    index_type: z.string(),
+    times_advised: z.number(),
+    mti_used: z.number(),
+    mti_created: z.number(),
+    last_advised: z.string().nullable(),
+    last_mti_used: z.string().nullable(),
+    reasons: z.array(z.object({
+      code: z.string(),
+      description: z.string().nullable(),
+    })),
+    rows_merged: z.number().int(),
+  })).optional(),
+  count: z.number().int().optional(),
+  truncated: z.boolean().optional(),
+});
+
+const routineShape = {
+  schema: z.string(),
+  name: z.string(),
+  specific_name: z.string(),
+  type: z.enum(['PROCEDURE', 'SCALAR FUNCTION', 'TABLE FUNCTION']),
+  language: z.string().nullable(),
+  external_name: z.string().nullable(),
+  sql_data_access: z.string().nullable(),
+  result_sets: z.number().int().nullable(),
+  parameter_count: z.number().int(),
+  text: z.string().nullable(),
+  last_altered: z.string().nullable(),
+};
+
+const routineColumnShape = {
+  position: z.number().int(),
+  name: z.string().nullable(),
+  data_type: z.string(),
+  length: z.number().nullable(),
+  precision: z.number().nullable(),
+  scale: z.number().nullable(),
+  nullable: z.boolean(),
+  text: z.string().nullable(),
+};
+
+const listRoutinesOutputSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  ...sqlErrorOutputFields,
+  schema: z.string().optional(),
+  data: z.array(z.object(routineShape)).optional(),
+  count: z.number().int().optional(),
+  truncated: z.boolean().optional(),
+});
+
+const describeRoutineOutputSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  ...sqlErrorOutputFields,
+  schema: z.string().optional(),
+  data: z.array(z.object({
+    ...routineShape,
+    parameters: z.array(z.object({
+      ...routineColumnShape,
+      mode: z.string(),
+      default: z.string().nullable(),
+    })),
+    returns: z.object(routineColumnShape).nullable().optional(),
+    result_columns: z.array(z.object(routineColumnShape)).optional(),
+    call_template: z.string(),
+    callable_with_execute_query: z.boolean(),
+    note: z.string().optional(),
+  })).optional(),
+  count: z.number().int().optional(),
+  truncated: z.boolean().optional(),
+});
+
 const profileTableOutputSchema = z.object({
   success: z.boolean(),
   error: z.string().optional(),
+  ...sqlErrorOutputFields,
   schema: z.string().optional(),
   table: z.string().optional(),
   mode: z.enum(['stored', 'computed']).optional(),
@@ -312,6 +521,7 @@ const profileTableOutputSchema = z.object({
     statistics_updated: z.string().nullable().optional(),
     masked: z.enum(['redact', 'last4']).optional(),
   })).optional(),
+  columns: resultColumnsSchema.optional(),
   count: z.number().int().optional(),
   truncated: z.boolean().optional(),
   sql: z.string().optional(),
@@ -322,6 +532,7 @@ const businessContextOutputSchema = z.object({
   error: z.string().optional(),
   data: z.array(z.object({
     table: z.string(),
+    filters: annotationFiltersSchema,
     entity: z.string().optional(),
     description: z.string().optional(),
     columns: z.record(z.string(), z.string()).optional(),
@@ -333,6 +544,10 @@ const businessContextOutputSchema = z.object({
     })).optional(),
   })).optional(),
   count: z.number().int().optional(),
+  partial_match: z.boolean().optional().describe('True when no entity had the requested name and data holds entities whose names partly match it'),
+  available_entities: z.array(z.string()).optional().describe('Every loaded entity name, when nothing matched the filters'),
+  available_tables: z.array(z.string()).optional().describe('Every annotated SCHEMA.TABLE, when the table filter matched nothing'),
+  hint: z.string().optional().describe('What to call next when the filters did not match exactly'),
 });
 
 const tableConstraintsOutputSchema = z.object({
@@ -356,6 +571,8 @@ interface ToolAudit<TArgs> {
   audit?: (args: TArgs) => Pick<AuditCall, 'sql' | 'params' | 'args'>;
   /** SQL the handler built at run time, read from a successful result. */
   resultSql?: (result: ToolResult) => string | undefined;
+  /** The tool has its own `context` parameter, so it is not the intent argument. */
+  ownsContext?: boolean;
 }
 
 /**
@@ -374,9 +591,14 @@ export function withToolHandler<TArgs, TResult extends ToolResult>(
   sessionContext?: SessionContext,
   audit?: ToolAudit<TArgs>,
   systemOf: (args: TArgs) => string | undefined = systemArgOf,
-): (args: TArgs) => Promise<McpToolResponse> {
-  return async (args: TArgs): Promise<McpToolResponse> => {
-    const facts = audit?.audit?.(args) ?? {};
+): (args: TArgs, ctx?: ServerContext) => Promise<McpToolResponse> {
+  return async (input: TArgs, ctx?: ServerContext): Promise<McpToolResponse> => {
+    const { args, intent } = splitIntent(input, audit?.ownsContext);
+    const facts: AuditFacts = {
+      ...(audit?.audit?.(args) ?? {}),
+      ...(intent !== undefined ? { intent } : {}),
+      ...callerFacts(ctx, sessionContext),
+    };
     const requested = systemOf(args);
 
     let target: DbTarget | undefined;
@@ -398,7 +620,11 @@ export function withToolHandler<TArgs, TResult extends ToolResult>(
 
     if (!rateResult.allowed) {
       const error = rateLimiter.formatError(rateResult);
-      recordAudit(audit?.tool, identity, system, facts, { outcome: 'rate_limited', error: error.error });
+      recordAudit(audit?.tool, identity, system, facts, {
+        outcome: 'rate_limited',
+        error: error.error,
+        errorKind: 'rate_limited',
+      });
       const structured = { success: false, error: error.error };
       return {
         content: [{ type: 'text', text: formatToolText(error, getResponseFormat()) }],
@@ -409,7 +635,7 @@ export function withToolHandler<TArgs, TResult extends ToolResult>(
 
     if (!target) {
       const message = targetError ?? errorMessage;
-      recordAudit(audit?.tool, identity, system, facts, { outcome: 'error', error: message });
+      recordAudit(audit?.tool, identity, system, facts, { outcome: 'error', error: message, errorKind: 'unknown_system' });
       return {
         content: [{ type: 'text', text: message }],
         structuredContent: { success: false, error: message },
@@ -426,6 +652,7 @@ export function withToolHandler<TArgs, TResult extends ToolResult>(
       recordAudit(audit?.tool, identity, system, facts, {
         outcome: 'error',
         error: message,
+        errorKind: 'exception',
         durationMs: Date.now() - started,
       });
       throw error;
@@ -434,11 +661,22 @@ export function withToolHandler<TArgs, TResult extends ToolResult>(
     const durationMs = Date.now() - started;
     if (!result.success) {
       const message = result.error ?? errorMessage;
+      const sqlError = sqlErrorFieldsOf(result);
+      const violations = 'violations' in result && Array.isArray(result.violations)
+        ? (result.violations as string[])
+        : undefined;
+      const errorKind = errorKindOf(result, message, sqlError);
+      const rejectedBy = rejectedByOf(errorKind, sqlError.sqlstate);
       recordAudit(audit?.tool, identity, system, facts, {
         outcome: 'error',
         error: message,
+        errorKind,
+        ...(rejectedBy ? { rejectedBy } : {}),
         durationMs,
         rowCount: rowCountOf(result),
+        ...(sqlError.sqlstate ? { sqlstate: sqlError.sqlstate } : {}),
+        ...(sqlError.sqlcode !== undefined ? { sqlcode: sqlError.sqlcode } : {}),
+        ...(violations ? { violations } : {}),
       });
       const structured = {
         success: false,
@@ -446,9 +684,10 @@ export function withToolHandler<TArgs, TResult extends ToolResult>(
         ...('violations' in result && result.violations
           ? { violations: result.violations }
           : {}),
+        ...sqlError,
       };
       return {
-        content: [{ type: 'text', text: message }],
+        content: [{ type: 'text', text: withCauseAndRecovery(message, sqlError) }],
         structuredContent: structured,
         isError: true,
       };
@@ -459,12 +698,42 @@ export function withToolHandler<TArgs, TResult extends ToolResult>(
       outcome: 'success',
       durationMs,
       rowCount: rowCountOf(result),
+      // true for a cut query result or listing, 'rows' or 'bytes' for an export
+      ...(result.truncated ? { truncated: true } : {}),
+      ...(isStringArray(result.skippedFilters) ? { skippedFilters: result.skippedFilters } : {}),
+      ...(typeof result.bytes === 'number' ? { bytes: result.bytes } : {}),
+      // validate_query: the verdict and findings, and Db2's SQLSTATE when it could not parse
+      ...(typeof result.valid === 'boolean' ? { valid: result.valid } : {}),
+      ...(typeof result.valid === 'boolean' && isStringArray(result.violations) && result.violations.length > 0
+        ? { violations: result.violations }
+        : {}),
+      ...(typeof result.valid === 'boolean' && typeof result.sqlstate === 'string' ? { sqlstate: result.sqlstate } : {}),
+      ...(typeof result.valid === 'boolean' && typeof result.sqlcode === 'number' ? { sqlcode: result.sqlcode } : {}),
     });
     return {
       content: [{ type: 'text', text: formatToolText(result, getResponseFormat()) }],
       structuredContent: result,
     };
   };
+}
+
+/** The SQLSTATE, SQLCODE, cause and recovery a failed tool result carries. */
+function sqlErrorFieldsOf(result: object): SqlErrorDetails {
+  const fields: SqlErrorDetails = {};
+  const source = result as Record<string, unknown>;
+  if (typeof source.sqlstate === 'string') fields.sqlstate = source.sqlstate;
+  if (typeof source.sqlcode === 'number') fields.sqlcode = source.sqlcode;
+  if (typeof source.cause === 'string') fields.cause = source.cause;
+  if (typeof source.recovery === 'string') fields.recovery = source.recovery;
+  return fields;
+}
+
+/** The error text, followed by the cause and recovery when Db2 gave them. */
+function withCauseAndRecovery(message: string, fields: SqlErrorDetails): string {
+  const lines = [message];
+  if (fields.cause) lines.push(`Cause: ${fields.cause}`);
+  if (fields.recovery) lines.push(`Recovery: ${fields.recovery}`);
+  return lines.join('\n\n');
 }
 
 function systemArgOf(args: unknown): string | undefined {
@@ -475,17 +744,95 @@ function systemArgOf(args: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+/** What the audit line says about the call itself, before it runs. */
+type AuditFacts = Pick<AuditCall, 'sql' | 'params' | 'args' | 'intent' | 'client' | 'session'>;
+
+/** How the call ended. */
+type AuditOutcome = Pick<
+  AuditCall,
+  | 'outcome' | 'error' | 'errorKind' | 'durationMs' | 'rowCount' | 'truncated' | 'skippedFilters' | 'bytes'
+  | 'sqlstate' | 'sqlcode' | 'violations' | 'rejectedBy' | 'valid'
+>;
+
+/**
+ * Take the intent argument out of the tool arguments. Handlers never see it.
+ * A tool with its own `context` parameter keeps it, and nothing is taken while
+ * MCP_TOOL_INTENT is off.
+ */
+function splitIntent<TArgs>(input: TArgs, ownsContext?: boolean): { args: TArgs; intent?: string } {
+  if (ownsContext || !isToolIntentEnabled() || typeof input !== 'object' || input === null || !('context' in input)) {
+    return { args: input };
+  }
+  const { context, ...rest } = input as Record<string, unknown>;
+  const text = typeof context === 'string' ? context.trim() : '';
+  const intent = text === '' ? undefined : text.slice(0, MAX_INTENT_LENGTH);
+  return { args: rest as TArgs, ...(intent !== undefined ? { intent } : {}) };
+}
+
+/**
+ * The client and session behind a call. Client info comes from the request's
+ * 2026-07-28 metadata, or the HTTP User-Agent when there is none.
+ */
+function callerFacts(ctx: ServerContext | undefined, sessionContext: SessionContext | undefined): AuditFacts {
+  const facts: AuditFacts = {};
+  const client = clientOf(ctx, sessionContext);
+  if (client) {
+    facts.client = client;
+  }
+  if (sessionContext) {
+    facts.session = auditSessionId(sessionContext.sessionId);
+  }
+  return facts;
+}
+
+function clientOf(ctx: ServerContext | undefined, sessionContext: SessionContext | undefined): AuditClient | undefined {
+  const envelope = ctx?.mcpReq?.envelope as Record<string, unknown> | undefined;
+  const info = envelope?.[CLIENT_INFO_META_KEY] as { name?: unknown; version?: unknown } | undefined;
+  if (info && typeof info.name === 'string') {
+    return {
+      name: info.name,
+      ...(typeof info.version === 'string' ? { version: info.version } : {}),
+    };
+  }
+  return sessionContext?.userAgent ? { userAgent: sessionContext.userAgent } : undefined;
+}
+
+/**
+ * Why a failed result failed. Tools that know say so in `errorKind`; otherwise a
+ * Db2 SQLSTATE or SQLCODE means an SQL error, and a few messages shared by the
+ * catalog tools are recognised.
+ */
+function errorKindOf(result: ToolResult, message: string, sqlError: SqlErrorDetails): AuditErrorKind {
+  if (typeof result.errorKind === 'string') {
+    return result.errorKind as AuditErrorKind;
+  }
+  if (sqlError.sqlstate || sqlError.sqlcode !== undefined) {
+    return 'sql_error';
+  }
+  if (message.includes('is not in the allowed schemas')) {
+    return 'allowlist_denied';
+  }
+  if (/\bnot found\b|does not exist/i.test(message)) {
+    return 'not_found';
+  }
+  return 'other';
+}
+
 function recordAudit(
   tool: string | undefined,
   identity: string,
   system: string | undefined,
-  facts: Pick<AuditCall, 'sql' | 'params' | 'args'>,
-  outcome: Pick<AuditCall, 'outcome' | 'error' | 'durationMs' | 'rowCount'>,
+  facts: AuditFacts,
+  outcome: AuditOutcome,
 ): void {
   if (!tool) {
     return;
   }
   writeAudit({ tool, identity, ...(system ? { system } : {}), ...facts, ...outcome });
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }
 
 function rowCountOf(result: ToolResult): number | undefined {
@@ -527,30 +874,43 @@ function argsAudit<T extends Record<string, unknown>>(tool: string): ToolAudit<T
  * @returns Configured McpServer instance ready to connect to a transport
  */
 export function createServer(sessionContext?: SessionContext): McpServer {
-  const server = new McpServer({
-    name: SERVER_NAME,
-    version: SERVER_VERSION,
-  });
-
-  const system = systemShape(sessionContext);
-
   const loadedTools = getCustomTools();
   const enabledTools = new Set(getEnabledTools(loadedTools.tools));
+  const sessionTools = sessionToolNames(loadedTools, enabledTools, sessionContext);
+  const instructions = buildServerInstructions(loadedTools, sessionTools);
+  const contextHint = businessContextHint(loadedTools, sessionTools);
+  const sqlTools: SqlToolDescription[] = [];
+
+  const server = new McpServer(
+    {
+      name: SERVER_NAME,
+      version: SERVER_VERSION,
+      icons: serverIcons(),
+    },
+    instructions ? { instructions } : undefined,
+  );
+
+  const common = { ...systemShape(sessionContext), ...contextShape() };
 
   if (enabledTools.has('execute_query')) {
-    server.registerTool(
+    const ui = isUiEnabled();
+    const description = 'Execute a read-only SQL SELECT query against the IBM Db2i database. Only SELECT statements are allowed for security. Results are limited by default to prevent large result sets.' +
+      (ui ? ' Pass chart only when the user asks for a chart or graph. Otherwise leave it out: the result opens as a table and the user can switch to a chart.' : '');
+    const registered = server.registerTool(
       'execute_query',
       {
         title: 'Execute SQL Query',
-        description: 'Execute a read-only SQL SELECT query against the IBM DB2i database. Only SELECT statements are allowed for security. Results are limited by default to prevent large result sets.',
+        description: description + contextHint,
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           sql: z.string().describe('SQL SELECT query to execute'),
           params: z.array(z.unknown()).optional().describe('Query parameters for prepared statement'),
           limit: z.number().int().positive().optional().describe('Maximum number of rows to return (default: QUERY_DEFAULT_LIMIT, max: QUERY_MAX_LIMIT)'),
+          ...chartShape(ui),
         }),
         outputSchema: queryOutputSchema,
+        _meta: resultViewMeta(),
       },
       withToolHandler(
         (args, target) => executeQueryTool({
@@ -559,12 +919,78 @@ export function createServer(sessionContext?: SessionContext): McpServer {
           limit: args.limit,
           target,
           defaultSchema: target.defaultSchema,
+          describeTable: sessionTools.has('describe_table'),
+          chart: (args as { chart?: ChartSpec }).chart,
         }),
         'Query failed',
         sessionContext,
         sqlAudit('execute_query'),
       )
     );
+    sqlTools.push({ registered, description });
+  }
+
+  if (enabledTools.has('export_query') && getExportConfig()) {
+    const delivery = sessionContext ? 'link' : 'path';
+    const handler = withToolHandler(
+      (args: { sql: string; params?: unknown[]; format?: 'csv' | 'xlsx'; filename?: string; max_rows?: number }, target) =>
+        exportQueryTool({
+          sql: args.sql,
+          params: args.params,
+          format: args.format,
+          filename: args.filename,
+          maxRows: args.max_rows,
+          delivery,
+          owner: sessionContext ? target.config.username : 'stdio',
+          target,
+          defaultSchema: target.defaultSchema,
+          describeTable: sessionTools.has('describe_table'),
+        }),
+      'Export failed',
+      sessionContext,
+      sqlAudit('export_query'),
+    );
+    const description =
+      'Run a read-only SQL SELECT and write every row to a CSV or Excel (XLSX) file for the user, instead of returning the rows. ' +
+      'Use it when the user asks for a file, a spreadsheet, or more rows than execute_query returns. ' +
+      (delivery === 'link'
+        ? 'The result has a download link: give it to the user as is, and do not open it yourself, because each download counts against a small limit. It expires after a few minutes. '
+        : 'The result has the file path on this machine: tell the user where the file is. ') +
+      'The result also has the row count, the columns, and a few sample rows so you can check the export. ' +
+      'Same checks as execute_query; masked columns are masked in the file.';
+    const registered = server.registerTool(
+      'export_query',
+      {
+        title: 'Export Query to File',
+        description: description + contextHint,
+        annotations: { ...READ_ONLY_ANNOTATIONS, idempotentHint: false },
+        inputSchema: z.object({
+          ...common,
+          sql: z.string().describe('SQL SELECT query to export'),
+          params: z.array(z.unknown()).optional().describe('Query parameters for prepared statement'),
+          format: z.enum(['csv', 'xlsx']).optional().describe('File format. Default: xlsx'),
+          filename: z.string().max(120).optional().describe('Name for the file, without extension, e.g. open-orders-1001'),
+          max_rows: z.number().int().positive().optional().describe('Most rows to write (capped by EXPORT_MAX_ROWS)'),
+        }),
+        outputSchema: exportOutputSchema,
+      },
+      async (args, ctx) => {
+        const response = await handler(args, ctx);
+        const url = response.structuredContent?.url;
+        const filename = response.structuredContent?.filename;
+        if (typeof url === 'string' && typeof filename === 'string') {
+          response.content.push({
+            type: 'resource_link',
+            uri: url,
+            name: filename,
+            mimeType: EXPORT_CONTENT_TYPES[filename.endsWith('.csv') ? 'csv' : 'xlsx'],
+            description: 'Query export for the user to download',
+          });
+        }
+        return response;
+      }
+    );
+    sqlTools.push({ registered, description });
   }
 
   if (enabledTools.has('list_schemas')) {
@@ -572,10 +998,10 @@ export function createServer(sessionContext?: SessionContext): McpServer {
       'list_schemas',
       {
         title: 'List Schemas',
-        description: 'List all schemas (libraries) in the IBM DB2i database. Optionally filter by name pattern using * as wildcard.',
+        description: 'List all schemas (libraries) in the IBM Db2i database. Optionally filter by name pattern using * as wildcard.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           filter: z.string().optional().describe('Filter pattern for schema names. Use * as wildcard. Example: "QSYS*" matches schemas starting with QSYS'),
         }),
         outputSchema: listSchemasOutputSchema,
@@ -597,7 +1023,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: `List all tables in a schema (library). ${SCHEMA_DEFAULT_HINT} Optionally filter by name pattern using * as wildcard.`,
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) name to list tables from. ${SCHEMA_DEFAULT_HINT}`),
           filter: z.string().optional().describe('Filter pattern for table names. Use * as wildcard. Example: "CUST*" matches tables starting with CUST'),
         }),
@@ -624,7 +1050,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: 'Find tables by name or description text across libraries. Matches TABLE_NAME, SYSTEM_TABLE_NAME, and TABLE_TEXT. Use * as a wildcard. When a schema allowlist is configured, only those libraries are searched. Otherwise system libraries (Q* and SYS*) are skipped unless include_system is true.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           filter: z.string().describe('Name or text to match. Use * as a wildcard. Example: "ORDER*" matches tables starting with ORDER'),
           schema: z.string().optional().describe('Limit the search to one library. Must be in the schema allowlist when one is configured.'),
           include_system: z.boolean().optional().describe('Include Q* and SYS* libraries. Ignored when a schema or a schema allowlist is set.'),
@@ -655,7 +1081,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: 'Find columns by name or description text across libraries. Matches COLUMN_NAME, SYSTEM_COLUMN_NAME, and COLUMN_TEXT. Use * as a wildcard. When a schema allowlist is configured, only those libraries are searched. Otherwise system libraries (Q* and SYS*) are skipped unless include_system is true.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           filter: z.string().describe('Name or text to match. Use * as a wildcard. Example: "ITEM*" matches columns starting with ITEM'),
           schema: z.string().optional().describe('Limit the search to one library. Must be in the schema allowlist when one is configured.'),
           include_system: z.boolean().optional().describe('Include Q* and SYS* libraries. Ignored when a schema or a schema allowlist is set.'),
@@ -686,7 +1112,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: `Get detailed column information for a specific table including data types, lengths, nullability, defaults, and CCSID. ${SCHEMA_DEFAULT_HINT}`,
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) name containing the table. ${SCHEMA_DEFAULT_HINT}`),
           table: z.string().describe('Table name to describe'),
         }),
@@ -713,7 +1139,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: `List all views in a schema (library). ${SCHEMA_DEFAULT_HINT} Optionally filter by name pattern using * as wildcard.`,
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) name to list views from. ${SCHEMA_DEFAULT_HINT}`),
           filter: z.string().optional().describe('Filter pattern for view names. Use * as wildcard.'),
         }),
@@ -740,7 +1166,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: `List all indexes for a specific table including uniqueness and column information. ${SCHEMA_DEFAULT_HINT}`,
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) name containing the table. ${SCHEMA_DEFAULT_HINT}`),
           table: z.string().describe('Table name to list indexes for'),
         }),
@@ -767,7 +1193,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: `Get all constraints (primary keys, foreign keys, unique constraints) for a specific table. ${SCHEMA_DEFAULT_HINT}`,
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) name containing the table. ${SCHEMA_DEFAULT_HINT}`),
           table: z.string().describe('Table name to get constraints for'),
         }),
@@ -786,6 +1212,68 @@ export function createServer(sessionContext?: SessionContext): McpServer {
     );
   }
 
+  if (enabledTools.has('list_routines')) {
+    server.registerTool(
+      'list_routines',
+      {
+        title: 'List Routines',
+        description: `List SQL procedures and functions in a library from QSYS2.SYSROUTINES, one row per specific routine, so overloads appear once each. Shows the type (procedure, scalar function, or table function), language, external program, SQL data access, result sets, and text. Use describe_routine for parameters and a call template. ${SCHEMA_DEFAULT_HINT}`,
+        annotations: READ_ONLY_ANNOTATIONS,
+        inputSchema: z.object({
+          ...common,
+          schema: z.string().optional().describe(`Schema (library) to list routines in. ${SCHEMA_DEFAULT_HINT}`),
+          filter: z.string().optional().describe('Filter routine names. Use * as wildcard, e.g. "GET*". Without a wildcard, matches names containing the text.'),
+          type: z.enum(['PROCEDURE', 'FUNCTION']).optional().describe('Only procedures or only functions. Omit for both.'),
+          limit: z.number().int().positive().optional().describe('Maximum routines to return. Capped by QUERY_MAX_LIMIT.'),
+        }),
+        outputSchema: listRoutinesOutputSchema,
+      },
+      withToolHandler(
+        (args, target) => listRoutinesTool({
+          schema: args.schema,
+          filter: args.filter,
+          type: args.type,
+          limit: args.limit,
+          target,
+          defaultSchema: target.defaultSchema,
+        }),
+        'Failed to list routines',
+        sessionContext,
+        argsAudit('list_routines'),
+      )
+    );
+  }
+
+  if (enabledTools.has('describe_routine')) {
+    server.registerTool(
+      'describe_routine',
+      {
+        title: 'Describe Routine',
+        description: `Describe an SQL procedure or function from QSYS2.SYSPARMS: parameters in order with mode, data type, and default; the return value of a scalar function; and the result columns of a table function. An overloaded name returns every overload unless specific_name picks one. call_template is a statement with a ? marker per parameter. callable_with_execute_query says whether execute_query can run it: procedures (CALL) and functions that modify SQL data cannot, and note says why. ${SCHEMA_DEFAULT_HINT}`,
+        annotations: READ_ONLY_ANNOTATIONS,
+        inputSchema: z.object({
+          ...common,
+          schema: z.string().optional().describe(`Schema (library) containing the routine. ${SCHEMA_DEFAULT_HINT}`),
+          name: z.string().optional().describe('Routine name. Required unless specific_name is given.'),
+          specific_name: z.string().optional().describe('Specific name of one overload, from list_routines.'),
+        }),
+        outputSchema: describeRoutineOutputSchema,
+      },
+      withToolHandler(
+        (args, target) => describeRoutineTool({
+          schema: args.schema,
+          name: args.name,
+          specificName: args.specific_name,
+          target,
+          defaultSchema: target.defaultSchema,
+        }),
+        'Failed to describe routine',
+        sessionContext,
+        argsAudit('describe_routine'),
+      )
+    );
+  }
+
   if (enabledTools.has('validate_query')) {
     server.registerTool(
       'validate_query',
@@ -794,7 +1282,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: 'Check a SQL statement without running it. Parses it with QSYS2.PARSE_STATEMENT and checks that referenced tables, columns, and qualified routines exist in the catalog. Also reports read-only and schema-allowlist findings.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           sql: z.string().describe('SQL statement to validate. It is not executed.'),
         }),
         outputSchema: validateQueryOutputSchema,
@@ -820,7 +1308,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: 'Return the SQL DDL that recreates a database object, using QSYS2.GENERATE_SQL. Does not run the generated statements. Requires IBM i 7.3 or later.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) that contains the object. ${SCHEMA_DEFAULT_HINT}`),
           object: z.string().describe('Object name'),
           type: z.enum(SQL_OBJECT_TYPES).describe('Object type: TABLE, VIEW, INDEX, ALIAS, TRIGGER, FUNCTION, PROCEDURE, or SEQUENCE'),
@@ -850,7 +1338,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: 'List views, indexes, triggers, and other objects that depend on a table, using SYSTOOLS.RELATED_OBJECTS. Requires IBM i 7.3 Technology Refresh 9, IBM i 7.4 Technology Refresh 3, or a later release.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) that contains the table. ${SCHEMA_DEFAULT_HINT}`),
           table: z.string().describe('Table name'),
         }),
@@ -878,7 +1366,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: 'List the physical data files in a library with their journal, journal library, journal images, omitted entries, and whether they have a primary key, using QSYS2.OBJECT_STATISTICS. needs_attention is true when a table is not journaled, or has no primary key and does not journal both images, which journal-based replication tools need. Requires IBM i 7.3 Technology Refresh 2 or later.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) to inspect. ${SCHEMA_DEFAULT_HINT}`),
           filter: z.string().optional().describe('Filter pattern for table names. Use * as wildcard. Example: "ORDER*" matches tables starting with ORDER'),
           limit: z.number().int().positive().optional().describe('Maximum rows to return. Capped by QUERY_MAX_LIMIT.'),
@@ -900,6 +1388,71 @@ export function createServer(sessionContext?: SessionContext): McpServer {
     );
   }
 
+  if (enabledTools.has('search_ibmi_services')) {
+    server.registerTool(
+      'search_ibmi_services',
+      {
+        title: 'Search IBM i Services',
+        description: 'Find IBM i SQL services (views, table functions, procedures, and more in QSYS2 and SYSTOOLS) in the catalog QSYS2.SERVICES_INFO, with the release that added each one and an example query. Call it before writing SQL that uses an IBM i service, instead of guessing names and parameters. With no query and no category, it lists the categories with a count each. This tool only reads the catalog. Running an example with execute_query still needs the IBM i authority the service documents and, when QUERY_ALLOWED_SCHEMAS is set, the service\'s schema in that list. Table functions must be qualified, as in TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => \'NONE\')), with plain values as arguments.',
+        annotations: READ_ONLY_ANNOTATIONS,
+        inputSchema: z.object({
+          ...common,
+          query: z.string().optional().describe('Keywords, all of which must appear in the service name or category (case-insensitive). Example: "journal entries"'),
+          category: z.string().optional().describe('Exact category, such as JOURNAL, SECURITY, or WORK MANAGEMENT. Call with no arguments to list them.'),
+          include_example: z.boolean().optional().describe('Include the example query for each service. Default true.'),
+          search_examples: z.boolean().optional().describe('Also match keywords against the example queries. Default false.'),
+          limit: z.number().int().positive().optional().describe('Maximum services to return. Capped by QUERY_MAX_LIMIT.'),
+        }),
+        outputSchema: servicesOutputSchema,
+      },
+      withToolHandler(
+        (args, target) => searchIbmiServicesTool({
+          query: args.query,
+          category: args.category,
+          includeExample: args.include_example,
+          searchExamples: args.search_examples,
+          limit: args.limit,
+          target,
+        }),
+        'Failed to search IBM i services',
+        sessionContext,
+        argsAudit('search_ibmi_services'),
+      )
+    );
+  }
+
+  if (enabledTools.has('index_advice')) {
+    server.registerTool(
+      'index_advice',
+      {
+        title: 'Index Advice',
+        description: 'List the indexes the query optimizer asked for on the tables of a library, from the IBM i index advisor (QSYS2.SYSIXADV). Rows with the same table, key columns, and index type are merged into one, with counts summed and reason codes described. Sorted by mti_used, then times_advised: advice where the optimizer kept building and reusing a maintained temporary index (MTI) is the strongest signal. key_columns are in CREATE INDEX order and can end in DESC. last_advised and since are in the system\'s local time. This tool only reads the advice; it does not create indexes.',
+        annotations: READ_ONLY_ANNOTATIONS,
+        inputSchema: z.object({
+          ...common,
+          schema: z.string().optional().describe(`Schema (library) whose tables to read advice for. ${SCHEMA_DEFAULT_HINT}`),
+          table: z.string().optional().describe('Table name. Omit for every table in the library.'),
+          since: z.string().optional().describe('Only advice last given on or after this date or timestamp, in the IBM i system\'s local time with no time zone. Example: "2026-01-31" or "2026-01-31 08:00:00"'),
+          limit: z.number().int().positive().optional().describe('Maximum rows to return. Capped by QUERY_MAX_LIMIT.'),
+        }),
+        outputSchema: indexAdviceOutputSchema,
+      },
+      withToolHandler(
+        (args, target) => indexAdviceTool({
+          schema: args.schema,
+          table: args.table,
+          since: args.since,
+          limit: args.limit,
+          target,
+          defaultSchema: target.defaultSchema,
+        }),
+        'Failed to read index advice',
+        sessionContext,
+        argsAudit('index_advice'),
+      )
+    );
+  }
+
   if (enabledTools.has('profile_table')) {
     server.registerTool(
       'profile_table',
@@ -908,13 +1461,14 @@ export function createServer(sessionContext?: SessionContext): McpServer {
         description: `Profile a table for ETL work: row count, deleted rows, size, and last change from QSYS2.SYSTABLESTAT, plus per-column distinct count, null count, and low and high values. By default column numbers come from stored statistics in QSYS2.SYSCOLUMNSTAT (low and high are the second-lowest and second-highest values), and columns without collected statistics report source "none". Set compute to true to scan the table for exact numbers on up to ${MAX_COMPUTED_COLUMNS} columns. Masked columns keep their counts and return no values.`,
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
-          ...system,
+          ...common,
           schema: z.string().optional().describe(`Schema (library) that contains the table. ${SCHEMA_DEFAULT_HINT}`),
           table: z.string().describe('Table name'),
           compute: z.boolean().optional().describe('Scan the table for exact counts, MIN, and MAX. Slower on large tables. Default false.'),
           columns: z.array(z.string()).optional().describe(`Columns to profile. Defaults to every column (the first ${MAX_COMPUTED_COLUMNS} when compute is true).`),
         }),
         outputSchema: profileTableOutputSchema,
+        _meta: resultViewMeta(),
       },
       withToolHandler(
         (args, target) => profileTableTool({
@@ -940,9 +1494,10 @@ export function createServer(sessionContext?: SessionContext): McpServer {
       'get_business_context',
       {
         title: 'Get Business Context',
-        description: 'List business entities, table and column descriptions, and relations that the catalog does not declare as foreign keys. Filter by entity or table. Omit both to return every annotation loaded from MCP_CUSTOM_TOOLS.',
+        description: 'List business entities, row filters most queries need (such as leaving out deleted rows), table and column descriptions, and relations that the catalog does not declare as foreign keys. Filter by entity or table. Omit both to return every annotation loaded from MCP_CUSTOM_TOOLS. An unknown entity name falls back to names that partly match it, and when nothing matches, the result lists the loaded entity names.',
         annotations: READ_ONLY_ANNOTATIONS,
         inputSchema: z.object({
+          ...contextShape(),
           entity: z.string().optional().describe('Entity name, for example sales_order'),
           table: z.string().optional().describe('Table name, or SCHEMA.TABLE'),
         }),
@@ -962,7 +1517,7 @@ export function createServer(sessionContext?: SessionContext): McpServer {
 
   const customRegistrations = new Map<string, LiveCustomTool>();
   for (const tool of loadedTools.tools) {
-    if (!enabledTools.has(tool.name) || !customToolReachable(tool, sessionContext)) {
+    if (!sessionTools.has(tool.name)) {
       continue;
     }
     customRegistrations.set(tool.name, registerCustomTool(server, tool, sessionContext));
@@ -972,10 +1527,14 @@ export function createServer(sessionContext?: SessionContext): McpServer {
     tools: customRegistrations,
     sessionContext,
     listsAnnotatedTables: enabledTools.has('describe_table'),
+    sqlTools,
   });
 
   registerResources(server, enabledTools, sessionContext);
   registerPrompts(server, enabledTools, sessionContext);
+  if (sessionTools.has('execute_query') || sessionTools.has('profile_table') || customRegistrations.size > 0) {
+    registerResultView(server);
+  }
 
   return server;
 }
@@ -991,6 +1550,14 @@ interface LiveCustomTools {
   sessionContext?: SessionContext;
   /** resources/list offers the annotated tables, so a reload changes it. */
   listsAnnotatedTables: boolean;
+  /** Built-in tools that run ad-hoc SQL. Their descriptions end with the business context hint. */
+  sqlTools: SqlToolDescription[];
+}
+
+interface SqlToolDescription {
+  registered: RegisteredTool;
+  /** Description without the business context hint. */
+  description: string;
 }
 
 const liveCustomTools = new WeakMap<McpServer, LiveCustomTools>();
@@ -1041,9 +1608,10 @@ function syncOneServer(
   loaded: LoadedCustomTools,
   enabled: ReadonlySet<string>,
 ): void {
+  const sessionTools = sessionToolNames(loaded, enabled, live.sessionContext);
   const next = new Map(
     loaded.tools
-      .filter((tool) => enabled.has(tool.name) && customToolReachable(tool, live.sessionContext))
+      .filter((tool) => sessionTools.has(tool.name))
       .map((tool) => [tool.name, tool])
   );
 
@@ -1068,10 +1636,37 @@ function syncOneServer(
       title: tool.title,
       description: tool.description,
       paramsSchema: customToolInputSchema(tool, live.sessionContext),
+      _meta: customToolMeta(tool),
       callback: customToolCallback(tool, live.sessionContext),
     });
     current.signature = signature;
   }
+
+  const hint = businessContextHint(loaded, sessionTools);
+  for (const sqlTool of live.sqlTools) {
+    const description = sqlTool.description + hint;
+    if (sqlTool.registered.description !== description) {
+      sqlTool.registered.update({ description });
+    }
+  }
+}
+
+/**
+ * Tool names a session registers: the enabled built-ins, and the enabled
+ * business tools it can reach.
+ */
+function sessionToolNames(
+  loaded: LoadedCustomTools,
+  enabled: ReadonlySet<string>,
+  sessionContext: SessionContext | undefined,
+): Set<string> {
+  const names = new Set(enabled);
+  for (const tool of loaded.tools) {
+    if (!customToolReachable(tool, sessionContext)) {
+      names.delete(tool.name);
+    }
+  }
+  return names;
 }
 
 /**
@@ -1083,14 +1678,28 @@ function customToolReachable(tool: StoredTool, sessionContext: SessionContext | 
 
 /**
  * The tool's parameters, plus `system` when it is not fixed to one, the caller
- * can reach several, and no parameter already uses that name.
+ * can reach several, and no parameter already uses that name. The intent
+ * `context` argument is added the same way, unless a parameter is named `context`.
  */
 function customToolInputSchema(tool: StoredTool, sessionContext: SessionContext | undefined) {
   const params = inputSchemaFor(tool.parameters);
-  if (tool.system || 'system' in tool.parameters) {
-    return params;
-  }
-  return params.extend(systemShape(sessionContext));
+  const system = tool.system || 'system' in tool.parameters ? {} : systemShape(sessionContext);
+  const context = 'context' in tool.parameters ? {} : contextShape();
+  return params.extend({ ...system, ...context });
+}
+
+/** `_meta` key on business tools in `tools/list`, so clients can tell them from built-in tools. */
+export const TOOL_META_KEY = 'db2i-mcp/tool';
+
+/**
+ * Tool `_meta` for a business tool: its kind and YAML toolset. Built-in tools
+ * carry no such entry.
+ */
+export function customToolMeta(tool: StoredTool): Record<string, unknown> {
+  return {
+    [TOOL_META_KEY]: { kind: 'business', ...(tool.toolset ? { toolset: tool.toolset } : {}) },
+    ...resultViewMeta(),
+  };
 }
 
 function registerCustomTool(
@@ -1106,6 +1715,7 @@ function registerCustomTool(
       annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: customToolInputSchema(tool, sessionContext),
       outputSchema: queryOutputSchema,
+      _meta: customToolMeta(tool),
     },
     customToolCallback(tool, sessionContext),
   );
@@ -1129,6 +1739,7 @@ function customToolCallback(
         const bound = bindCustomToolArgs(tool, withoutSystemArg(tool, args));
         return { sql: tool.sql, params: bound.ok ? bound.params : [] };
       },
+      ownsContext: 'context' in tool.parameters,
     },
     (args) => customToolSystem(tool, args),
   );
@@ -1158,10 +1769,12 @@ function withoutSystemArg(tool: StoredTool, args: unknown): Record<string, unkno
 function toolSignature(tool: StoredTool): string {
   return JSON.stringify({
     title: tool.title,
+    toolset: tool.toolset ?? null,
     description: tool.description,
     parameters: tool.parameters,
     sql: tool.sql,
     maxRows: tool.maxRows ?? null,
     system: tool.system ?? null,
+    chart: tool.chart ?? null,
   });
 }

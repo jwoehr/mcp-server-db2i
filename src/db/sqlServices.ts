@@ -1,15 +1,17 @@
 /**
  * IBM i SQL services used by validate_query, get_object_ddl, get_related_objects,
- * and get_journal_info.
+ * get_journal_info, and search_ibmi_services.
  *
  * PARSE_STATEMENT, RELATED_OBJECTS, and OBJECT_STATISTICS run on the read-only query pool.
  * GENERATE_SQL runs on the procedure pool because a read-only connection rejects it.
  */
 
-import { executeProcedure, executeQuery } from './connection.js';
+import { executeProcedure, executeQuery, explainUnparsedStatement } from './connection.js';
+import type { SqlErrorDetails } from './sqlErrorInfo.js';
 import type { DbTarget } from '../systems.js';
 import { filterToLikePattern } from './queries.js';
 import { isSchemaAllowed } from '../utils/security/schemaAllowlist.js';
+import { unqualifiedTableFunctions } from '../utils/security/sqlSecurityValidator.js';
 
 export const SQL_OBJECT_TYPES = [
   'TABLE',
@@ -64,6 +66,10 @@ export interface StatementInspection {
   missingColumns: string[];
   missingRoutines: string[];
   violations: string[];
+  /** The PARSE_STATEMENT rows, for checks that read more than names. Empty when not parsed. */
+  names: ParsedName[];
+  /** Db2's SQLSTATE, SQLCODE, cause and recovery when the statement did not parse and a prepare found them. */
+  parseError?: SqlErrorDetails;
 }
 
 export interface InspectOptions {
@@ -74,7 +80,7 @@ export interface InspectOptions {
   allowedSchemas?: string[];
 }
 
-interface TableRef {
+export interface TableRef {
   schema: string;
   table: string;
 }
@@ -128,8 +134,58 @@ function requireSqlName(value: string, label: string): string {
   return name;
 }
 
+/** The statement text sent to PARSE_STATEMENT: trimmed, without a trailing semicolon. */
+function statementForParse(sql: string): string {
+  const trimmed = sql.trim();
+  return trimmed.endsWith(';') ? trimmed.slice(0, -1).trimEnd() : trimmed;
+}
+
+/** Generic reason when PARSE_STATEMENT returns no rows and Db2 gives none either. */
+export const STATEMENT_NOT_PARSED =
+  'The statement could not be parsed. Fix the SQL, or set QUERY_PARSE_CHECK=false to skip this check.';
+
+/** When Db2 prepares a statement that PARSE_STATEMENT cannot parse, such as one that starts with VALUES. */
+export const STATEMENT_ACCEPTED_NOT_PARSED =
+  'QSYS2.PARSE_STATEMENT could not parse the statement, although Db2 accepts it, so the parse check cannot tell ' +
+  'what it reads. Write it as a SELECT: for example SELECT * FROM (VALUES 1, 2) AS V (N) instead of VALUES 1, 2.';
+
+/** Why a statement PARSE_STATEMENT returned no rows for was rejected. */
+export interface ParseFailure {
+  /** The error message for the tool result. */
+  error: string;
+  /** SQLSTATE, SQLCODE, cause and recovery from Db2, when the prepare found them. */
+  details: SqlErrorDetails;
+}
+
+/**
+ * The reason for a statement PARSE_STATEMENT returned no rows for. The statement
+ * is prepared without running, and Db2's error is returned when there is one, as
+ * in `The statement could not be parsed: [42000] SQL0104 - Token EXISTS was not valid.`
+ * Otherwise the generic message, for example on JT400, which cannot prepare alone.
+ *
+ * @param sql - A statement that already passed the SQL validator
+ * @param target - Caller and system
+ */
+export async function explainParseFailure(sql: string, target?: DbTarget): Promise<ParseFailure> {
+  const reason = await explainUnparsedStatement(statementForParse(sql), target);
+  if (!reason) {
+    return { error: STATEMENT_NOT_PARSED, details: {} };
+  }
+  if ('accepted' in reason) {
+    return { error: STATEMENT_ACCEPTED_NOT_PARSED, details: {} };
+  }
+  return {
+    error: `The statement could not be parsed: ${reason.message} The statement was prepared to find this reason and was not run.`,
+    details: reason.details,
+  };
+}
+
+/**
+ * Parse a statement with QSYS2.PARSE_STATEMENT. A trailing semicolon is removed first:
+ * PARSE_STATEMENT returns no rows for `SELECT ...;`, and the statement runs without it.
+ */
 export async function parseStatement(sql: string, target?: DbTarget): Promise<ParsedName[]> {
-  const result = await executeQuery(PARSE_SQL, [sql], target);
+  const result = await executeQuery(PARSE_SQL, [statementForParse(sql)], target);
   return result.rows.map((row) => ({
     nameType: cell(row.NAME_TYPE) ?? '',
     schema: cell(row.SCHEMA),
@@ -137,6 +193,31 @@ export async function parseStatement(sql: string, target?: DbTarget): Promise<Pa
     columnName: cell(row.COLUMN_NAME),
     statementType: cell(row.SQL_STATEMENT_TYPE),
   }));
+}
+
+/**
+ * Column names of a table, both SQL and system names, uppercased. Null when the
+ * table is not in the catalog or the user cannot see it.
+ */
+export async function tableColumnNames(schema: string, table: string, target?: DbTarget): Promise<Set<string> | null> {
+  const result = await executeQuery(
+    `SELECT COLUMN_NAME, SYSTEM_COLUMN_NAME FROM QSYS2.SYSCOLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+    [schema.trim().toUpperCase(), table.trim().toUpperCase()],
+    target
+  );
+  if (result.rows.length === 0) {
+    return null;
+  }
+  const names = new Set<string>();
+  for (const row of result.rows) {
+    for (const value of [row.COLUMN_NAME, row.SYSTEM_COLUMN_NAME]) {
+      const name = cell(value);
+      if (name) {
+        names.add(name.toUpperCase());
+      }
+    }
+  }
+  return names;
 }
 
 export async function hasRoutine(schema: string, name: string, target?: DbTarget): Promise<boolean> {
@@ -160,12 +241,118 @@ export async function hasRoutine(schema: string, name: string, target?: DbTarget
   return found;
 }
 
-function allowlistViolation(kind: 'Table' | 'Routine', schema: string, name: string, allowed: string[]): string {
+function allowlistViolation(kind: 'Table' | 'Routine' | 'Sequence' | 'Type', schema: string, name: string, allowed: string[]): string {
   return `${kind} ${schema}.${name} is not in the allowed schemas (${allowed.join(', ')}).`;
 }
 
 function unresolvedTable(table: string): string {
   return `Unqualified table ${table} has no default schema. Set DB2I_SCHEMA (or schema in the profile), or qualify the table with a library.`;
+}
+
+/** Tables and qualified routines a parsed statement uses, and the ones the allowlist refuses. */
+export interface ParsedSchemaCheck {
+  /** Allowlist violations and unqualified tables with no default schema. */
+  violations: string[];
+  /** Tables, views and aliases inside the allowlist, each once. */
+  tables: TableRef[];
+  /** Qualified routines inside the allowlist, each once. */
+  routines: Array<{ schema: string; name: string }>;
+}
+
+/**
+ * Check the tables and routines in PARSE_STATEMENT rows against the schema allowlist.
+ *
+ * IBM i lists every table, view and alias the statement reads, including those in
+ * subqueries, LATERAL, EXISTS and TABLE() arguments, and never lists CTE names.
+ * An unqualified table resolves to the default schema. Unqualified routines are
+ * built-ins (UPPER, COALESCE) and are skipped. Column rows are not needed: a column
+ * belongs to a table that is listed on its own row.
+ *
+ * @param parsed - Rows from parseStatement
+ * @param options - Uppercased allowlist (unset means no restriction) and the default schema
+ * @returns Violations, and the tables and routines that passed
+ */
+export function checkParsedSchemas(
+  parsed: readonly ParsedName[],
+  options: { allowed?: readonly string[]; defaultSchema?: string; sql?: string }
+): ParsedSchemaCheck {
+  const allowed = options.allowed ? [...options.allowed] : undefined;
+  const defaultSchema = options.defaultSchema?.trim().toUpperCase() || undefined;
+  const violations: string[] = [];
+
+  // PARSE_STATEMENT returns an unqualified table function with no schema, the same as a
+  // built-in such as UPPER. It resolves through the SQL path, which includes QSYS2, so it
+  // could read any library (DISPLAY_JOURNAL, IFS_READ). Require a library for table functions.
+  if (allowed && options.sql) {
+    for (const name of unqualifiedTableFunctions(options.sql)) {
+      violations.push(
+        `Table function ${name} is not qualified with a library, so the allowed schemas cannot be checked. ` +
+          'Qualify it, for example TABLE(QSYS2.ACTIVE_JOB_INFO(...)).'
+      );
+    }
+  }
+
+  // Sequences and user-defined types live in a library too
+  for (const row of parsed) {
+    if (!allowed || !row.name) {
+      continue;
+    }
+    if (row.nameType === 'SEQUENCE') {
+      const schema = row.schema ?? defaultSchema;
+      if (!schema || !isSchemaAllowed(schema, allowed)) {
+        violations.push(schema ? allowlistViolation('Sequence', schema, row.name, allowed) : unresolvedTable(row.name));
+      }
+    } else if (row.nameType === 'TYPE' && row.schema && !isSchemaAllowed(row.schema, allowed)) {
+      violations.push(allowlistViolation('Type', row.schema, row.name, allowed));
+    }
+  }
+
+  const tables: TableRef[] = [];
+  const seenTables = new Set<string>();
+  for (const row of parsed) {
+    if (!TABLE_NAME_TYPES.has(row.nameType) || !row.name) {
+      continue;
+    }
+    const schema = row.schema ?? defaultSchema;
+    if (!schema) {
+      violations.push(unresolvedTable(row.name));
+      continue;
+    }
+    if (allowed && !isSchemaAllowed(schema, allowed)) {
+      violations.push(allowlistViolation('Table', schema, row.name, allowed));
+      continue;
+    }
+    const key = `${schema}.${row.name}`;
+    if (seenTables.has(key)) {
+      continue;
+    }
+    seenTables.add(key);
+    tables.push({ schema, table: row.name });
+  }
+
+  const routines: Array<{ schema: string; name: string }> = [];
+  const seenRoutines = new Set<string>();
+  for (const row of parsed) {
+    if (!ROUTINE_NAME_TYPES.has(row.nameType) || !row.name) {
+      continue;
+    }
+    // Unqualified functions are built-ins (UPPER, COALESCE). Skip them.
+    if (!row.schema) {
+      continue;
+    }
+    if (allowed && !isSchemaAllowed(row.schema, allowed)) {
+      violations.push(allowlistViolation('Routine', row.schema, row.name, allowed));
+      continue;
+    }
+    const key = `${row.schema}.${row.name}`;
+    if (seenRoutines.has(key)) {
+      continue;
+    }
+    seenRoutines.add(key);
+    routines.push({ schema: row.schema, name: row.name });
+  }
+
+  return { violations: [...new Set(violations)], tables, routines };
 }
 
 async function lookupPairs(
@@ -199,13 +386,17 @@ async function lookupPairs(
 export async function inspectStatement(sql: string, options: InspectOptions = {}): Promise<StatementInspection> {
   const parsed = await parseStatement(sql, options.target);
   if (parsed.length === 0) {
+    const failure = await explainParseFailure(sql, options.target);
+    const hasReason = Object.keys(failure.details).length > 0;
     return {
       parsed: false,
       statementType: null,
       missingTables: [],
       missingColumns: [],
       missingRoutines: [],
-      violations: ['The statement could not be parsed.'],
+      violations: [hasReason ? failure.error : 'The statement could not be parsed.'],
+      names: [],
+      ...(hasReason ? { parseError: failure.details } : {}),
     };
   }
 
@@ -214,29 +405,9 @@ export async function inspectStatement(sql: string, options: InspectOptions = {}
   const defaultSchema = options.defaultSchema?.trim().toUpperCase() || undefined;
   const allowed = options.allowedSchemas;
 
-  const tables: TableRef[] = [];
-  const seenTables = new Set<string>();
-
-  for (const row of parsed) {
-    if (!TABLE_NAME_TYPES.has(row.nameType) || !row.name) {
-      continue;
-    }
-    const schema = row.schema ?? defaultSchema;
-    if (!schema) {
-      violations.push(unresolvedTable(row.name));
-      continue;
-    }
-    if (allowed && !isSchemaAllowed(schema, allowed)) {
-      violations.push(allowlistViolation('Table', schema, row.name, allowed));
-      continue;
-    }
-    const key = `${schema}.${row.name}`;
-    if (seenTables.has(key)) {
-      continue;
-    }
-    seenTables.add(key);
-    tables.push({ schema, table: row.name });
-  }
+  const names = checkParsedSchemas(parsed, { allowed, defaultSchema, sql });
+  violations.push(...names.violations);
+  const { tables, routines } = names;
 
   const specificColumns: ColumnRef[] = [];
   const seenColumns = new Set<string>();
@@ -274,27 +445,6 @@ export async function inspectStatement(sql: string, options: InspectOptions = {}
     looseColumns.clear();
   }
 
-  const routines: Array<{ schema: string; name: string }> = [];
-  const seenRoutines = new Set<string>();
-  for (const row of parsed) {
-    if (!ROUTINE_NAME_TYPES.has(row.nameType) || !row.name) {
-      continue;
-    }
-    // Unqualified functions are built-ins (UPPER, COALESCE). Skip them.
-    if (!row.schema) {
-      continue;
-    }
-    if (allowed && !isSchemaAllowed(row.schema, allowed)) {
-      violations.push(allowlistViolation('Routine', row.schema, row.name, allowed));
-      continue;
-    }
-    const key = `${row.schema}.${row.name}`;
-    if (seenRoutines.has(key)) {
-      continue;
-    }
-    seenRoutines.add(key);
-    routines.push({ schema: row.schema, name: row.name });
-  }
 
   const missingTables: string[] = [];
   const missingColumns: string[] = [];
@@ -367,6 +517,7 @@ export async function inspectStatement(sql: string, options: InspectOptions = {}
     missingColumns,
     missingRoutines,
     violations,
+    names: parsed,
   };
 }
 
@@ -445,6 +596,97 @@ export async function listRelatedObjects(
     system_name: textCell(row.SYSTEM_NAME),
     object_text: textCell(row.OBJECT_TEXT),
   }));
+}
+
+export const SERVICES_INFO_UNAVAILABLE =
+  'QSYS2.SERVICES_INFO is not available on this system. It ships with the Db2 for i PTF group; apply a current group to get it.';
+
+/** One row of QSYS2.SERVICES_INFO, the catalog of IBM i services. */
+export interface IbmiService {
+  service_name: string;
+  category: string;
+  schema: string;
+  sql_object_type: string | null;
+  system_object_name: string | null;
+  earliest_release: string | null;
+  initial_db2_group_level: number | null;
+  latest_db2_group_level: number | null;
+  example: string | null;
+}
+
+/** The catalog changes only when PTFs are applied, so an hour is fresh enough. */
+export const SERVICES_CACHE_TTL_MS = 60 * 60 * 1000;
+const SERVICES_CACHE_MAX_ENTRIES = 50;
+
+const servicesCache = new Map<string, { services: IbmiService[]; expires: number }>();
+
+export function clearServicesCache(): void {
+  servicesCache.clear();
+}
+
+/**
+ * True when the failure is QSYS2.SERVICES_INFO missing (SQL0204 on an older PTF level).
+ */
+export function isServicesInfoMissing(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /SERVICES_INFO/i.test(message) && (/\bSQL0204\b/.test(message) || /not found/i.test(message));
+}
+
+function intCell(value: unknown): number | null {
+  if (value == null || value === '') {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function exampleCell(value: unknown): string | null {
+  const text = textCell(value);
+  return text == null ? null : text.replace(/\r\n?/g, '\n');
+}
+
+/**
+ * Every row of QSYS2.SERVICES_INFO, cached per system and user for an hour.
+ * The whole view is about 400 rows, so callers filter in memory.
+ */
+export async function listServices(target?: DbTarget): Promise<IbmiService[]> {
+  // Same key as routineCache: not the pool key, which is the bearer token in required auth mode.
+  const key = `${target?.system ?? ''}|${target?.config.username ?? ''}`;
+  const now = Date.now();
+  const cached = servicesCache.get(key);
+  if (cached && cached.expires > now) {
+    return cached.services;
+  }
+
+  const result = await executeQuery(
+    `SELECT SERVICE_CATEGORY, SERVICE_SCHEMA_NAME, SERVICE_NAME, SQL_OBJECT_TYPE, SYSTEM_OBJECT_NAME,
+            EARLIEST_POSSIBLE_RELEASE, INITIAL_DB2_GROUP_LEVEL, LATEST_DB2_GROUP_LEVEL, EXAMPLE
+     FROM QSYS2.SERVICES_INFO`,
+    [],
+    target
+  );
+
+  const services = result.rows.map((row) => ({
+    service_name: textCell(row.SERVICE_NAME) ?? '',
+    category: textCell(row.SERVICE_CATEGORY) ?? '',
+    schema: textCell(row.SERVICE_SCHEMA_NAME) ?? '',
+    sql_object_type: textCell(row.SQL_OBJECT_TYPE),
+    system_object_name: textCell(row.SYSTEM_OBJECT_NAME),
+    earliest_release: textCell(row.EARLIEST_POSSIBLE_RELEASE),
+    initial_db2_group_level: intCell(row.INITIAL_DB2_GROUP_LEVEL),
+    latest_db2_group_level: intCell(row.LATEST_DB2_GROUP_LEVEL),
+    example: exampleCell(row.EXAMPLE),
+  }));
+
+  servicesCache.delete(key);
+  if (servicesCache.size >= SERVICES_CACHE_MAX_ENTRIES) {
+    const oldest = servicesCache.keys().next().value;
+    if (oldest !== undefined) {
+      servicesCache.delete(oldest);
+    }
+  }
+  servicesCache.set(key, { services, expires: now + SERVICES_CACHE_TTL_MS });
+  return services;
 }
 
 export const JOURNAL_INFO_UNAVAILABLE =

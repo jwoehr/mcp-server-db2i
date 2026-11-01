@@ -1,4 +1,7 @@
-# Development Guide
+---
+title: "Development"
+description: "Set up a development environment, run the tests, and add a tool."
+---
 
 This guide covers setting up a development environment and contributing to mcp-server-db2i.
 
@@ -56,7 +59,8 @@ This uses `tsx` to run TypeScript directly. It does not restart on changes.
 | Script | Description |
 |--------|-------------|
 | `npm run dev` | Run the TypeScript source with `tsx` |
-| `npm run build` | Compile TypeScript to JavaScript |
+| `npm run build` | Build the result view, then compile TypeScript to JavaScript |
+| `npm run build:ui` | Build the result view only (`ui/result` to `src/ui/resultHtml.generated.ts`). `dev`, `test` and `typecheck` run it first |
 | `npm start` | Run production build |
 | `npm test` | Run tests |
 | `npm run test:watch` | Run tests in watch mode |
@@ -83,15 +87,22 @@ mcp-server-db2i/
 │   │   ├── driver.ts      # Driver interface
 │   │   ├── drivers/       # jt400, odbc and mapepire implementations
 │   │   ├── queries.ts     # Catalog queries
+│   │   ├── sqlErrorInfo.ts # Cause and recovery for failed statements
+│   │   ├── indexAdvice.ts # index_advice from SYSIXADV
+│   │   ├── routines.ts    # list_routines and describe_routine from SYSROUTINES and SYSPARMS
 │   │   ├── profile.ts     # profile_table statistics
 │   │   └── sqlServices.ts # PARSE_STATEMENT, GENERATE_SQL, RELATED_OBJECTS
 │   ├── customTools/       # YAML business SQL tools, annotations, masking, file watch
 │   ├── tools/             # MCP tools
 │   │   ├── query.ts       # execute_query
 │   │   ├── sqlLimit.ts    # FETCH FIRST row cap
+│   │   ├── unknownColumnHint.ts # describe_table hint for SQLCODE -206
 │   │   ├── metadata.ts    # Schema, table, and catalog search tools
+│   │   ├── indexAdvice.ts # index_advice
+│   │   ├── routines.ts    # list_routines, describe_routine
 │   │   ├── profile.ts     # profile_table
 │   │   └── sqlServices.ts # validate_query, DDL, related objects, journals
+│   ├── ui/                # Result view: chart hints, result columns, ui://db2i/result
 │   ├── transports/        # HTTP transport
 │   │   ├── http.ts        # Express server and /auth
 │   │   ├── sessionAuth.ts # Session key per auth mode
@@ -102,6 +113,8 @@ mcp-server-db2i/
 │       ├── formatResult.ts # json, pretty, and markdown tool text
 │       ├── rateLimiter.ts # Rate limiting
 │       └── security/      # SQL validation and schema allowlist
+├── ui/result/             # Result view page (MCP Apps): grid and Chart.js charts
+├── scripts/build-ui.mjs   # Bundles ui/result into one HTML file for the server
 ├── tests/                 # Unit and integration tests (no IBM i needed)
 ├── examples/              # Business SQL tools and a profiles file
 ├── docs/                  # Documentation
@@ -140,6 +153,22 @@ The tests in `tests/integration/` run the MCP server end to end over an in-memor
 npm run test -- tests/integration/
 ```
 
+### Db2 for i statement corpus
+
+`tests/fixtures/db2iSqlCorpus.ts` lists Db2 for i statements the way assistants write them. Each entry says what the SQL validator must decide and what the schema allowlist must decide, both from the JavaScript parser and from the names IBM i's own parser returns. `tests/fixtures/parseStatementRows.ts` holds the `QSYS2.PARSE_STATEMENT` rows recorded for every entry, so `npm test` checks the allowlist without an IBM i. `tests/db2iSqlCorpus.test.ts` runs every entry through the validator, both allowlist paths and the row limit.
+
+When a deployment rejects SQL that Db2 for i accepts, add the statement here instead of fixing one construct on its own. The audit log says which check refused it in `rejectedBy`: `validator`, `allowlist`, `parse_check` or `masking` are the server's own checks, and `db2` means Db2 itself found the statement invalid.
+
+1. Reduce the statement to the construct that failed, and rewrite it with generic names (`MYLIB`, `OUTSIDELIB`, `ORDERS`, `ORDERNO`). Never copy a library, table or column name from a real system.
+2. Add it to `DB2I_SQL_CORPUS` with the decisions it should get. Statements the validator must accept go with the other valid statements, and a library outside the list goes in the deny section.
+3. Record its `PARSE_STATEMENT` rows. This only parses; no statement runs:
+
+   ```bash
+   npm run build && npm run corpus:record
+   ```
+
+4. Run `npm test`, fix the check that gets it wrong, and keep the entry as the regression test.
+
 ## Validating tool files
 
 `validate-tools` runs the startup checks on YAML tool files and then exits. It does not open a database connection and does not need `DB2I_HOSTNAME`.
@@ -148,7 +177,7 @@ npm run test -- tests/integration/
 npx mcp-server-db2i validate-tools examples/erp-tools
 ```
 
-`QUERY_ALLOWED_SCHEMAS` and `DB2I_SCHEMA` are applied when they are set. `--connect` also runs each statement through `QSYS2.PARSE_STATEMENT` on `ibmi.example.com` (or whichever host `DB2I_HOSTNAME` names). That path needs credentials. A missing `PARSE_STATEMENT` is a failure.
+`QUERY_ALLOWED_SCHEMAS` and `DB2I_SCHEMA` are applied when they are set. `--connect` also runs each statement through `QSYS2.PARSE_STATEMENT` on `ibmi.example.com` (or whichever host `DB2I_HOSTNAME` names), and checks in `QSYS2.SYSCOLUMNS` that each annotation filter column exists. That path needs credentials. A missing `PARSE_STATEMENT` is a failure.
 
 ```bash
 npx mcp-server-db2i validate-tools --connect examples/erp-tools
@@ -217,7 +246,7 @@ export async function myTool(input: MyToolInput): Promise<{
 
 2. **Add the name** to `TOOL_NAMES` in `src/config.ts`, so `MCP_TOOLS_ENABLED` and `MCP_TOOLS_DISABLED` accept it.
 
-3. **Register the tool** in `createServer()` in `src/server.ts`. `withToolHandler` resolves the target system, applies the rate limit, writes the audit line, and formats the result:
+3. **Register the tool** in `createServer()` in `src/server.ts`. `withToolHandler` resolves the target system, applies the rate limit, writes the audit line, and formats the result. Spread `common` into the input schema: it adds the optional `system` argument and, with `MCP_TOOL_INTENT`, the `context` argument, which `withToolHandler` removes before your handler runs. When a failure has a known cause, set `errorKind` on the failed result so the audit line records it:
 
 ```typescript
 if (enabledTools.has('my_tool')) {
@@ -228,7 +257,7 @@ if (enabledTools.has('my_tool')) {
       description: 'Description of what this tool does',
       annotations: READ_ONLY_ANNOTATIONS,
       inputSchema: z.object({
-        ...system,
+        ...common,
         param1: z.string().describe('First parameter'),
         param2: z.number().optional().describe('Optional second parameter'),
       }),
@@ -259,6 +288,12 @@ describe('myTool', () => {
 });
 ```
 
+## Result View
+
+The result view is a small web page in `ui/result/`: `data.ts` reads the tool result and gives each column a role (measure, time or category), `select.ts` picks the chart, `build.ts` turns it into a Chart.js config in the brand theme (`theme.ts`), and `bridge.ts` speaks the MCP Apps protocol with the host over `postMessage`. `scripts/build-ui.mjs` bundles it with esbuild into one HTML file with no external requests and writes it to `src/ui/resultHtml.generated.ts`, which is not committed. `src/ui/resultView.ts` serves that HTML as `ui://db2i/result`.
+
+To make a row-returning tool use the view, spread `resultViewFields(result.columns, maskedColumns, chart)` into its result, add `columns` (and `chart`, `chartError`) to its output schema, and set `_meta: resultViewMeta()` on the tool. The pure modules are tested in `tests/ui/view.test.ts`. Keep the page under 400 KB; a test checks it.
+
 ## Database Layer
 
 ### Connection Pool
@@ -267,7 +302,28 @@ The `db/connection.ts` module manages connection pools. It does not know which d
 
 The `mapepire` driver keeps its own job pool (`JobPool`), which gets jobs from a `JobFactory`. Only the SSH factory exists today. A daemon transport would add a second factory and reuse the pool. `tests/db/mapepirePool.test.ts` tests the pool against a fake factory, and `db/drivers/sshHostKey.ts` holds the host key check.
 
-Pools:
+### Driver Errors
+
+When Db2 rejects a statement, a driver throws a `DbError` (`db/driver.ts`) instead of a plain `Error`. Its message keeps the `[SQLSTATE] text` shape, and it carries `sqlstate` and `sqlcode`:
+
+| Driver | Where the values come from |
+|--------|----------------------------|
+| `odbc` | The first diagnostic in `odbcErrors`: `state` and the native `code`. ODBC reports its own SQLSTATE mapping, such as `42S02` for `42704` |
+| `jt400` | `getSQLState()` and `getErrorCode()` of the Java `SQLException` behind node-jt400's error. If they cannot be read, the SQLCODE comes from the `[SQLnnnn]` message ID |
+| `mapepire` | The `message, SQLSTATE, SQLCODE` form mapepire-js reports |
+
+Other failures, such as a lost connection or a `QueryTimeoutError`, stay plain errors.
+
+`db/connection.ts` passes a `DbError` to `explainSqlError` in `db/sqlErrorInfo.ts`. It looks the SQLCODE up with `SYSTOOLS.SQLCODE_INFO` on the same pool, splits the second-level text into `cause` and `recovery`, and throws a `DatabaseQueryError` with those in `details`:
+
+- Each system and SQLCODE is looked up once and cached for the life of the process. A failed lookup is not cached, except when the function does not exist on that system; then the system is not asked again.
+- The lookup has a 5 second limit. If it fails for any reason, the error is reported as the driver gave it.
+- The second-level text keeps its `&1` placeholders. The first-level message in `error` has the values.
+- With the JDBC option `errors=full`, JT400 and Mapepire put the second-level text in the message, with the values filled in. That text is split instead, and no lookup runs.
+
+Tools spread `sqlErrorFields(error)` into their error result (`execute_query` and `export_query` pass it through `withUnknownColumnHint` in `tools/unknownColumnHint.ts` first, which puts a describe_table hint at the start of `recovery` for SQLCODE -206), and `withToolHandler` in `server.ts` returns `sqlstate`, `sqlcode`, `cause` and `recovery` in `structuredContent`, with cause and recovery also in the text. Rejections by the SQL validator, the schema allowlist or masking do not come from Db2 and carry none of these fields.
+
+### Pools
 
 - **Global pool**: For stdio transport
 - **Session pools**: For HTTP transport (per-authenticated user)

@@ -3,7 +3,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { checkQuerySchemas, isSchemaAllowed } from '../src/utils/security/schemaAllowlist.js';
+import {
+  checkQuerySchemas,
+  isSchemaAllowed,
+  normalizeForParsing,
+} from '../src/utils/security/schemaAllowlist.js';
 
 const allowed = ['MYLIB'];
 
@@ -70,12 +74,66 @@ describe('checkQuerySchemas', () => {
     const result = check('SELECT * FROM MYLIB/ORDERS');
     expect(result.ok).toBe(false);
     expect(result.violations[0]).toContain('could not be parsed');
+    expect(result.unparseable).toBe(true);
   });
 
-  it('should reject TABLE() table functions while the allowlist is active', () => {
-    const result = check('SELECT * FROM TABLE(QSYS2.ACTIVE_JOB_INFO()) X');
+  it('does not mark a library outside the list as unparseable', () => {
+    const result = check('SELECT ORDERNO FROM OUTSIDELIB.ORDERS');
     expect(result.ok).toBe(false);
-    expect(result.violations[0]).toContain('could not be parsed');
+    expect(result.unparseable).toBeUndefined();
+  });
+
+  describe('TABLE() table functions', () => {
+    const withQsys2 = (sql: string) =>
+      checkQuerySchemas(sql, { allowed: ['MYLIB', 'QSYS2'], defaultSchema: 'MYLIB' });
+
+    it('should check a qualified table function as a table in its library', () => {
+      const sql = "SELECT * FROM TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => 'NONE')) X";
+
+      expect(withQsys2(sql)).toEqual({ ok: true, violations: [] });
+      expect(check(sql).violations).toEqual([
+        'Table QSYS2.ACTIVE_JOB_INFO is not in the allowed schemas (MYLIB).',
+      ]);
+    });
+
+    it('should accept spacing, quoted names, markers and a join', () => {
+      expect(withQsys2(
+        "SELECT * FROM TABLE ( QSYS2 . OBJECT_STATISTICS ( 'QSYS' , '*LIB' ) ) AS X JOIN MYLIB.ORDERS O ON 1 = 1"
+      ).ok).toBe(true);
+      expect(withQsys2('SELECT * FROM TABLE("QSYS2"."SYSTEM_STATUS"(RESET_STATISTICS => ?)) X').ok).toBe(true);
+    });
+
+    it('should reject a table function from a library outside the allowlist', () => {
+      expect(withQsys2('SELECT * FROM TABLE(OTHERLIB.F()) X').violations).toEqual([
+        'Table OTHERLIB.F is not in the allowed schemas (MYLIB, QSYS2).',
+      ]);
+    });
+
+    it('should keep rejecting forms whose arguments could hide a library', () => {
+      for (const sql of [
+        'SELECT * FROM TABLE(MYLIB.F((SELECT A FROM OTHERLIB.T))) X',
+        'SELECT * FROM TABLE(MYLIB.F(OTHERLIB.G(1))) X',
+        'SELECT * FROM TABLE(QSYS2.ACTIVE_JOB_INFO()) X, TABLE(MYLIB.F(UPPER(1))) Y',
+      ]) {
+        const result = withQsys2(sql);
+        expect(result.ok, sql).toBe(false);
+        expect(result.violations[0]).toContain('could not be parsed');
+      }
+    });
+
+    it('should reject an unqualified table function, which resolves through the SQL path', () => {
+      const [message] = withQsys2('SELECT * FROM TABLE(ACTIVE_JOB_INFO()) X').violations;
+      expect(message).toContain('could not be parsed');
+      expect(message).toContain('not qualified with its library');
+    });
+
+    it('should not be fooled by literals and comments', () => {
+      expect(withQsys2(
+        "SELECT 'TABLE(OTHERLIB.F())' AS S FROM TABLE(QSYS2.F('a)b', 'c(d')) X -- TABLE(OTHERLIB.G())"
+      ).ok).toBe(true);
+      expect(withQsys2("SELECT * FROM TABLE(MYLIB.F('x')) X WHERE 'TABLE(' = 'y' AND 1 IN (SELECT 1 FROM OTHERLIB.T)")
+        .violations).toEqual(['Table OTHERLIB.T is not in the allowed schemas (MYLIB, QSYS2).']);
+    });
   });
 
   it('should not allow catalog schemas unless they are listed', () => {
@@ -84,6 +142,256 @@ describe('checkQuerySchemas', () => {
     });
     expect(result.ok).toBe(true);
     expect(check('SELECT * FROM QSYS2.SYSTABLES').ok).toBe(false);
+  });
+
+  it('should say what failed and where, then list the possible causes', () => {
+    const [message] = check('SELECT * FROM MYLIB/ORDERS').violations;
+    expect(message).toMatch(/^The query could not be parsed, so its libraries could not be checked/);
+    expect(message).toContain('near line 1: "/ORDERS"');
+    expect(message).toContain('system naming (LIB/FILE)');
+    expect(message).toContain('Db2 syntax the checker does not support yet');
+  });
+
+  it('should name what each grammar rejected when they stop at different problems', () => {
+    // The db2 grammar has no window frames; the mysql one reserves LINES.
+    const [message] = check(
+      'WITH C AS (\n' +
+      '  SELECT ORDERNO, SUM(QTY) OVER (PARTITION BY ITEMNO ORDER BY ORDERNO ROWS UNBOUNDED PRECEDING) AS CUM\n' +
+      '  FROM MYLIB.ORDERS\n' +
+      ')\n' +
+      'SELECT COUNT(*) AS LINES FROM C'
+    ).violations;
+    expect(message).toContain('(near line 2: "ROWS UNBOUNDED PRECEDING)"; ');
+    expect(message).toContain('alias "LINES" is a reserved word to the checker, so rename it)');
+    expect(check(
+      'WITH C AS (SELECT ORDERNO, SUM(QTY) OVER (PARTITION BY ITEMNO ORDER BY ORDERNO ROWS UNBOUNDED PRECEDING) AS CUM ' +
+      'FROM MYLIB.ORDERS) SELECT COUNT(*) AS NLINES FROM C'
+    ).ok).toBe(true);
+  });
+
+  it('should name the reserved alias even when it is the only failure reported', () => {
+    const [message] = check('SELECT ORDERNO AS KEY FROM MYLIB.ORDERS').violations;
+    expect(message).toContain('alias "KEY" is a reserved word to the checker, so rename it');
+  });
+
+  it('should give one position when both grammars stop at the same place', () => {
+    const [message] = check('SELECT * FROM MYLIB/ORDERS').violations;
+    expect(message.match(/near line/g)).toHaveLength(1);
+  });
+
+  describe('Db2 for i cast syntax', () => {
+    it.each([
+      'SELECT CAST(NOTE AS VARCHAR(60) CCSID 1208) FROM MYLIB.ORDERHDR',
+      'SELECT CAST(NOTE AS NVARCHAR(30)) FROM MYLIB.ORDERHDR',
+      'SELECT CAST(ITEMNO AS NCHAR(10)) FROM MYLIB.ORDERS',
+    ])('should accept %s and still check its library', (sql) => {
+      expect(check(sql).ok).toBe(true);
+      const outside = check(sql.replace('MYLIB.', 'OTHERLIB.'));
+      expect(outside.ok).toBe(false);
+      expect(outside.violations[0]).toMatch(/^Table OTHERLIB\./);
+    });
+
+    it.each([
+      'CHAR(10) CCSID 37',
+      'VARCHAR(10) FOR BIT DATA',
+      'CHAR(10) FOR SBCS DATA',
+      'NCLOB(1000)',
+      'CLOB(1M)',
+      'CLOB(64 K)',
+      'DBCLOB(100)',
+      'GRAPHIC(10) CCSID 1200',
+      'VARGRAPHIC(10)',
+      'DECFLOAT(34)',
+      'DECFLOAT',
+      'TIMESTAMP(12)',
+      'vargraphic(30) ccsid 1200',
+    ])('should accept a cast to %s', (type) => {
+      expect(check(`SELECT CAST(NOTE AS ${type}) FROM MYLIB.ORDERS`).ok).toBe(true);
+    });
+
+    it('should accept a Db2 cast together with parameters and FETCH FIRST', () => {
+      const sql =
+        'SELECT CAST(NOTE AS VARCHAR(60) CCSID 1208) AS NOTE FROM MYLIB.ORDERHDR ' +
+        'WHERE ORDERNO = ? FETCH FIRST 5 ROWS ONLY';
+      expect(check(sql).ok).toBe(true);
+    });
+
+    it('should still catch a qualified function inside a Db2 cast', () => {
+      const result = check(
+        'SELECT CAST(OUTSIDELIB.F(NOTE) AS VARGRAPHIC(10) CCSID 1200) FROM MYLIB.ORDERS'
+      );
+      expect(result.ok).toBe(false);
+      expect(result.violations).toEqual([
+        'Function OUTSIDELIB.F is not in the allowed schemas (MYLIB).',
+      ]);
+    });
+
+    it('should not rename a qualified function that shares a type name', () => {
+      expect(normalizeForParsing('SELECT X AS OUTSIDELIB.CLOB(1)')).toContain('OUTSIDELIB.CLOB');
+      expect(normalizeForParsing('SELECT CAST(X AS NCHAR.F)')).toContain('NCHAR.F');
+    });
+
+    it('should leave string literals, quoted names and comments alone', () => {
+      const sql =
+        "SELECT CAST(NOTE AS VARGRAPHIC(30) CCSID 1200) -- AS NCHAR(1) CCSID 37 ?\n" +
+        "FROM MYLIB.ORDERS /* AS CLOB(1M) FOR BIT DATA ? */ " +
+        `WHERE DESCR = 'AS NVARCHAR CCSID 1208 ?' AND "AS NCHAR" = 1`;
+      expect(normalizeForParsing(sql)).toBe(
+        "SELECT CAST(NOTE AS VARCHAR(30) ) -- AS NCHAR(1) CCSID 37 ?\n" +
+          "FROM MYLIB.ORDERS /* AS CLOB(1M) FOR BIT DATA ? */ " +
+          `WHERE DESCR = 'AS NVARCHAR CCSID 1208 ?' AND "AS NCHAR" = 1`
+      );
+    });
+
+    it('should keep quotes with doubled quote escapes intact', () => {
+      const sql = "SELECT * FROM MYLIB.ORDERS WHERE DESCR = 'IT''S ? CCSID 1' AND ORDERNO = ?";
+      expect(normalizeForParsing(sql)).toBe(
+        "SELECT * FROM MYLIB.ORDERS WHERE DESCR = 'IT''S ? CCSID 1' AND ORDERNO = NULL"
+      );
+    });
+
+    it('should not touch FOR READ ONLY or FOR FETCH ONLY', () => {
+      expect(normalizeForParsing('SELECT * FROM MYLIB.ORDERS FOR READ ONLY')).toBe(
+        'SELECT * FROM MYLIB.ORDERS FOR READ ONLY'
+      );
+      expect(normalizeForParsing('SELECT * FROM MYLIB.ORDERS FOR FETCH ONLY')).toBe(
+        'SELECT * FROM MYLIB.ORDERS FOR FETCH ONLY'
+      );
+    });
+  });
+
+  describe('Db2 for i special registers', () => {
+    function checkWithSysibm(sql: string) {
+      return checkQuerySchemas(sql, { allowed: ['SYSIBM', 'MYLIB'] });
+    }
+
+    it.each([
+      'SELECT CURRENT USER AS U FROM SYSIBM.SYSDUMMY1',
+      'SELECT CURRENT USER U FROM SYSIBM.SYSDUMMY1',
+      'SELECT CURRENT_USER AS U FROM SYSIBM.SYSDUMMY1',
+      'SELECT CURRENT TIMESTAMP AS TS FROM SYSIBM.SYSDUMMY1',
+      'SELECT CURRENT TIMESTAMP FROM SYSIBM.SYSDUMMY1',
+      'SELECT CURRENT TIMESTAMP(12) AS TS, CURRENT TIME ZONE AS TZ FROM SYSIBM.SYSDUMMY1',
+      'SELECT CURRENT DATE AS D FROM SYSIBM.SYSDUMMY1',
+      'SELECT CURRENT SCHEMA AS S, CURRENT SERVER AS SRV, CURRENT PATH AS P FROM SYSIBM.SYSDUMMY1',
+      'SELECT current date as d, current_time as t FROM SYSIBM.SYSDUMMY1',
+      'SELECT USER AS U, SESSION_USER AS SU FROM SYSIBM.SYSDUMMY1',
+    ])('should accept %s', (sql) => {
+      expect(checkWithSysibm(sql).ok).toBe(true);
+    });
+
+    it.each([
+      'SELECT ORDERNO, CURRENT DATE AS D FROM MYLIB.ORDERS',
+      'SELECT ORDERNO FROM MYLIB.ORDERS WHERE ORDERDATE < CURRENT DATE',
+      'SELECT ORDERNO FROM MYLIB.ORDERS WHERE ORDERDATE > CURRENT DATE - 30 DAYS',
+      'SELECT ORDERNO FROM MYLIB.ORDERS WHERE CHANGED > CURRENT TIMESTAMP - 2 HOURS - (1 + 1) MINUTES',
+      'SELECT ORDERNO, VARCHAR_FORMAT(CURRENT TIMESTAMP, \'YYYY-MM-DD\') AS TODAY FROM MYLIB.ORDERS',
+      'SELECT ORDERNO, CAST(CURRENT DATE AS CHAR(10)) AS TODAY FROM MYLIB.ORDERS',
+    ])('should accept %s and still check its library', (sql) => {
+      expect(check(sql).ok).toBe(true);
+      const outside = check(sql.replace('MYLIB.', 'OTHERLIB.'));
+      expect(outside.ok).toBe(false);
+      expect(outside.violations[0]).toMatch(/^Table OTHERLIB\./);
+    });
+
+    it('should still refuse a library outside the list next to a special register', () => {
+      const result = check(
+        'SELECT ORDERNO, CURRENT DATE AS D FROM MYLIB.ORDERS ' +
+          'WHERE ORDERNO IN (SELECT ORDERNO FROM OTHERLIB.ORDERHDR WHERE ORDERDATE = CURRENT DATE - 1 DAY)'
+      );
+      expect(result.ok).toBe(false);
+      expect(result.violations).toEqual([
+        'Table OTHERLIB.ORDERHDR is not in the allowed schemas (MYLIB).',
+      ]);
+    });
+
+    it('should not hide a table whose name looks like a special register', () => {
+      const qualified = check('SELECT * FROM OTHERLIB.CURRENT USER');
+      expect(qualified.ok).toBe(false);
+      expect(qualified.violations[0]).toMatch(/^Table OTHERLIB\.CURRENT /);
+      // An unqualified table named CURRENT with an alias no longer parses, so it is refused
+      expect(check('SELECT * FROM CURRENT DATE').ok).toBe(false);
+    });
+
+    it('should only rewrite keywords, never qualified names or column names', () => {
+      expect(
+        normalizeForParsing('SELECT MYLIB.CURRENT_DATE, X.CURRENT DATE, T1 DAYS, 30 DAYS, CURRENT DATE.X')
+      ).toBe('SELECT MYLIB.CURRENT_DATE, X.CURRENT DATE, T1 DAYS, 30, CURRENT DATE.X');
+      expect(normalizeForParsing('SELECT A$CURRENT DATE, CURRENT DATES FROM MYLIB.ORDERS')).toBe(
+        'SELECT A$CURRENT DATE, CURRENT DATES FROM MYLIB.ORDERS'
+      );
+    });
+
+    it('should leave special registers in strings and comments alone', () => {
+      const sql = "SELECT 'CURRENT DATE - 1 DAY' -- CURRENT USER\nFROM MYLIB.ORDERS /* 30 DAYS */";
+      expect(normalizeForParsing(sql)).toBe(sql);
+    });
+  });
+
+  describe('function calls', () => {
+    const withCatalog = { allowed: ['MYLIB', 'SYSIBM'], defaultSchema: 'MYLIB' };
+
+    it('should reject a qualified function outside the list', () => {
+      const result = checkQuerySchemas('SELECT OUTSIDELIB.F(ORDERNO) FROM MYLIB.ORDERS', withCatalog);
+      expect(result.ok).toBe(false);
+      expect(result.violations).toEqual([
+        'Function OUTSIDELIB.F is not in the allowed schemas (MYLIB, SYSIBM).',
+      ]);
+    });
+
+    it('should reject a qualified function when every table is allowed', () => {
+      const result = checkQuerySchemas('SELECT OUTSIDELIB.F(1) FROM SYSIBM.SYSDUMMY1', withCatalog);
+      expect(result.ok).toBe(false);
+      expect(result.violations[0]).toContain('OUTSIDELIB.F');
+    });
+
+    it.each([
+      ['WHERE', 'SELECT ORDERNO FROM MYLIB.ORDERS WHERE OUTSIDELIB.F(ORDERNO) = 1'],
+      ['an aggregate', 'SELECT SUM(OUTSIDELIB.F(ORDERNO)) FROM MYLIB.ORDERS'],
+      ['CAST', 'SELECT CAST(OUTSIDELIB.F(ORDERNO) AS INT) FROM MYLIB.ORDERS'],
+      ['ORDER BY', 'SELECT ORDERNO FROM MYLIB.ORDERS ORDER BY OUTSIDELIB.F(ORDERNO)'],
+      [
+        'a subquery',
+        'SELECT * FROM MYLIB.ORDERS WHERE ORDERNO IN (SELECT OUTSIDELIB.F(1) FROM MYLIB.ORDERHDR)',
+      ],
+      [
+        'a WITH clause',
+        'WITH T AS (SELECT OUTSIDELIB.F(ORDERNO) AS X FROM MYLIB.ORDERS) SELECT X FROM T',
+      ],
+      ['a nested call', 'SELECT UPPER(OUTSIDELIB.F(ORDERNO)) FROM MYLIB.ORDERS'],
+    ])('should reject a qualified function inside %s', (_where, sql) => {
+      const result = check(sql);
+      expect(result.ok).toBe(false);
+      expect(result.violations.some((v) => v.includes('OUTSIDELIB.F'))).toBe(true);
+    });
+
+    it('should allow a qualified function in the list, case-insensitively', () => {
+      expect(check('SELECT MYLIB.F(ORDERNO) FROM MYLIB.ORDERS').ok).toBe(true);
+      expect(check('SELECT mylib.F(ORDERNO) FROM MYLIB.ORDERS').ok).toBe(true);
+    });
+
+    it('should require the schema of a qualified system function to be listed', () => {
+      const sql = 'SELECT QSYS2.F(ORDERNO) FROM MYLIB.ORDERS';
+      expect(check(sql).ok).toBe(false);
+      expect(checkQuerySchemas(sql, { allowed: ['MYLIB', 'QSYS2'] }).ok).toBe(true);
+    });
+
+    it('should report each outside function once', () => {
+      const result = check(
+        'SELECT OUTSIDELIB.F(ORDERNO), OUTSIDELIB.F(LINENO), OTHERLIB.G(ITEMNO) FROM MYLIB.ORDERS'
+      );
+      expect(result.violations).toEqual([
+        'Function OUTSIDELIB.F is not in the allowed schemas (MYLIB).',
+        'Function OTHERLIB.G is not in the allowed schemas (MYLIB).',
+      ]);
+    });
+
+    it('should allow unqualified built-in functions', () => {
+      const sql =
+        'SELECT UPPER(ITEMNO), SUBSTR(ITEMNO, 1, 2), COALESCE(LINENO, 0), COUNT(*), CURRENT_DATE ' +
+        'FROM MYLIB.ORDERS GROUP BY ITEMNO, LINENO';
+      expect(check(sql).ok).toBe(true);
+    });
   });
 });
 

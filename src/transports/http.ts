@@ -3,6 +3,7 @@
  * 
  * Express-based HTTP server with:
  * - OAuth-style token authentication (/auth)
+ * - Optional OAuth 2.1 authorization server for remote clients (/oauth/*)
  * - MCP protocol endpoints (/mcp)
  * - Health check endpoint (/health)
  * - Stateless MCP serving by default (stateful Mcp-Session-Id is deprecated)
@@ -12,29 +13,25 @@
 import express, { type Express, type Request, type Response } from 'express';
 import https from 'node:https';
 import http from 'node:http';
-import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createMcpHandler, isInitializeRequest, isLegacyRequest, type McpHttpHandler } from '@modelcontextprotocol/server';
 import { toNodeHandler, toWebRequest } from '@modelcontextprotocol/node';
 
-import {
-  getHttpConfig,
-  hostnameOf,
-  isLoopbackHost,
-  loadPartialConfig,
-  normalizeDbHost,
-  withoutSshKeyLogin,
-  type DB2iConfig,
-} from '../config.js';
+import { DISPLAY_NAME, FAVICON_ICO, FAVICON_SVG, ICON_PNG, ICON_TILE_SVG } from '../branding.js';
+import { getExportConfig, getHttpConfig, hostnameOf, isLoopbackHost } from '../config.js';
+import { exportDownloadHandler } from '../export/download.js';
+import { writeAuditEvent } from '../utils/auditLog.js';
 import { createChildLogger } from '../utils/logger.js';
 import {
   getTokenManager,
   authMiddleware,
-  authRateLimitMiddleware,
-  clearAuthRateLimit,
+  createAuthRateLimitMiddleware,
+  createOAuthRateLimitMiddleware,
+  createExportDownloadRateLimitMiddleware,
+  createOAuthRouter,
   extractBearerToken,
+  resetOAuthState,
   type AuthenticatedRequest,
-  type AuthRequest,
   type AuthResponse,
   type AuthValidationResult,
 } from '../auth/index.js';
@@ -42,15 +39,13 @@ import { getSessionManager } from './sessionManager.js';
 import { GLOBAL_SESSION_KEY, isSessionOwnedByCaller, resolveCallerSessionKey } from './sessionAuth.js';
 import { createServer as createMcpServer, SERVER_NAME, SERVER_VERSION, type SessionContext } from '../server.js';
 import { getOpenApiSpec } from '../openapi.js';
-import { initializeSessionPool, testConnection, closeSessionPool, closeAllSessionPools } from '../db/connection.js';
 import {
-  DEFAULT_SYSTEM_NAME,
-  defaultSystem,
-  getSystem,
-  getSystems,
-  isProfilesFileConfigured,
-  unknownSystemMessage,
-} from '../systems.js';
+  initializeSessionPool,
+  closeSessionPool,
+  closeAllSessionPools,
+  setSessionPoolIdleTimeout,
+} from '../db/connection.js';
+import { authAllowedDbHosts, closeCheckPool, handOverPool, verifyLogin } from '../auth/login.js';
 
 const log = createChildLogger({ component: 'http-transport' });
 
@@ -158,7 +153,8 @@ function sessionNotFoundBody(): { jsonrpc: '2.0'; error: { code: number; message
 
 /**
  * Build a per-request MCP server bound to the caller's database pool.
- * Pools stay keyed by auth token (or the shared "global" key), not by MCP session id.
+ * Pools stay keyed by auth token or OAuth grant (or the shared "global" key),
+ * not by MCP session id.
  */
 function createHttpMcpServer(request?: globalThis.Request): ReturnType<typeof createMcpServer> {
   const httpConfig = getHttpConfig();
@@ -173,68 +169,24 @@ function createHttpMcpServer(request?: globalThis.Request): ReturnType<typeof cr
       throw new Error('Token session not found');
     }
     context = {
-      sessionId: resolveCallerSessionKey(httpConfig.authMode, token),
+      sessionId: resolveCallerSessionKey(httpConfig.authMode, token, validation.session),
       binding: { system: validation.session.system, config: validation.session.config },
     };
+  }
+
+  const userAgent = userAgentOf(request?.headers.get('user-agent'));
+  if (userAgent) {
+    context.userAgent = userAgent;
   }
 
   initializeSessionPool(context.sessionId);
   return createMcpServer(context);
 }
 
-/**
- * Hosts /auth may connect to. With DB2I_PROFILES and no explicit
- * MCP_AUTH_ALLOWED_DB_HOSTS, the profile hosts.
- */
-function authAllowedDbHosts(httpConfig: ReturnType<typeof getHttpConfig>): string[] | null {
-  if (isProfilesFileConfigured() && !process.env.MCP_AUTH_ALLOWED_DB_HOSTS?.trim()) {
-    return [...new Set(getSystems().map((system) => normalizeDbHost(system.config.hostname)))];
-  }
-  return httpConfig.authAllowedDbHosts;
-}
-
-/**
- * The connection an /auth request asks for: a profile plus the caller's
- * credentials, or, without DB2I_PROFILES, the request's host over DB2I_*.
- * The caller's password is what logs in, so a mapepire privateKeyFile is
- * dropped: the server's key would accept any password.
- */
-function authConnection(authReq: AuthRequest): { system: string; config: DB2iConfig } {
-  if (!isProfilesFileConfigured()) {
-    if (authReq.system !== undefined && authReq.system !== DEFAULT_SYSTEM_NAME) {
-      throw new Error(unknownSystemMessage(authReq.system));
-    }
-    const config = loadPartialConfig({
-      hostname: authReq.host,
-      port: authReq.port,
-      username: authReq.username,
-      password: authReq.password,
-      database: authReq.database,
-      schema: authReq.schema,
-    });
-    return {
-      system: DEFAULT_SYSTEM_NAME,
-      config: { ...config, mapepireOptions: withoutSshKeyLogin(config.mapepireOptions) },
-    };
-  }
-
-  if (authReq.host !== undefined || authReq.port !== undefined || authReq.database !== undefined) {
-    throw new Error('host, port, and database come from DB2I_PROFILES. Choose a profile with system.');
-  }
-  const profile = authReq.system === undefined ? defaultSystem() : getSystem(authReq.system);
-  if (!profile) {
-    throw new Error(unknownSystemMessage(authReq.system ?? ''));
-  }
-  return {
-    system: profile.name,
-    config: {
-      ...profile.config,
-      username: authReq.username,
-      password: authReq.password,
-      schema: authReq.schema ?? profile.config.schema,
-      mapepireOptions: withoutSshKeyLogin(profile.config.mapepireOptions),
-    },
-  };
+/** User-Agent for the audit log, trimmed to a length that cannot flood it. */
+function userAgentOf(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.slice(0, 200) : undefined;
 }
 
 /**
@@ -255,7 +207,7 @@ async function handleStatefulLegacyRequest(req: Request, res: Response): Promise
       return;
     }
 
-    const sessionKey = resolveCallerSessionKey(httpConfig.authMode, authReq.authToken);
+    const sessionKey = resolveCallerSessionKey(httpConfig.authMode, authReq.authToken, authReq.tokenSession);
     const sessionManager = getSessionManager();
     const mcpSession = sessionManager.getSession(sessionId);
 
@@ -281,7 +233,7 @@ async function handleStatefulLegacyRequest(req: Request, res: Response): Promise
       return;
     }
 
-    const sessionKey = resolveCallerSessionKey(httpConfig.authMode, authReq.authToken);
+    const sessionKey = resolveCallerSessionKey(httpConfig.authMode, authReq.authToken, authReq.tokenSession);
     const sessionManager = getSessionManager();
     const mcpSession = sessionManager.getSession(sessionId);
 
@@ -330,7 +282,7 @@ async function handleStatefulLegacyRequest(req: Request, res: Response): Promise
         return;
       }
       binding = { system: authReq.tokenSession.system, config: authReq.tokenSession.config };
-      sessionKey = resolveCallerSessionKey(httpConfig.authMode, authReq.authToken);
+      sessionKey = resolveCallerSessionKey(httpConfig.authMode, authReq.authToken, authReq.tokenSession);
     }
 
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
@@ -367,7 +319,8 @@ async function handleStatefulLegacyRequest(req: Request, res: Response): Promise
     let transport: Awaited<ReturnType<typeof sessionManager.createSession>>['transport'];
 
     try {
-      mcpServer = createMcpServer({ sessionId: sessionKey, binding });
+      const userAgent = userAgentOf(req.headers['user-agent']);
+      mcpServer = createMcpServer({ sessionId: sessionKey, binding, ...(userAgent ? { userAgent } : {}) });
       const result = await sessionManager.createSession(mcpServer, sessionKey);
       transport = result.transport;
     } catch (err) {
@@ -416,6 +369,29 @@ export function createHttpApp(): Express {
     }
   );
   const mcpNodeHandler = toNodeHandler(mcpHttpHandler);
+
+  // Close pools when tokens expire or are revoked, in stateful and stateless modes.
+  // Pools are reused across requests for the same key: the token, or for OAuth
+  // the grant, which every refreshed token of one sign-in shares. A grant's pool
+  // closes with its last token, so a refresh keeps it and revoking the grant ends it.
+  if (httpConfig.authMode === 'required') {
+    const tokenManager = getTokenManager();
+    tokenManager.setCleanupCallback(async (token, session) => {
+      if (session.grantId && tokenManager.hasGrant(session.grantId)) {
+        return;
+      }
+      const sessionKey = resolveCallerSessionKey(httpConfig.authMode, token, session);
+      await getSessionManager().closeSessionsByToken(sessionKey);
+      await closeSessionPool(sessionKey);
+    });
+  }
+
+  // Close the connections of sessions that ran nothing for MCP_POOL_IDLE_TIMEOUT.
+  // The next query reconnects, so a session that stays signed in holds no idle job.
+  setSessionPoolIdleTimeout(httpConfig.poolIdleTimeout * 1000);
+
+  // Behind a proxy, MCP_TRUST_PROXY lets req.ip, and so the rate limits, see the client address
+  app.set('trust proxy', httpConfig.trustProxy);
 
   // Middleware
   app.use(express.json());
@@ -494,6 +470,28 @@ export function createHttpApp(): Express {
     next();
   });
 
+  // Project icon for browser tabs, connector lists and the MCP server info. No auth:
+  // it is the same public logo for everyone.
+  const sendIcon = (type: string, body: Buffer | string) => (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.type(type).send(body);
+  };
+  app.get('/favicon.ico', sendIcon('image/x-icon', FAVICON_ICO));
+  app.get('/favicon.svg', sendIcon('image/svg+xml', FAVICON_SVG));
+  app.get('/icon.png', sendIcon('image/png', ICON_PNG));
+  app.get('/icon.svg', sendIcon('image/svg+xml', ICON_TILE_SVG));
+
+  // One login limiter for POST /auth and the OAuth sign-in form, so they share a budget
+  const authRateLimitMiddleware = createAuthRateLimitMiddleware(httpConfig.authRateLimit);
+
+  // OAuth authorization server for remote clients (MCP_OAUTH_ENABLED)
+  if (httpConfig.oauth) {
+    app.use(createOAuthRouter(httpConfig.oauth, DISPLAY_NAME, {
+      requests: createOAuthRateLimitMiddleware(httpConfig.oauthRateLimit),
+      login: authRateLimitMiddleware,
+    }));
+  }
+
   // OpenAPI specification endpoint
   app.get('/openapi.json', (req: Request, res: Response) => {
     const protocol = httpConfig.tls.enabled ? 'https' : 'http';
@@ -520,6 +518,7 @@ export function createHttpApp(): Express {
         authMode: httpConfig.authMode,
         sessionMode: httpConfig.sessionMode,
         tlsEnabled: httpConfig.tls.enabled,
+        oauthEnabled: httpConfig.oauth !== null,
       },
       sessions: {
         tokens: httpConfig.authMode === 'required' ? tokenManager.getStats() : undefined,
@@ -528,8 +527,33 @@ export function createHttpApp(): Express {
     });
   });
 
+  // Export download links (export_query over HTTP). No bearer check: the
+  // 256-bit id in the link is the credential, and a browser cannot send the token.
+  if (getExportConfig()) {
+    app.get('/exports/:id', createExportDownloadRateLimitMiddleware(), exportDownloadHandler);
+  }
+
   // Authentication endpoint (only active in 'required' auth mode)
   app.post('/auth', authRateLimitMiddleware, async (req: Request, res: Response) => {
+    let pool: string | undefined;
+    // Every way out of a login attempt is audited, with the user name as sent
+    const auditSignIn = (
+      outcome: 'success' | 'failure' | 'error',
+      details: { identity?: string; system?: string; reason?: string } = {},
+    ): void => {
+      const body = (typeof req.body === 'object' && req.body !== null ? req.body : {}) as Record<string, unknown>;
+      const identity = details.identity ?? (typeof body.username === 'string' ? body.username.trim().slice(0, 128) : '');
+      const system = details.system ?? (typeof body.system === 'string' ? body.system.trim().slice(0, 128) : undefined);
+      writeAuditEvent({
+        event: 'sign_in',
+        method: 'password',
+        identity,
+        ...(system ? { system } : {}),
+        ip: req.ip,
+        outcome,
+        ...(details.reason ? { reason: details.reason } : {}),
+      });
+    };
     try {
       // Check if /auth endpoint is needed for current auth mode
       if (httpConfig.authMode !== 'required') {
@@ -545,6 +569,7 @@ export function createHttpApp(): Express {
       // Validate request
       const validation = validateAuthRequest(req.body);
       if (!validation.valid || !validation.request) {
+        auditSignIn('failure', { reason: validation.error ?? 'Invalid request' });
         res.status(400).json({
           error: 'invalid_request',
           error_description: validation.error,
@@ -554,62 +579,27 @@ export function createHttpApp(): Express {
 
       const authReq = validation.request;
 
-      // A profile plus the caller's credentials, or the request's host with env fallbacks
-      let dbConfig: DB2iConfig;
-      let system: string;
-      try {
-        ({ config: dbConfig, system } = authConnection(authReq));
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Configuration error';
-        res.status(400).json({
-          error: 'invalid_request',
-          error_description: message,
+      // A profile plus the caller's credentials, or the request's host with env fallbacks,
+      // proven with a test connection
+      const login = await verifyLogin(authReq);
+      if (!login.ok) {
+        auditSignIn('failure', { identity: authReq.username, system: authReq.system, reason: login.description });
+        res.status(login.status).json({
+          error: login.error,
+          error_description: login.description,
         });
         return;
       }
-
-      const allowedDbHosts = authAllowedDbHosts(httpConfig);
-      const requestedHost = normalizeDbHost(dbConfig.hostname);
-      if (allowedDbHosts && !allowedDbHosts.includes(requestedHost)) {
-        res.status(400).json({
-          error: 'invalid_request',
-          error_description: 'Host is not allowed',
-        });
-        return;
-      }
-
-      // Test connection to validate credentials
-      log.debug({ host: dbConfig.hostname, user: dbConfig.username }, 'Testing credentials');
-      
-      // Use crypto random bytes for unique test pool ID (avoids collision with concurrent requests)
-      const testPoolId = `auth-test-${crypto.randomBytes(16).toString('hex')}`;
-      try {
-        initializeSessionPool(testPoolId);
-        const connected = await testConnection({ poolKey: testPoolId, system, config: dbConfig });
-        await closeSessionPool(testPoolId);
-
-        if (!connected) {
-          res.status(401).json({
-            error: 'invalid_credentials',
-            error_description: 'Authentication failed: unable to connect to database',
-          });
-          return;
-        }
-      } catch (err) {
-        await closeSessionPool(testPoolId);
-        const message = err instanceof Error ? err.message : 'Connection failed';
-        res.status(401).json({
-          error: 'invalid_credentials',
-          error_description: `Authentication failed: ${message}`,
-        });
-        return;
-      }
+      const { system, config: dbConfig } = login;
+      // Set until a token takes the pool; any other way out closes it
+      pool = login.pool;
 
       // Create token session
       const tokenManager = getTokenManager();
       
       // Advisory check - the hard limit is enforced in createSession()
       if (!tokenManager.canCreateSession()) {
+        auditSignIn('error', { identity: dbConfig.username, system, reason: 'Maximum concurrent sessions reached' });
         res.status(503).json({
           error: 'service_unavailable',
           error_description: 'Maximum concurrent sessions reached. Please try again later.',
@@ -627,9 +617,13 @@ export function createHttpApp(): Express {
         token = result.token;
         expiresAt = result.expiresAt;
         expiresIn = result.expiresIn;
+        pool = undefined;
+        // The login's test pool becomes the token's, so its first query is already connected
+        void handOverPool(login.pool, token);
       } catch (err) {
         // Check if this is a max sessions error (race condition)
         if (err instanceof Error && err.message.includes('Maximum concurrent sessions')) {
+          auditSignIn('error', { identity: dbConfig.username, system, reason: 'Maximum concurrent sessions reached' });
           res.status(503).json({
             error: 'service_unavailable',
             error_description: err.message,
@@ -638,9 +632,6 @@ export function createHttpApp(): Express {
         }
         throw err; // Re-throw other errors
       }
-
-      // Clear rate limit on successful auth
-      clearAuthRateLimit(req);
 
       const response: AuthResponse = {
         access_token: token,
@@ -653,14 +644,20 @@ export function createHttpApp(): Express {
         { host: dbConfig.hostname, system, user: dbConfig.username, expiresIn },
         'Authentication successful'
       );
+      auditSignIn('success', { identity: dbConfig.username, system });
 
       res.status(201).json(response);
     } catch (err) {
       log.error({ err }, 'Unexpected error in auth handler');
+      auditSignIn('error', { reason: 'Unexpected error' });
       res.status(500).json({
         error: 'server_error',
         error_description: 'An unexpected error occurred',
       });
+    } finally {
+      if (pool) {
+        await closeCheckPool(pool);
+      }
     }
   });
 
@@ -709,27 +706,21 @@ export async function startHttpServer(): Promise<http.Server | https.Server> {
     );
   }
 
-  if (httpConfig.authMode === 'required' && authAllowedDbHosts(httpConfig) === null) {
+  if (httpConfig.authMode === 'required' && authAllowedDbHosts() === null) {
     log.warn(
       'MCP_AUTH_ALLOWED_DB_HOSTS and DB2I_HOSTNAME are unset. ' +
       '/auth will open a database connection to any host the client names.'
     );
   }
 
-  const app = createHttpApp();
-
-  // Register cleanup callback to close session pools when tokens expire or are revoked.
-  // This handles cleanup for both stateful and stateless modes in 'required' auth:
-  // - sessionKey = authToken, so pools are keyed by token
-  // - Pools are intentionally reused across requests for the same token (efficiency)
-  // - When token expires/revokes, this callback closes the associated pool
-  if (httpConfig.authMode === 'required') {
-    const tokenManager = getTokenManager();
-    tokenManager.setCleanupCallback(async (token: string) => {
-      await getSessionManager().closeSessionsByToken(token);
-      await closeSessionPool(token);
-    });
+  if (httpConfig.oauth?.ephemeralSecret) {
+    log.warn(
+      'MCP_OAUTH_SECRET is unset, so OAuth clients registered before a restart must register again. ' +
+      'Set it to a random value: openssl rand -hex 32'
+    );
   }
+
+  const app = createHttpApp();
 
   let server: http.Server | https.Server;
 
@@ -806,6 +797,7 @@ export async function shutdownHttpServer(server: http.Server | https.Server): Pr
   // Close token manager (clears auth tokens and triggers pool cleanup via callback)
   const tokenManager = getTokenManager();
   await tokenManager.shutdown();
+  resetOAuthState();
 
   // Close all database connection pools
   await closeAllSessionPools();

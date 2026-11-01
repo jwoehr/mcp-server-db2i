@@ -1,16 +1,19 @@
 # syntax=docker/dockerfile:1
 # check=skip=SecretsUsedInArgOrEnv
 
-# MCP Server for IBM DB2i
+# MCP Server for IBM Db2i
 # Multi-stage build with two runtime targets:
 #   odbc (default): IBM i Access ODBC driver, no Java
 #   jt400:          JDBC via node-jt400, ships OpenJDK 17 JRE
+# Both include the mapepire driver (@ibm/mapepire-js and ssh2), which needs no
+# Java on this side. Only the jt400 target carries node-jt400.
 #
 #   docker build -t mcp-server-db2i .                        # odbc image
 #   docker build --target jt400 -t mcp-server-db2i:jt400 .   # jt400 image
 #
-# IBM publishes the ODBC driver for amd64, i386 and ppc64el only. On an arm64
-# host add --platform linux/amd64, or build the jt400 target, which runs natively.
+# IBM publishes the ODBC driver for amd64 and ppc64el (its apt repository also
+# carries older i386 builds), with no arm64 build. On an arm64 host add
+# --platform linux/amd64, or build the jt400 target, which runs natively.
 #
 # Note: ENV placeholders below are intentionally empty - they're overridden at runtime
 # via -e flags, --env-file, or Docker secrets. The BuildKit warning is suppressed above.
@@ -42,15 +45,27 @@ COPY package*.json ./
 RUN npm ci
 ENV PATH="/app/node_modules/.bin:${PATH}"
 
-# Copy source code
+# Copy source code (ui/ and scripts/build-ui.mjs build the result view)
 COPY tsconfig.json ./
 COPY src ./src
+COPY ui ./ui
+COPY scripts/build-ui.mjs ./scripts/
 
 # Build TypeScript
 RUN npm run build
 
-# Prune dev dependencies for smaller production image
-RUN npm prune --omit=dev
+# Production node_modules, one set per runtime target. node-jt400, @ibm/mapepire-js
+# and ssh2 are optional peer dependencies that npm leaves out, so each target first
+# lists the ones it needs as dependencies. Versions still come from package-lock.json.
+FROM builder AS deps-odbc
+RUN node -e "const fs=require('fs');const p=require('./package.json');for(const n of process.argv.slice(1)){p.dependencies[n]=p.peerDependencies[n];delete p.devDependencies[n]}fs.writeFileSync('package.json',JSON.stringify(p,null,2))" \
+      @ibm/mapepire-js ssh2 \
+    && npm install --omit=dev --no-audit --no-fund
+
+FROM builder AS deps-jt400
+RUN node -e "const fs=require('fs');const p=require('./package.json');for(const n of process.argv.slice(1)){p.dependencies[n]=p.peerDependencies[n];delete p.devDependencies[n]}fs.writeFileSync('package.json',JSON.stringify(p,null,2))" \
+      node-jt400 @ibm/mapepire-js ssh2 \
+    && npm install --omit=dev --no-audit --no-fund
 
 # Shared runtime layer: application files, user and env placeholders.
 # The driver-specific stages below add their native runtime and set USER.
@@ -61,14 +76,17 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Copy pre-built node_modules from builder (already pruned to production only)
-COPY --from=builder /app/node_modules ./node_modules
-
-# Copy built files from builder stage
+# Copy built files from builder stage. Each target adds its own node_modules.
 COPY --from=builder /app/dist ./dist
 
-# Create non-root user for security
-RUN useradd -m -s /bin/bash mcpuser
+# Create non-root user for security, the directory export_query writes to
+# (EXPORT_DIR=/data/exports), and the one for the OAuth state file
+# (MCP_OAUTH_STATE_FILE=/data/oauth/grants.json). A named volume mounted there
+# takes its owner and mode from the directory.
+RUN useradd -m -s /bin/bash mcpuser \
+    && mkdir -p /data/exports /data/oauth \
+    && chown mcpuser:mcpuser /data/exports /data/oauth \
+    && chmod 700 /data/exports /data/oauth
 
 # Environment variables (to be provided at runtime)
 # Database connection
@@ -76,7 +94,7 @@ ENV DB2I_HOSTNAME=""
 ENV DB2I_USERNAME=""
 ENV DB2I_PASSWORD=""
 ENV DB2I_SCHEMA=""
-# odbc (default) | jt400. Each runtime target sets its own value.
+# odbc (default) | jt400 | mapepire. Each runtime target sets its own value.
 ENV DB2I_DRIVER=""
 ENV DB2I_JDBC_OPTIONS=""
 ENV DB2I_ODBC_OPTIONS=""
@@ -122,15 +140,23 @@ RUN ln -s /usr/lib/jvm/java-17-openjdk-* /usr/lib/jvm/java-17-openjdk
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
+COPY --from=deps-jt400 /app/node_modules ./node_modules
+
 ENV DB2I_DRIVER="jt400"
+
+# Build identifier for the audit log, such as the git commit:
+# docker build --build-arg MCP_BUILD_ID=$(git rev-parse --short HEAD) .
+# Last, so a new value does not rebuild the layers above.
+ARG MCP_BUILD_ID=""
+ENV MCP_BUILD_ID=$MCP_BUILD_ID
 
 USER mcpuser
 
 # ODBC runtime: unixODBC plus the IBM i Access ODBC Driver from IBM's apt
 # repository (https://ibmi-oss-docs.readthedocs.io/en/latest/odbc/installation.html).
 # Default target, kept last so `docker build .` builds it. No Java.
-# IBM publishes the driver for amd64, i386 and ppc64el only, so on an arm64
-# host build with: docker build --platform linux/amd64 .
+# IBM publishes no arm64 build of the driver, so on an arm64 host build with:
+# docker build --platform linux/amd64 .
 FROM runtime-base AS odbc
 
 ARG TARGETARCH
@@ -149,6 +175,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y curl && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=deps-odbc /app/node_modules ./node_modules
+
 ENV DB2I_DRIVER="odbc"
+
+# Build identifier for the audit log, such as the git commit:
+# docker build --build-arg MCP_BUILD_ID=$(git rev-parse --short HEAD) .
+# Last, so a new value does not rebuild the layers above.
+ARG MCP_BUILD_ID=""
+ENV MCP_BUILD_ID=$MCP_BUILD_ID
 
 USER mcpuser

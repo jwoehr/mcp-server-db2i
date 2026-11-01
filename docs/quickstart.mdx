@@ -1,0 +1,92 @@
+---
+title: "Quickstart"
+description: "Install mcp-server-db2i, point it at an IBM i, and connect an MCP client."
+---
+
+<Steps>
+  <Step title="Pick a driver and install its prerequisites">
+    The server needs Node.js 22 or higher. What else it needs depends on the driver.
+
+    | Driver | Set | Needs |
+    |--------|-----|-------|
+    | `odbc` (default) | nothing | unixODBC and the IBM i Access ODBC Driver on the machine that runs the server. No Java. |
+    | `jt400` | `DB2I_DRIVER=jt400` | The `node-jt400` package, a JDK to install it, and a JRE 11 or higher at runtime. |
+    | `mapepire` | `DB2I_DRIVER=mapepire` | The `@ibm/mapepire-js` and `ssh2` packages, SSH access to the IBM i, and Java 8 or higher on the IBM i. No administrator install: the first connection uploads the Mapepire JAR (about 10 MB) to the user's home directory. |
+
+    See [Database drivers](/configuration#database-drivers) for install steps per platform.
+  </Step>
+
+  <Step title="Install the server">
+    ```bash
+    npm install -g mcp-server-db2i
+    ```
+
+    Or run it with `npx mcp-server-db2i` from the client config, as in the next step. To run it in a container instead, see [Docker](/docker).
+
+    Only the `odbc` driver installs with the server. For `jt400` or `mapepire`, add its packages:
+
+    ```bash
+    npm install -g mcp-server-db2i node-jt400              # jt400
+    npm install -g mcp-server-db2i @ibm/mapepire-js ssh2   # mapepire
+    ```
+
+    With npx, pass them with `-p` instead: `"args": ["-y", "-p", "mcp-server-db2i@latest", "-p", "node-jt400", "mcp-server-db2i"]`. See [Installing the jt400 and mapepire packages](/configuration#installing-the-jt400-and-mapepire-packages).
+  </Step>
+
+  <Step title="Add it to your MCP client">
+    Add the server to your client's config, for example `~/.cursor/mcp.json` in Cursor:
+
+    ```json
+    {
+      "mcpServers": {
+        "db2i": {
+          "command": "npx",
+          "args": ["-y", "mcp-server-db2i@latest"],
+          "env": {
+            "DB2I_HOSTNAME": "${env:DB2I_HOSTNAME}",
+            "DB2I_USERNAME": "${env:DB2I_USERNAME}",
+            "DB2I_PASSWORD": "${env:DB2I_PASSWORD}"
+          }
+        }
+      }
+    }
+    ```
+
+    The `${env:...}` references keep credentials out of the config file. Set the variables in your shell profile (`~/.zshrc` or `~/.bashrc`). Claude Code uses `${VAR_NAME}` instead, and can add the server with:
+
+    ```bash
+    claude mcp add --scope user db2i -- npx -y mcp-server-db2i@latest
+    ```
+
+    `@latest` makes npx check for a new release each time the client starts the server. Without it, npx keeps running the version it cached first. To upgrade on your own schedule instead, pin a version, such as `mcp-server-db2i@3.0.0`. See [Choosing a version](/client-setup#choosing-a-version).
+
+    See [Client setup](/client-setup) for config paths in Cursor, Claude Desktop, and Claude Code, and for Docker-based setups.
+  </Step>
+
+  <Step title="Ask a question">
+    Restart the client, then try:
+
+    - "List all schemas that contain 'PROD'"
+    - "Show me the tables in schema MYLIB"
+    - "Describe the columns in MYLIB/CUSTOMERS"
+    - "What indexes exist on the ORDERS table?"
+    - "Find the order header and line tables in MYLIB and write a GET /orders/:orderNo endpoint"
+  </Step>
+</Steps>
+
+## Next steps
+
+<Columns cols={2}>
+  <Card title="Limit what the assistant can reach" icon="shield" href="/security#schema-allowlist">
+    Set `QUERY_ALLOWED_SCHEMAS`, disable tools, and mask sensitive columns.
+  </Card>
+  <Card title="Add business SQL tools" icon="file-code" href="/custom-tools">
+    Turn reviewed ERP queries into named tools with typed parameters.
+  </Card>
+  <Card title="Connect several systems" icon="server" href="/configuration#multiple-systems">
+    Reach production and test from one server with `DB2I_PROFILES`.
+  </Card>
+  <Card title="Serve remote clients" icon="globe" href="/http-transport#remote-clients-oauth">
+    Run over HTTP with OAuth so claude.ai connectors can sign in.
+  </Card>
+</Columns>

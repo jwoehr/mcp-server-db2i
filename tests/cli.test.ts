@@ -21,8 +21,8 @@ vi.mock('../src/db/connection.js', () => ({
   executeProcedure: vi.fn(),
 }));
 
-import { closeGlobalPool } from '../src/db/connection.js';
-import { parseCliArgs, runValidateTools } from '../src/cli.js';
+import { closeGlobalPool, executeQuery } from '../src/db/connection.js';
+import { missingConnectionHelp, parseCliArgs, runValidateTools } from '../src/cli.js';
 
 const dirs: string[] = [];
 
@@ -32,6 +32,7 @@ afterEach(() => {
   }
   dirs.length = 0;
   parseStatement.mockReset();
+  vi.mocked(executeQuery).mockReset();
   vi.mocked(closeGlobalPool).mockClear();
 });
 
@@ -223,7 +224,59 @@ describe('runValidateTools', () => {
       });
       expect(code).toBe(1);
       expect(stderr.text()).toMatch(/tool search_sales_orders: PARSE_STATEMENT rejected the statement \(type: DELETE\)/);
-      expect(stdout.text()).toMatch(/PARSE_STATEMENT check failed/);
+      expect(stdout.text()).toMatch(/the checks on the IBM i failed/);
+      expect(closeGlobalPool).toHaveBeenCalled();
+    } finally {
+      restoreDbEnv(previous);
+    }
+  });
+
+  it('checks annotation filter columns when --connect is set', async () => {
+    const previous = {
+      host: process.env.DB2I_HOSTNAME,
+      user: process.env.DB2I_USERNAME,
+      password: process.env.DB2I_PASSWORD,
+    };
+    process.env.DB2I_HOSTNAME = 'ibmi.example.com';
+    process.env.DB2I_USERNAME = 'user';
+    process.env.DB2I_PASSWORD = 'secret';
+    parseStatement.mockResolvedValue([
+      { nameType: 'TABLE', schema: 'MYLIB', name: 'ORDERHDR', columnName: null, statementType: 'QUERY' },
+    ]);
+    const withFilters = `${VALID}
+annotations:
+  MYLIB.ORDERHDR:
+    filters:
+      - sql: "STATUS <> 'D'"
+        columns: [STATUS]
+  MYLIB.ORDERS:
+    filters:
+      - sql: "LINESTAT <> 'D'"
+        columns: [LINESTAT]
+  MYLIB.CUSTOMERS:
+    filters:
+      - sql: "ACTIVE = 'Y'"
+        columns: [ACTIVE]
+`;
+    vi.mocked(executeQuery).mockImplementation(async (_sql: string, params?: unknown[]) => {
+      const [, table] = params as string[];
+      if (table === 'ORDERHDR') return { rows: [{ COLUMN_NAME: 'STATUS', SYSTEM_COLUMN_NAME: 'STATUS' }] };
+      if (table === 'ORDERS') return { rows: [{ COLUMN_NAME: 'ORDERNO', SYSTEM_COLUMN_NAME: 'ORDERNO' }] };
+      return { rows: [] };
+    });
+    const stdout = capture();
+    const stderr = capture();
+    try {
+      const code = await runValidateTools({
+        paths: [writeYaml(withFilters)],
+        connect: true,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+      expect(code).toBe(1);
+      expect(stderr.text()).not.toMatch(/ORDERHDR/);
+      expect(stderr.text()).toMatch(/annotation MYLIB\.ORDERS: filter column LINESTAT is not a column of the table/);
+      expect(stderr.text()).toMatch(/annotation MYLIB\.CUSTOMERS: table not found/);
       expect(closeGlobalPool).toHaveBeenCalled();
     } finally {
       restoreDbEnv(previous);
@@ -268,3 +321,25 @@ function restoreDbEnv(previous: { host?: string; user?: string; password?: strin
   if (previous.password === undefined) delete process.env.DB2I_PASSWORD;
   else process.env.DB2I_PASSWORD = previous.password;
 }
+
+describe('help, version and first-run setup', () => {
+  it('parses --help and --version', () => {
+    expect(parseCliArgs(['--help']).kind).toBe('help');
+    expect(parseCliArgs(['-h']).kind).toBe('help');
+    expect(parseCliArgs(['--version'])).toEqual({ kind: 'version' });
+    expect(parseCliArgs(['-v'])).toEqual({ kind: 'version' });
+  });
+
+  it('shows setup help when stdio has no connection settings', () => {
+    const help = missingConnectionHelp({});
+    expect(help).toContain('DB2I_HOSTNAME');
+    expect(help).toContain('"command": "npx"');
+  });
+
+  it('stays quiet when a host, a profiles file or HTTP only is configured', () => {
+    expect(missingConnectionHelp({ DB2I_HOSTNAME: 'ibmi.example.com' })).toBeNull();
+    expect(missingConnectionHelp({ DB2I_PROFILES: 'profiles.yaml' })).toBeNull();
+    expect(missingConnectionHelp({ MCP_TRANSPORT: 'http' })).toBeNull();
+    expect(missingConnectionHelp({ MCP_TRANSPORT: 'both' })).not.toBeNull();
+  });
+});

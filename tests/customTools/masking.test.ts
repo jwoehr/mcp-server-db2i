@@ -6,9 +6,15 @@ vi.mock('../../src/db/connection.js', () => ({
 }));
 
 import { executeQuery } from '../../src/db/connection.js';
-import { checkMaskedColumns, maskRows, tokenizeSql } from '../../src/customTools/masking.js';
+import {
+  checkMaskedColumns,
+  maskRows,
+  maskValue,
+  requireMaskedColumns,
+  tokenizeSql,
+} from '../../src/customTools/masking.js';
 import { resetCustomTools, setCustomTools } from '../../src/customTools/registry.js';
-import { executeQueryTool } from '../../src/tools/query.js';
+import { executeQueryTool, prepareReadQuery } from '../../src/tools/query.js';
 
 const query = vi.mocked(executeQuery);
 const masked = new Set(['EMAIL', 'PHONE']);
@@ -62,6 +68,27 @@ describe('checkMaskedColumns', () => {
     const kinds = tokenizeSql(sql).filter((token) => token.text.includes('EMAIL') || token.upper === 'EMAIL');
     expect(kinds.every((token) => token.kind === 'string' || token.kind === 'comment')).toBe(true);
   });
+
+  it('treats a quoted column name like the plain name', () => {
+    const plain = checkMaskedColumns('SELECT "EMAIL", C."PHONE" FROM MYLIB.CUSTOMERS C', masked);
+    expect(plain.violations).toEqual([]);
+    expect(plain.selected.sort()).toEqual(['EMAIL', 'PHONE']);
+
+    for (const sql of [
+      'SELECT "EMAIL" AS E FROM MYLIB.CUSTOMERS',
+      'SELECT CUSTNO FROM MYLIB.CUSTOMERS WHERE "EMAIL" = ?',
+      'SELECT UPPER("EMAIL") FROM MYLIB.CUSTOMERS',
+      'SELECT "email" AS E FROM MYLIB.CUSTOMERS',
+    ]) {
+      expect(checkMaskedColumns(sql, masked).violations.join(' '), sql).toMatch(/Masked column EMAIL must be a plain selected column/);
+    }
+  });
+
+  it('reads a doubled quote inside a quoted name as one quote', () => {
+    const tokens = tokenizeSql('SELECT "A""B", "EMAIL" FROM MYLIB.CUSTOMERS');
+    const delims = tokens.filter((token) => token.kind === 'delim').map((token) => token.text);
+    expect(delims).toEqual(['A"B', 'EMAIL']);
+  });
 });
 
 describe('maskRows', () => {
@@ -99,6 +126,27 @@ describe('maskRows', () => {
   });
 });
 
+describe('requireMaskedColumns and maskValue', () => {
+  const rules = new Map<string, 'redact' | 'last4'>([
+    ['EMAIL', 'redact'],
+    ['PHONE', 'last4'],
+  ]);
+
+  it('checks masked columns against a header, case-insensitively', () => {
+    expect(requireMaskedColumns(['CUSTNO', 'email', 'Phone'], rules)).toBeUndefined();
+    expect(requireMaskedColumns(['CUSTNO', 'EMAIL'], rules)).toMatch(/PHONE/);
+    expect(requireMaskedColumns([], new Map())).toBeUndefined();
+  });
+
+  it('masks one value and leaves null and undefined alone', () => {
+    expect(maskValue('ada@example.com', 'redact')).toBe('****');
+    expect(maskValue('555-0100', 'last4')).toBe('****0100');
+    expect(maskValue(5550100, 'last4')).toBe('***0100');
+    expect(maskValue(null, 'redact')).toBeNull();
+    expect(maskValue(undefined, 'last4')).toBeUndefined();
+  });
+});
+
 describe('execute_query masking', () => {
   const previousEnv = process.env;
 
@@ -118,6 +166,7 @@ describe('execute_query masking', () => {
   function loadMasking(): void {
     setCustomTools({
       tools: [],
+      instructions: [],
       annotations: [],
       masking: new Map([['MYLIB.CUSTOMERS', new Map([['EMAIL', 'redact']])]]),
     });
@@ -163,6 +212,21 @@ describe('execute_query masking', () => {
     expect(result.data).toEqual([{ EMAIL: '****' }]);
   });
 
+  it('masks a column selected by its quoted name', async () => {
+    loadMasking();
+    query.mockImplementation(async (sql: string) => {
+      if (sql.includes('PARSE_STATEMENT')) {
+        return { rows: [parsedRow({ NAME_TYPE: 'TABLE', SCHEMA: 'MYLIB', NAME: 'CUSTOMERS' })] };
+      }
+      return { rows: [{ EMAIL: 'ada@example.com' }] };
+    });
+
+    const result = await executeQueryTool({ sql: 'SELECT "EMAIL" FROM MYLIB.CUSTOMERS' });
+
+    expect(result.success).toBe(true);
+    expect(result.data).toEqual([{ EMAIL: '****' }]);
+  });
+
   it('leaves a table with no rule untouched', async () => {
     loadMasking();
     query.mockImplementation(async (sql: string) => {
@@ -176,5 +240,80 @@ describe('execute_query masking', () => {
 
     expect(result.success).toBe(true);
     expect(result.data).toEqual([{ ORDERNO: 1001 }]);
+  });
+
+  it('warns about rounded columns, except masked ones', async () => {
+    loadMasking();
+    query.mockImplementation(async (sql: string) => {
+      if (sql.includes('PARSE_STATEMENT')) {
+        return { rows: [parsedRow({ NAME_TYPE: 'TABLE', SCHEMA: 'MYLIB', NAME: 'CUSTOMERS' })] };
+      }
+      return { rows: [{ EMAIL: 12345678901234567000, TOTAL: 12345678901234567000 }], roundedColumns: ['EMAIL', 'TOTAL'] };
+    });
+
+    const result = await executeQueryTool({ sql: 'SELECT EMAIL, TOTAL FROM MYLIB.CUSTOMERS' });
+
+    expect(result.success).toBe(true);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings?.[0]).toContain('values in TOTAL are not exact');
+  });
+});
+
+describe('prepareReadQuery', () => {
+  const previousEnv = process.env;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetCustomTools();
+    process.env = { ...previousEnv };
+    delete process.env.QUERY_PARSE_CHECK;
+    delete process.env.QUERY_ALLOWED_SCHEMAS;
+  });
+
+  afterEach(() => {
+    process.env = previousEnv;
+    resetCustomTools();
+  });
+
+  it('rejects a write without reaching the IBM i', async () => {
+    const result = await prepareReadQuery({ sql: 'DELETE FROM MYLIB.ORDERS' });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/Security validation failed/);
+      expect(result.violations?.length).toBeGreaterThan(0);
+    }
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('returns the mask rules for the selected columns and runs nothing but the parse check', async () => {
+    setCustomTools({
+      tools: [],
+      instructions: [],
+      annotations: [],
+      masking: new Map([['MYLIB.CUSTOMERS', new Map([['EMAIL', 'redact']])]]),
+    });
+    query.mockResolvedValueOnce({
+      rows: [parsedRow({ NAME_TYPE: 'TABLE', SCHEMA: 'MYLIB', NAME: 'CUSTOMERS' })],
+    });
+
+    const result = await prepareReadQuery({ sql: 'SELECT CUSTNO, EMAIL FROM MYLIB.CUSTOMERS' });
+
+    expect(result).toEqual({
+      ok: true,
+      maskRules: new Map([['EMAIL', 'redact']]),
+      filters: { tables: [], warnings: [] },
+    });
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(String(query.mock.calls[0][0])).toMatch(/PARSE_STATEMENT/);
+  });
+
+  it('returns no rules when the parse check is off and nothing is masked', async () => {
+    process.env.QUERY_PARSE_CHECK = 'false';
+
+    const result = await prepareReadQuery({ sql: 'SELECT ORDERNO FROM MYLIB.ORDERS' });
+
+    expect(result).toEqual({ ok: true, maskRules: new Map(), filters: { tables: [], warnings: [] } });
+    expect(query).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,7 @@
-# Configuration
+---
+title: "Configuration"
+description: "Environment variables, database drivers, multiple systems, and connection options."
+---
 
 This guide covers all configuration options for mcp-server-db2i.
 
@@ -32,13 +35,13 @@ DB2I_PASSWORD=your-password
 |----------|----------|---------|-------------|
 | `DB2I_HOSTNAME` | Yes | - | IBM i hostname or IP address |
 | `DB2I_USERNAME` | Yes* | - | IBM i user profile |
-| `DB2I_PASSWORD` | Yes* | - | User password. Not needed with `DB2I_DRIVER=mapepire` and `privateKeyFile` in `DB2I_MAPEPIRE_OPTIONS` |
+| `DB2I_PASSWORD` | Yes* | - | User password. Not needed with `DB2I_DRIVER=mapepire` and `privateKeyFile` or `agent` in `DB2I_MAPEPIRE_OPTIONS` |
 | `DB2I_USERNAME_FILE` | No | - | Path to file containing username (overrides `DB2I_USERNAME`) |
 | `DB2I_PASSWORD_FILE` | No | - | Path to file containing password (overrides `DB2I_PASSWORD`) |
-| `DB2I_PORT` | No | `446` | Not used. The `odbc` and `jt400` drivers connect to the IBM i host servers (8471, or 9471 with TLS), not the DRDA port. `mapepire` uses SSH (`sshPort` in `DB2I_MAPEPIRE_OPTIONS`) |
+| `DB2I_PORT` | No | `446` | Not used. The `odbc` and `jt400` drivers connect to the IBM i host servers (449 port mapper, 8476 sign-on and 8471 database, or 9476 and 9471 with TLS), not the DRDA port. `mapepire` uses SSH (`sshPort` in `DB2I_MAPEPIRE_OPTIONS`) |
 | `DB2I_DATABASE` | No | `*LOCAL` | Not used. To reach an independent ASP, set the driver option (`database name` for jt400, `DATABASE` for ODBC) |
 | `DB2I_SCHEMA` | No | - | Default schema/library. Also the library list for `execute_query` (JDBC `libraries`, ODBC `DBQ`) when the option is not set |
-| `DB2I_DRIVER` | No | `odbc` | Database driver: `odbc` (IBM i Access ODBC driver, no Java), `jt400` (JDBC via the optional node-jt400 package, needs Java) or `mapepire` (Mapepire over SSH, needs Java on the IBM i only). See [Database Drivers](#database-drivers) |
+| `DB2I_DRIVER` | No | `odbc` | Database driver: `odbc` (IBM i Access ODBC driver, no Java), `jt400` (JDBC via node-jt400, installed separately, needs Java) or `mapepire` (Mapepire over SSH, @ibm/mapepire-js and ssh2 installed separately, needs Java on the IBM i only). See [Database Drivers](#database-drivers) |
 | `DB2I_JDBC_OPTIONS` | No | - | Additional JDBC options (semicolon-separated). `jt400` and `mapepire` drivers |
 | `DB2I_ODBC_OPTIONS` | No | - | Additional ODBC connection keywords (semicolon-separated). `odbc` driver only |
 | `DB2I_MAPEPIRE_OPTIONS` | No | - | SSH and Mapepire settings (semicolon-separated). `mapepire` driver only. See [Using the Mapepire driver](#using-the-mapepire-driver-ssh) |
@@ -53,10 +56,14 @@ DB2I_PASSWORD=your-password
 | `MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `http`, or `both` |
 | `MCP_HTTP_PORT` | `3000` | HTTP server port |
 | `MCP_HTTP_HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` for a published Docker port or a reverse proxy on another container. Terminate TLS here or at that proxy |
+| `MCP_TRUST_PROXY` | `false` | Express `trust proxy`: `true`, a hop count, or comma-separated proxy addresses or subnets. Set it behind a reverse proxy or tunnel so rate limits see the client address |
 | `MCP_ALLOWED_HOSTS` | loopback | Extra `Host` header names, comma-separated. `localhost`, `127.0.0.1`, and `::1` are always allowed. The bind address is included unless it is `0.0.0.0` |
 | `MCP_SESSION_MODE` | `stateless` | `stateless` (default). `stateful` is deprecated and only keeps `Mcp-Session-Id` for 2025-era clients |
 | `MCP_TOKEN_EXPIRY` | `3600` | Token lifetime in seconds (for `required` auth mode) |
 | `MCP_MAX_SESSIONS` | `100` | Maximum concurrent sessions |
+| `MCP_POOL_IDLE_TIMEOUT` | `600` | Seconds an HTTP session's connections may sit unused before they close. The next query reconnects. `0` turns it off |
+
+Over stdio, the server exits when its client goes away: when stdin closes, or when writing to stdout fails. It closes its connection pools first, the same as on `SIGINT`, `SIGTERM`, or `SIGHUP`. Shutdown takes at most 5 seconds. A pool that is still waiting on a running statement after that is logged and left behind, and the process exits with code 1. In `both` mode, a closed stdin closes only the stdio connection pools, and the HTTP transport keeps serving.
 
 ### HTTP Authentication Settings
 
@@ -65,7 +72,23 @@ DB2I_PASSWORD=your-password
 | `MCP_AUTH_MODE` | `required` | Authentication mode (see below) |
 | `MCP_AUTH_TOKEN` | - | Static token for `token` auth mode |
 | `MCP_ALLOW_UNAUTHENTICATED_HTTP` | `false` | Allow `MCP_AUTH_MODE=none` when `MCP_HTTP_HOST` is not a loopback address |
-| `MCP_AUTH_ALLOWED_DB_HOSTS` | `DB2I_HOSTNAME` | Comma-separated hosts `POST /auth` may connect to. When unset, only `DB2I_HOSTNAME` is accepted. When both are unset, any host is accepted and a warning is logged |
+| `MCP_AUTH_ALLOWED_DB_HOSTS` | `DB2I_HOSTNAME` | Comma-separated hosts `POST /auth` and the OAuth sign-in may connect to. When unset, only `DB2I_HOSTNAME` is accepted. When both are unset, any host is accepted and a warning is logged |
+| `MCP_OAUTH_ENABLED` | `false` | Built-in OAuth 2.1 authorization server with an IBM i sign-in page, for remote clients such as claude.ai. Requires `MCP_AUTH_MODE=required`. See [Remote Clients (OAuth)](http-transport.md#remote-clients-oauth) |
+| `MCP_PUBLIC_URL` | - | External HTTPS origin of the server (no path). Required with OAuth |
+| `MCP_OAUTH_REDIRECT_URIS` | Claude connector and Cursor callbacks | Comma-separated redirect URIs clients may register. Exact URLs, or prefixes ending in `/*`. Loopback is always accepted |
+| `MCP_OAUTH_SECRET` | random per process | Signing key, at least 32 characters. Set it so client registrations survive a restart |
+| `MCP_OAUTH_REFRESH_EXPIRY` | `604800` | Refresh token lifetime in seconds. `0` turns refresh tokens off |
+| `MCP_OAUTH_STATE_FILE` | none | Encrypted file for refresh grants, so users stay signed in across a restart. Requires `MCP_OAUTH_SECRET`. See [Staying signed in across restarts](http-transport.md#staying-signed-in-across-restarts) |
+| `MCP_OAUTH_BRAND_NAME` | - | Company name in the sign-in page header and browser tab. See [Customize for your company](customization.md) |
+| `MCP_OAUTH_LOGO` | db2i/mcp logo | SVG or PNG file for the sign-in page header, at most 64 KB |
+| `MCP_OAUTH_TITLE` | `Sign in to IBM i` | Sign-in page heading, for every language |
+| `MCP_OAUTH_SYSTEM_LABEL` | `System` | Label above the system picker, for every language |
+| `MCP_OAUTH_ACCENT` | `#3159E8` | Button and focus color, `#RGB` or `#RRGGBB` |
+| `MCP_OAUTH_ACCENT_DARK` | `MCP_OAUTH_ACCENT` | The same in dark mode |
+| `MCP_OAUTH_FONT_FAMILY` | system fonts | CSS font stack for the sign-in page text |
+| `MCP_OAUTH_FONT_FILE` | - | WOFF2 font for the sign-in page text, at most 200 KB |
+| `MCP_OAUTH_LANGUAGE` | `en` | Sign-in page language: `en`, `fi`, a language from `MCP_OAUTH_STRINGS`, or `auto` to follow the browser |
+| `MCP_OAUTH_STRINGS` | - | JSON file that changes sign-in page wording or adds a language. See [Language and wording](customization.md#language-and-wording) |
 
 **Authentication Modes:**
 
@@ -87,7 +110,30 @@ DB2I_PASSWORD=your-password
 |----------|---------|-------------|
 | `QUERY_DEFAULT_LIMIT` | `1000` | Default number of rows returned by queries |
 | `QUERY_MAX_LIMIT` | `10000` | Maximum rows allowed (caps user-provided limits) |
+| `QUERY_TIMEOUT` | `120` | Seconds a statement may run before it is cancelled on the IBM i. Applies to every statement a tool runs, including catalog queries. `0` turns the limit off; at most `86400`. A profile's `queryTimeout` overrides it. How each driver cancels is in [Security](security.md#query-timeout) |
+| `QUERY_MAX_LENGTH` | `32768` | Longest SQL statement, in characters, that `execute_query`, `validate_query`, `export_query` and business SQL tools accept. From `1` to `2097152` |
 | `QUERY_PARSE_CHECK` | on | `execute_query` and business SQL tools parse the statement with `QSYS2.PARSE_STATEMENT` before running it. One extra round trip, often a few hundred milliseconds. Business tools cache that result. Set to `false` or `0` to turn the check off |
+
+### Query exports
+
+[`export_query`](tools.md#query-exports) writes query results to files on the server host. It is off until both of the first two variables are set.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EXPORT_ENABLED` | off | `true` or `1` registers `export_query` and, over HTTP, the `/exports/:id` download route |
+| `EXPORT_DIR` | - | Directory for export files. Created with mode `0700`; it must not be a symbolic link and must belong to the user the server runs as. Export files left by an earlier run are deleted at startup; other files are left alone |
+| `EXPORT_MAX_ROWS` | `100000` | Most rows per export. `max_rows` can only lower it |
+| `EXPORT_MAX_BYTES` | `104857600` | Largest export file in bytes (100 MB). The export stops after the batch that reaches it, and the result says `truncated: "bytes"` |
+| `EXPORT_TIMEOUT` | `QUERY_TIMEOUT` | Seconds an export may take, from the query to the last row. The statement is cancelled on the IBM i at the limit, as with `QUERY_TIMEOUT`. `0` turns the limit off |
+| `EXPORT_TTL_MINUTES` | `15` | Minutes a finished file is kept. Then the file and its link are gone |
+| `EXPORT_MAX_DOWNLOADS` | `3` | Downloads a link allows. After the last one the link stops working and the file is deleted. `HEAD` requests do not count. `1` makes links single use |
+| `EXPORT_MAX_CONCURRENT` | `2` | Exports that may run at the same time. Each holds a connection (or a Mapepire job) until it finishes |
+| `EXPORT_DIR_MAX_BYTES` | `1073741824` | Bytes all export files may take together (1 GB). A new export is refused when it could go over |
+| `MCP_PUBLIC_URL` | - | Needed over HTTP: download links are `<MCP_PUBLIC_URL>/exports/<id>`. The same variable the OAuth server uses; its host is added to the allowed hosts |
+
+Over stdio the result is the file path, so the user can open the file from the same machine. Over HTTP it is a download link, and the server only ever hands out links, never host paths. With `MCP_TRANSPORT=both`, each caller gets the form for its transport.
+
+The Mapepire driver gives an export a job of its own and never shares one, because cancelling at `EXPORT_TIMEOUT` ends whatever the job is running. When every job allowed by `maxJobs` is busy, the export is refused and can be tried again.
 
 ### Tool Selection
 
@@ -96,7 +142,7 @@ DB2I_PASSWORD=your-password
 | `MCP_TOOLS_ENABLED` | - | Comma-separated allowlist. If set, only these tools are registered |
 | `MCP_TOOLS_DISABLED` | - | Comma-separated denylist, applied after the allowlist |
 
-Valid built-in names: `execute_query`, `list_schemas`, `list_tables`, `search_tables`, `search_columns`, `describe_table`, `list_views`, `list_indexes`, `get_table_constraints`, `validate_query`, `get_object_ddl`, `get_related_objects`, `get_journal_info`, `profile_table`, `get_business_context`. Names are case-insensitive. An unknown name stops the server at startup, so a typo can't silently leave a tool exposed.
+Valid built-in names: `execute_query`, `export_query` (also needs `EXPORT_ENABLED`), `list_schemas`, `list_tables`, `search_tables`, `search_columns`, `describe_table`, `list_views`, `list_indexes`, `get_table_constraints`, `list_routines`, `describe_routine`, `validate_query`, `get_object_ddl`, `get_related_objects`, `get_journal_info`, `index_advice`, `profile_table`, `get_business_context`, `search_ibmi_services`. Names are case-insensitive. An unknown name stops the server at startup, so a typo can't silently leave a tool exposed.
 
 When [business SQL tools](custom-tools.md) are loaded, the same variables also accept a custom tool name or `toolset:<name>`. A toolset selector matches only custom tools in that group. `toolset:sales` does not register `execute_query`.
 
@@ -113,7 +159,7 @@ MCP_TOOLS_ENABLED=list_schemas,list_tables,describe_table
 
 Disabled tools are not listed by `tools/list` and cannot be called. The setting applies to both stdio and HTTP transports.
 
-Resources and prompts follow the tools they draw on. Disabling `describe_table` removes `db2i://{schema}/{table}` and all three prompts. Disabling `get_object_ddl` removes `db2i://{schema}/{table}/ddl`, and disabling `get_business_context` removes `db2i://business-context`. See [Resources and prompts](../README.md#resources-and-prompts).
+Resources and prompts follow the tools they draw on. Disabling `describe_table` removes `db2i://{schema}/{table}` and all three prompts. Disabling `get_object_ddl` removes `db2i://{schema}/{table}/ddl`, and disabling `get_business_context` removes `db2i://business-context`. See [Resources and prompts](tools.md#resources).
 
 ### Business SQL tools
 
@@ -136,6 +182,14 @@ The server reads these files before it accepts connections. A statement that is 
 
 `structuredContent` always holds the raw result object, whatever this setting is. Only the text content changes.
 
+### Result View (charts)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_UI_ENABLED` | `true` | Offer the result view, a grid and chart that MCP Apps hosts show under `execute_query`, `profile_table` and business SQL tool results. `false` leaves out the `ui://db2i/result` resource, the tool metadata that points to it, and the `chart` argument of `execute_query` |
+
+Hosts without MCP Apps support ignore the view and show the text result as before. See [Result view](tools.md#result-view).
+
 ### Rate Limiting
 
 | Variable | Default | Description |
@@ -143,6 +197,14 @@ The server reads these files before it accepts connections. A statement that is 
 | `RATE_LIMIT_WINDOW_MS` | `900000` | Rate limit time window in milliseconds (15 min) |
 | `RATE_LIMIT_MAX_REQUESTS` | `100` | Maximum requests allowed per window |
 | `RATE_LIMIT_ENABLED` | `true` | Set to `false` or `0` to disable rate limiting |
+| `AUTH_RATE_LIMIT_MAX_ATTEMPTS` | `5` | Login attempts allowed per IP address in the window, for `POST /auth` and the OAuth sign-in form together |
+| `AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Login rate limit window in milliseconds (1 min) |
+| `OAUTH_RATE_LIMIT_MAX_REQUESTS` | `120` | Requests allowed per IP address in the window, across all `/oauth/*` endpoints |
+| `OAUTH_RATE_LIMIT_WINDOW_MS` | `60000` | OAuth endpoint rate limit window in milliseconds (1 min) |
+
+The login limit guards against password guessing. `POST /auth` and the OAuth sign-in form share it. The OAuth limit covers registration, sign-in, token and revocation requests. Its variables are only read with `MCP_OAUTH_ENABLED`. Neither limit has an off switch, and `RATE_LIMIT_ENABLED` does not affect them. Each value must be a positive whole number, and a window can be at most `2147483647` ms (about 24.8 days), or the HTTP server does not start.
+
+Both limits count per client address. Raise them when many users arrive from one address: behind NAT or a proxy, or through a hosted client such as claude.ai, whose requests come from a shared outbound range (`160.79.104.0/21`).
 
 ### Logging
 
@@ -155,6 +217,10 @@ The server reads these files before it accepts connections. A statement that is 
 | `MCP_AUDIT_LOG` | off | `stderr` writes one JSON line per tool call to standard error, separate from the pino log. Any other value is a file path to append. The server refuses to start when that path is not writable |
 | `MCP_AUDIT_SQL` | `hash` | `hash` records `sha256:` of the statement. `full` records the SQL text. Anything else stops startup |
 | `MCP_AUDIT_PARAMS` | off | `true` includes bound parameter values. Otherwise the line records only how many values were bound |
+| `MCP_BUILD_ID` | - | Build identifier written to every audit line as `build`, such as the git commit the server was built from. Use it to tell deployments apart between releases. 1 to 64 letters, digits and `._+-`; anything else stops startup. The Docker image takes it as a build argument: `docker build --build-arg MCP_BUILD_ID=$(git rev-parse --short HEAD) .` |
+| `MCP_TOOL_INTENT` | off | `true` adds an optional `context` argument to every tool, in which the model says why it made the call. It is removed before the tool runs and written to the audit log as `intent`. The text comes from the user's prompt: read [Before you turn these on](security.md#before-you-turn-these-on) first |
+
+With the audit log on, every line records the server version (`serverVersion`) and, with `MCP_BUILD_ID`, the build. Lines also record the MCP client, a hash of the session, why a failed call failed (`errorKind`), and sign-ins at the OAuth page and `POST /auth`. See [Call details and sign-ins](security.md#call-details-and-sign-ins). All of this is optional and stays in your own log.
 
 ## Example Configuration
 
@@ -183,6 +249,7 @@ MCP_HTTP_HOST=127.0.0.1
 MCP_SESSION_MODE=stateless
 MCP_TOKEN_EXPIRY=3600
 MCP_MAX_SESSIONS=100
+MCP_POOL_IDLE_TIMEOUT=600
 
 # HTTP Authentication (choose one mode)
 MCP_AUTH_MODE=required
@@ -196,10 +263,16 @@ MCP_TLS_KEY_PATH=/certs/server.key
 # Query limits
 QUERY_DEFAULT_LIMIT=1000
 QUERY_MAX_LIMIT=10000
+QUERY_TIMEOUT=120
 
 # Libraries execute_query and the SQL service tools may reference (unset = no restriction)
 # QUERY_ALLOWED_SCHEMAS=MYLIB,QSYS2
 # QUERY_PARSE_CHECK=true
+
+# Query exports (export_query); links need MCP_PUBLIC_URL over HTTP
+# EXPORT_ENABLED=true
+# EXPORT_DIR=/data/exports
+# MCP_PUBLIC_URL=https://mcp.example.com
 
 # Tool selection and response format
 # MCP_TOOLS_ENABLED=list_schemas,list_tables,describe_table
@@ -207,6 +280,7 @@ QUERY_MAX_LIMIT=10000
 # MCP_TOOLS_ENABLED=toolset:sales,get_business_context
 MCP_TOOLS_DISABLED=execute_query
 MCP_RESPONSE_FORMAT=json
+# MCP_UI_ENABLED=true
 
 # Rate limiting
 RATE_LIMIT_WINDOW_MS=900000
@@ -222,29 +296,71 @@ NODE_ENV=production
 
 `DB2I_DRIVER` picks how the server talks to Db2 for i. All drivers run the same tools and apply the same defaults: system naming, ISO dates, a read-only query connection, `DB2I_SCHEMA` as the library list, and a second connection without the read-only setting for `QSYS2.GENERATE_SQL` (`get_object_ddl`). Each driver is loaded on first use, so the default `odbc` driver never starts Java.
 
-Pick by what the network allows: `odbc` and `jt400` need the database host server ports (8471 and friends) open to the MCP server. `mapepire` needs only SSH (port 22).
+Pick by what the network allows: `odbc` and `jt400` need the database host server ports (8471 and friends) open to the MCP server. `mapepire` needs only SSH (port 22) open to the MCP server. By default it still connects to the database host server inside the IBM i, so that server must be running there (see [`technique`](#options)).
 
 | Driver | Package | Needs | Options variable |
 |--------|---------|-------|------------------|
 | `odbc` (default) | [odbc](https://www.npmjs.com/package/odbc) (IBM/node-odbc) | unixODBC and the IBM i Access ODBC Driver | `DB2I_ODBC_OPTIONS` |
 | `jt400` | [node-jt400](https://www.npmjs.com/package/node-jt400) | A JDK when running `npm install`, and a Java Runtime Environment 11 or later at runtime | `DB2I_JDBC_OPTIONS` |
-| `mapepire` | [@ibm/mapepire-js](https://www.npmjs.com/package/@ibm/mapepire-js) and [ssh2](https://www.npmjs.com/package/ssh2) | SSH access to the IBM i, and Java 8 or later on the IBM i. Nothing on the MCP server side | `DB2I_MAPEPIRE_OPTIONS`, plus `DB2I_JDBC_OPTIONS` |
+| `mapepire` | [@ibm/mapepire-js](https://www.npmjs.com/package/@ibm/mapepire-js) and [ssh2](https://www.npmjs.com/package/ssh2) | SSH access to the IBM i, and Java 8 or later on the IBM i. No Java on the MCP server side | `DB2I_MAPEPIRE_OPTIONS`, plus `DB2I_JDBC_OPTIONS` |
 
-All driver packages are optional dependencies, so `npm install` succeeds when one of them cannot build. If the `odbc` prebuilt binary is missing for your platform, `npm install` builds it from source and needs the unixODBC headers (`unixodbc-dev` on Debian and Ubuntu, `unixODBC-devel` on RHEL and SUSE).
+Only the `odbc` package installs with the server. It is an optional dependency, so `npm install` still succeeds when it cannot build. If the `odbc` prebuilt binary is missing for your platform, `npm install` builds it from source and needs the unixODBC headers (`unixodbc-dev` on Debian and Ubuntu, `unixODBC-devel` on RHEL and SUSE).
+
+### Installing the jt400 and mapepire packages
+
+`node-jt400`, `@ibm/mapepire-js` and `ssh2` are optional peer dependencies: npm and npx do not install them. Add the packages for the driver you pick next to the server.
+
+| Driver | With npx | With npm |
+|--------|----------|----------|
+| `jt400` | `npx -y -p mcp-server-db2i@latest -p node-jt400 mcp-server-db2i` | `npm install -g mcp-server-db2i node-jt400` |
+| `mapepire` | `npx -y -p mcp-server-db2i@latest -p @ibm/mapepire-js -p ssh2 mcp-server-db2i` | `npm install -g mcp-server-db2i @ibm/mapepire-js ssh2` |
+
+`npx` can only add packages that are on its command line, so a client config passes each one with `-p`. For `jt400`:
+
+```json
+{
+  "mcpServers": {
+    "db2i": {
+      "command": "npx",
+      "args": ["-y", "-p", "mcp-server-db2i@latest", "-p", "node-jt400", "mcp-server-db2i"],
+      "env": {
+        "DB2I_DRIVER": "jt400",
+        "DB2I_HOSTNAME": "ibmi.example.com",
+        "DB2I_USERNAME": "MYUSER",
+        "DB2I_PASSWORD": "..."
+      }
+    }
+  }
+}
+```
+
+For `mapepire`, use `"args": ["-y", "-p", "mcp-server-db2i@latest", "-p", "@ibm/mapepire-js", "-p", "ssh2", "mcp-server-db2i"]` and `"DB2I_DRIVER": "mapepire"`.
+
+In a project instead of a global install, leave out `-g`. When a system (from `DB2I_DRIVER` or a profile in `DB2I_PROFILES`) uses a driver whose packages are missing, the server stops at startup and prints the command to run. In [Docker](docker.md), both images include the mapepire packages and the `jt400` image includes `node-jt400`.
+
+### Values that differ by driver
+
+Every driver returns `BIGINT` beyond the JavaScript safe integer range as an exact string, and binary columns (`BINARY`, `VARBINARY`, `BLOB`, `CHAR FOR BIT DATA`, `VARCHAR FOR BIT DATA`) as upper-case hex text, such as `"0AFF"`.
+
+The JDBC option `translate binary=true` changes that for `jt400` and `mapepire`: `FOR BIT DATA` columns come back as text converted from EBCDIC. Bytes that have no character are lost (`X'00FF'` comes back as an empty string), so leave the option off and convert the columns that hold text in the query instead, for example `CAST(<column> AS CHAR(10) CCSID 37)`.
+
+The `odbc` driver reads every `DECIMAL` and `NUMERIC` value as a JavaScript number, so a value with more than 15 digits comes back rounded: `DECIMAL(31,2)` `12345678901234567890.12` arrives as `12345678901234567000`. The `odbc` package has no setting to read these columns as text. When a result has such a value, `execute_query` and business SQL tools add a `warnings` entry that names the column. To keep every digit, select the column as `CAST(<column> AS VARCHAR(40))`, or use the `jt400` or `mapepire` driver, which return wide decimals as exact text.
 
 ### Using the JT400 driver
 
-`node-jt400` builds a native Java bridge during `npm install`. Without a JDK the build fails, npm skips the package, and the install still succeeds with ODBC only. To use JT400:
+`node-jt400` builds a native Java bridge when it installs, so the install needs a JDK and a compiler toolchain. To use JT400:
 
 1. Install a JDK (11 or later) and make sure `JAVA_HOME` points at it.
-2. Install or reinstall the server, for example `npm install -g mcp-server-db2i`, so `node-jt400` builds.
+2. Add `node-jt400` next to the server, with `-p node-jt400` for npx or `npm install -g mcp-server-db2i node-jt400` (see [Installing the jt400 and mapepire packages](#installing-the-jt400-and-mapepire-packages)).
 3. Set `DB2I_DRIVER=jt400`, or `driver: jt400` on a profile.
 
-If the package is missing, the first query fails with an error that names `node-jt400`. The server itself still starts.
+If the build fails, the install fails with it. npm prints `glob` deprecation warnings while installing `node-jt400`. They come from its Java bridge and its build tools, and do not affect the server.
 
 ### Using the Mapepire driver (SSH)
 
-The `mapepire` driver reaches Db2 for i through [Mapepire](https://mapepire-ibmi.github.io/) over SSH. It logs in with SSH as the configured user and starts the Mapepire server inside that session. No Mapepire daemon runs on the IBM i, no port besides SSH is used, and no administrator install is needed.
+The `mapepire` driver reaches Db2 for i through [Mapepire](https://mapepire-ibmi.github.io/) over SSH. It logs in with SSH as the configured user and starts the Mapepire server inside that session. No Mapepire daemon runs on the IBM i, no port besides SSH is opened to the network, and no administrator install is needed.
+
+Add `@ibm/mapepire-js` and `ssh2` next to the server first (see [Installing the jt400 and mapepire packages](#installing-the-jt400-and-mapepire-packages)). Neither needs a build or Java on the MCP server side.
 
 On the first connection, mapepire-js uploads its bundled server JAR (about 10 MB) to `$HOME/.mapepire` in the user's home directory. Later connections reuse it. A JAR that Code for i already installed in `$HOME/.vscode` is reused too. To use an installed server instead, for example the `mapepire-server` RPM, set `serverPath`.
 
@@ -253,10 +369,13 @@ Requirements on the IBM i:
 - The SSH daemon running, and the user allowed to log in with SSH.
 - A home directory for the user, which must exist and be writable.
 - Java 8 or later. mapepire-js uses `/QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit/bin/java` by default. Set `javaPath` to use another JDK.
+- The database host server running (`STRHOSTSVR SERVER(*DATABASE)`), for the default `technique=tcp`. ODBC, JT400 and ACS Run SQL Scripts use the same server, so it is usually running already.
 
-Each Mapepire job is a JVM on the IBM i. Starting one takes a few seconds, and the first start takes longer because of the upload. The pool starts jobs when queries need them, up to `maxJobs`, and closes each one after `idleTimeout` without queries. The SSH session closes with the last job, and the next query opens it again. Over HTTP with `MCP_AUTH_MODE=required`, every `/auth` login starts a job to check the credentials, so a login takes several seconds.
+Each Mapepire job is a JVM on the IBM i. Starting one takes a few seconds, and the first start takes longer because of the upload. The pool starts jobs when queries need them, up to `maxJobs`, and closes each one after `idleTimeout` without queries. The SSH session closes with the last job, and the next query opens it again. Over HTTP, `MCP_POOL_IDLE_TIMEOUT` also closes a session's whole pool after 10 minutes without queries, on every driver. Over HTTP with `MCP_AUTH_MODE=required`, every `/auth` login and OAuth sign-in or refresh starts a job to check the credentials, so it takes several seconds. That job then serves the token's first queries, so they do not wait for another one.
 
 The JDBC connection runs on the IBM i with the JT400 driver, so `DB2I_JDBC_OPTIONS` applies as it does for `jt400`. That includes the read-only default (`access=read only`) and `libraries`. The session is encrypted by SSH, so `secure=true` is not needed.
+
+By default (`technique=tcp`) the Mapepire server connects to the database host server on the same IBM i, as the SSH user, so the queries run in a `QZDASOINIT` job. `technique=cli` uses the native JDBC driver in the SSH job instead. With mapepire-js 1.1 and later (Mapepire server 2.4 and later), `cli` fails with `CCSID value is not valid` when the job CCSID is 65535, which is the case when the system value `QCCSID` is 65535 and the user profile has `CCSID(*SYSVAL)`. Use `cli` only if the user profile has a CCSID such as 37, or the host server cannot be used. mapepire-js 1.0 ignores `technique` and always uses `cli`, which works on its bundled server 2.3.6.
 
 #### Host key check
 
@@ -281,12 +400,14 @@ If neither matches, the connection is refused and the error shows the key's fing
 | `knownHostsFile` | `~/.ssh/known_hosts` | known_hosts file to check the host key against when `hostKey` is not set |
 | `insecureHostKey` | `false` | `true` skips the host key check |
 | `privateKeyFile` | - | Private key for SSH login. When set, SSH does not use the password, and `DB2I_PASSWORD` can be left unset. The key must not have a passphrase. HTTP `/auth` logins ignore it and log in with the caller's password |
+| `agent` | - | SSH agent for the login, so the key can have a passphrase. `true` reads the socket path from `SSH_AUTH_SOCK`, or give the absolute socket path. On Windows: `pageant` for PuTTY Pageant, or `\\.\pipe\openssh-ssh-agent` for the Windows OpenSSH Authentication Agent. When set, `DB2I_PASSWORD` can be left unset. Not together with `privateKeyFile`. HTTP `/auth` logins ignore it and log in with the caller's password |
 | `javaPath` | mapepire-js default (`jdk80`) | Java binary on the IBM i |
 | `serverPath` | - | Path of an installed Mapepire server JAR. When set, the bundled JAR is not uploaded |
+| `technique` | `tcp` | How the Mapepire server connects to Db2: `tcp` (the database host server on the same system) or `cli` (the native JDBC driver in the SSH job, which needs a job CCSID other than 65535). Needs mapepire-js 1.1 or later |
 | `maxJobs` | `2` | Most Mapepire jobs (JVMs) one pool runs at a time |
 | `idleTimeout` | `600000` | Milliseconds before an idle job is closed |
 | `startupTimeout` | `60000` | Milliseconds to wait for a job to start |
-| `requestTimeout` | `120000` | Milliseconds to wait for one query or fetch to answer. A job that does not answer in time is closed |
+| `requestTimeout` | `120000` | Milliseconds to wait for one query or fetch to answer. A job that does not answer in time is closed, which does not stop its statement on the IBM i. While [`QUERY_TIMEOUT`](#query-limits) is on, a request is given at least that limit plus 10 seconds, so the statement is cancelled first |
 
 ```env
 DB2I_DRIVER=mapepire
@@ -295,6 +416,12 @@ DB2I_USERNAME=MCPREAD
 DB2I_PASSWORD=your-password
 DB2I_MAPEPIRE_OPTIONS=hostKey=SHA256:abc...xyz;maxJobs=2
 ```
+
+With `agent=true`, the server reads the agent socket from `SSH_AUTH_SOCK` and refuses to start when it is not set. A shell session usually has it; a service, a launchd job or a Windows service usually does not, so set `SSH_AUTH_SOCK` in `.env` or give the socket path in `agent` instead.
+
+> **Note:** Windows has two SSH agents. For PuTTY Pageant, set `agent=pageant` and load the `.ppk` key into Pageant. For the Windows OpenSSH Authentication Agent (the `ssh-agent` service), set `agent=\\.\pipe\openssh-ssh-agent`, since Windows does not define `SSH_AUTH_SOCK`.
+
+> **Note:** HTTP `/auth` and OAuth sign-ins check the caller's password by logging in over SSH. On an IBM i whose sshd allows only public key login, they cannot work with the `mapepire` driver, whatever `agent` or `privateKeyFile` is set to.
 
 To remove the private install from the IBM i, delete `$HOME/.mapepire` in the user's home directory.
 
@@ -348,7 +475,7 @@ DB2I_ODBC_OPTIONS=SSL=1
 
 ## Multiple Systems
 
-One server can reach several IBM i systems, for example production and test, or two partitions. Set `DB2I_PROFILES` to a YAML file with one profile per system ([example](../examples/profiles.yaml)). For a single system, the [environment variables](#database-connection) are simpler, so you don't need a profiles file.
+One server can reach several IBM i systems, for example production and test, or two partitions. Set `DB2I_PROFILES` to a YAML file with one profile per system ([example](https://github.com/Strom-Capital/mcp-server-db2i/tree/main/examples/profiles.yaml)). For a single system, the [environment variables](#database-connection) are simpler, so you don't need a profiles file.
 
 ```yaml
 profiles:
@@ -371,6 +498,7 @@ profiles:
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `name` | Yes | - | Name tools use in their `system` argument. Letters, digits, `_` and `-` |
+| `label` | No | `name` | Name shown in the OAuth sign-in page's system picker, up to 60 characters. The profile `name` is still what is submitted and logged |
 | `host` | Yes | - | IBM i hostname or IPv4 address |
 | `driver` | No | `DB2I_DRIVER`, else `odbc` | `odbc`, `jt400` or `mapepire`. Each profile can use a different driver |
 | `schema` | No | - | Default library, like `DB2I_SCHEMA` |
@@ -382,8 +510,9 @@ profiles:
 | `jdbcOptions` | No | - | Like `DB2I_JDBC_OPTIONS`, for this system |
 | `odbcOptions` | No | - | Like `DB2I_ODBC_OPTIONS`, for this system |
 | `mapepireOptions` | No | - | Like `DB2I_MAPEPIRE_OPTIONS`, for this system |
+| `queryTimeout` | No | `QUERY_TIMEOUT` | Seconds a statement on this system may run before it is cancelled. `0` turns the limit off for this system |
 
-*Set `username` or `usernameFile`, and `password` or `passwordFile`. A `mapepire` profile with `privateKeyFile` in `mapepireOptions` needs no password. A path may itself be a `"${ENV_VAR}"` reference. Quote every reference: inside a `{ }` map YAML reads a bare `${...}` as another map.
+*Set `username` or `usernameFile`, and `password` or `passwordFile`. A `mapepire` profile with `privateKeyFile` or `agent` in `mapepireOptions` needs no password. A path may itself be a `"${ENV_VAR}"` reference. Quote every reference: inside a `{ }` map YAML reads a bare `${...}` as another map.
 
 How calls pick a system:
 
@@ -409,7 +538,7 @@ The `DB2I_JDBC_OPTIONS` variable accepts semicolon-separated JDBC options for th
 | `date format` | `iso`, `usa`, `eur`, `jis`, `mdy`, `dmy`, `ymd` | Date format for date fields |
 | `time format` | `iso`, `usa`, `eur`, `jis`, `hms` | Time format for time fields |
 | `errors` | `full`, `basic` | Level of detail in error messages (`full` helps debugging) |
-| `translate binary` | `true`, `false` | Whether to translate binary/CCSID data |
+| `translate binary` | `true`, `false` | Return `FOR BIT DATA` columns as text instead of hex. Lossy; see [Values that differ by driver](#values-that-differ-by-driver) |
 | `secure` | `true`, `false` | Enable SSL/TLS encryption for the JDBC connection. Off unless set. Startup logs a warning when it is not `true` |
 | `access` | `all`, `read only`, `read call` | Statement access mode. Defaults to `read only` when omitted. An explicit value overrides that default and is logged at startup |
 
@@ -449,6 +578,7 @@ The `DB2I_ODBC_OPTIONS` variable accepts semicolon-separated connection keywords
 | `DBQ` (`DefaultLibraries`) | `LIB1,LIB2,...` | Default library and library list. Start with a comma (`,LIB1,LIB2`) to set a list without a default library. Defaults to `DB2I_SCHEMA` |
 | `DFT` (`DateFormat`) | `5` ISO, `4` USA, `6` EUR, `7` JIS, `1` MDY, `2` DMY, `3` YMD | Date format. The server sets `5` unless you set it |
 | `TRIMCHAR` (`TrimCharFields`) | `1`, `0` | Trim trailing blanks from CHAR columns. The server sets `1` to match JT400 |
+| `CCSID` | client code page | Code page the driver converts character data to. The server sets `1208` (UTF-8), which node-odbc expects; without it, characters outside ASCII such as `Ä`, `Ö` and `€` arrive as `�`. Only override it if you know the client needs another code page |
 | `SSL` | `1`, `0` | `1` encrypts the whole connection. The driver default only encrypts the password. Startup logs a warning when it is not `1` |
 | `CONNTYPE` (`ConnectionType`) | `2` read only, `1` read/call, `0` read/write | Statement access. Defaults to `2` when omitted. An explicit value overrides that default and is logged at startup |
 | `DRIVER` / `DSN` | driver name or DSN | Defaults to `DRIVER=IBM i Access ODBC Driver`. Set `DSN=...` to use a data source from `odbc.ini` instead |
@@ -508,11 +638,14 @@ QUERY_ALLOWED_SCHEMAS=MYLIB,QSYS2
 When the list is set:
 
 - Every table reference must be in the list. An unqualified name counts as the effective default schema (the session schema, or `DB2I_SCHEMA`).
+- Every schema-qualified function call must be in the list too, so `OUTSIDELIB.F(ORDERNO)` is rejected unless `OUTSIDELIB` is listed. Unqualified functions are not checked: they resolve through the SQL path (the job's library list under the default system naming), which is how built-ins such as `UPPER` and `COALESCE` are found. Clients cannot change the path, because `SET` statements are rejected. Keep libraries outside the list off the user profile's library list.
 - Catalog libraries such as `QSYS2` and `SYSIBM` are not included automatically. Add them if clients should query the catalog.
-- A query the server cannot parse is rejected. That includes system naming (`LIB/FILE`) and `TABLE(...)` table functions.
+- A table function qualified with its library, such as `TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => 'NONE'))`, is checked like a table in that library. Its arguments must be plain values, markers or named arguments; a subquery or another call inside them, and an unqualified table function, are rejected. See [Security](security.md#schema-allowlist).
+- A query the server cannot parse is rejected. That includes system naming (`LIB/FILE`).
 - Names defined in a `WITH` clause are not treated as tables.
 - `search_tables` and `search_columns` search only the libraries in the list. Without a list, they skip system libraries (`Q*` and `SYS*`) unless `include_system` is true.
-- `get_journal_info` and `profile_table` reject a library outside the list. They read `QSYS2` catalog views themselves, so `QSYS2` does not have to be in the list for them.
+- `get_journal_info`, `index_advice`, `profile_table`, `list_routines`, and `describe_routine` reject a library outside the list. They read `QSYS2` catalog views themselves, so `QSYS2` does not have to be in the list for them.
+- `search_ibmi_services` reads only the service catalog `QSYS2.SERVICES_INFO`, so the list does not apply to it. Running one of its examples with `execute_query` still needs the service's schema in the list, usually `QSYS2` or `SYSTOOLS`.
 - `list_tables`, `describe_table`, `list_views`, `list_indexes`, and `get_table_constraints` reject a library outside the list before querying. `list_schemas` returns only the libraries in the list. Keys and indexes of an allowed table are still reported when they reference another library.
 
 A view or alias inside an allowed library can still read other libraries. Give the IBM i user profile access only to the libraries in the list. See [Security](security.md#schema-allowlist).

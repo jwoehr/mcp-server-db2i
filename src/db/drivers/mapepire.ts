@@ -5,24 +5,57 @@
  * the IBM i and starts the Mapepire server inside it, one server process per
  * job. mapepire-js uploads its bundled server JAR to the user's
  * $HOME/.mapepire on first use unless serverPath points at an installed one.
- * Nothing needs to be installed or running on the IBM i besides sshd and Java.
+ * Nothing needs to be installed on the IBM i besides sshd and Java. The server
+ * connects to Db2 through the database host server on the same system
+ * (technique=tcp) unless technique=cli asks for the native JDBC driver.
  *
  * The pool is transport-agnostic: it asks a JobFactory for jobs. A daemon
  * transport (a running Mapepire server on port 8076) would add a factory and
  * reuse the pool.
  *
- * Both packages are optional dependencies, imported only when a mapepire pool
+ * Both packages are optional peer dependencies, imported only when a mapepire pool
  * is first needed.
  */
 
 import { readFileSync } from 'node:fs';
 import type { SQLJob } from '@ibm/mapepire-js';
 import type { Client, ConnectConfig } from 'ssh2';
-import type { DB2iConfig, MapepireSettings, MapepireSshSettings } from '../../config.js';
+import type { DB2iConfig, MapepireSettings, MapepireSshSettings, MapepireTechnique } from '../../config.js';
 import { buildMapepireJdbcOptions, resolveMapepireSettings } from '../../config.js';
-import type { CreatePoolOptions, DbDriver, DbPool, QueryParam } from '../driver.js';
-import { toDb2Timestamp } from '../driver.js';
+import { kindFromTypeName, rowFromObject } from '../columns.js';
+import type {
+  CreatePoolOptions,
+  DbColumn,
+  DbCursorOptions,
+  DbDriver,
+  DbPool,
+  DbQueryOptions,
+  DbRows,
+  QueryParam,
+  RowCursor,
+} from '../driver.js';
+import { CANCEL_GRACE_MS, DbError, QueryTimeoutError, toDb2Timestamp, withQueryTimeout } from '../driver.js';
+import { driverInstallHelp } from '../driverPackages.js';
 import { createHostKeyVerifier } from './sshHostKey.js';
+
+/** The fields of mapepire-js's column metadata used here. */
+interface MapepireColumn {
+  name: string;
+  label?: string;
+  type: string;
+  precision: number;
+  scale: number;
+}
+
+function mapepireColumns(columns: readonly MapepireColumn[]): DbColumn[] {
+  return columns.map((column) => ({
+    name: column.label || column.name,
+    kind: kindFromTypeName(column.type),
+    dbType: column.type,
+    precision: column.precision,
+    scale: column.scale,
+  }));
+}
 
 type MapepireModule = typeof import('@ibm/mapepire-js');
 type Ssh2Module = typeof import('ssh2');
@@ -71,7 +104,7 @@ function loadOptional<T>(
     }
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(
-      `DB2I_DRIVER=mapepire needs the optional @ibm/mapepire-js and ssh2 packages: npm install @ibm/mapepire-js ssh2. ${message}`,
+      `Could not load ${specifier}: ${message}\n\n${driverInstallHelp('mapepire')}`,
       { cause: error }
     );
   });
@@ -113,23 +146,72 @@ export interface JobFactory {
   onDead(listener: () => void): void;
 }
 
+const MAPEPIRE_SQL_ERROR = /^([\s\S]*), ([0-9A-Z]{5}), (-?\d+)$/;
+
 /**
  * mapepire-js reports a failed statement as `message, SQLSTATE, SQLCODE`.
  * Rewrite it as `[SQLSTATE] message`, the same shape as the ODBC driver.
  */
 export function describeMapepireError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  const match = /^([\s\S]*), ([0-9A-Z]{5}), (-?\d+)$/.exec(message);
+  const match = MAPEPIRE_SQL_ERROR.exec(message);
   if (match) {
     return `[${match[2]}] ${match[1]}`;
   }
   return message;
 }
 
+/**
+ * The error a failed request throws: a DbError with the SQLSTATE and SQLCODE
+ * when mapepire-js reported them, else a plain Error with the same message.
+ */
+export function toMapepireError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = MAPEPIRE_SQL_ERROR.exec(message);
+  if (match) {
+    const sqlcode = Number(match[3]);
+    return new DbError(
+      `[${match[2]}] ${match[1]}`,
+      { sqlstate: match[2], sqlcode: sqlcode !== 0 ? sqlcode : undefined },
+      { cause: error }
+    );
+  }
+  return new Error(message, { cause: error });
+}
+
+const NATIVE_CCSID_ERROR = /CCSID value is not valid/i;
+
+/**
+ * The native JDBC driver (technique=cli) refuses to load when the job CCSID
+ * is 65535. Say how to get past it, since the Db2 message does not.
+ */
+export function withCcsidHint(error: unknown, technique: MapepireTechnique): unknown {
+  const message = error instanceof Error ? error.message : String(error);
+  if (technique !== 'cli' || !NATIVE_CCSID_ERROR.test(message)) {
+    return error;
+  }
+  return new Error(
+    `${message.replace(/\.?\s*$/, '.')} The Mapepire server's native JDBC driver (technique=cli) cannot run in a job with CCSID 65535. ` +
+      'Remove technique=cli from DB2I_MAPEPIRE_OPTIONS to use the default tcp, or give the user profile a CCSID, for example CHGUSRPRF CCSID(37).',
+    { cause: error }
+  );
+}
+
 /** mapepire-js binds strings, numbers and null. */
 function bindParams(params: readonly QueryParam[]): Array<string | number | null> {
   return params.map((p) => (p instanceof Date ? toDb2Timestamp(p) : p));
 }
+
+/** The Mapepire server's answer to a request, as far as prepare needs it. */
+interface MapepireResponse {
+  success: boolean;
+  error?: string;
+  sql_state?: string;
+  sql_rc?: number;
+}
+
+// Request IDs for prepare_sql, unique within the process
+let prepareCounter = 0;
 
 /** A request that did not answer within requestTimeout. The pool closes its job. */
 class RequestTimeoutError extends Error {}
@@ -157,10 +239,13 @@ async function runOnJob(
   sql: string,
   params: readonly QueryParam[],
   requestTimeout: number
-): Promise<Row[]> {
+): Promise<DbRows> {
   const query = job.query<Row>(sql, params.length > 0 ? { parameters: bindParams(params) } : {});
   let result = await withTimeout(query.execute(FETCH_SIZE), requestTimeout);
-  const rows: Row[] = [...(result.data ?? [])];
+  const rows: DbRows = [...(result.data ?? [])];
+  if (result.metadata?.columns) {
+    rows.columns = mapepireColumns(result.metadata.columns);
+  }
   try {
     while (!result.is_done) {
       result = await withTimeout(query.fetchMore(FETCH_SIZE), requestTimeout);
@@ -222,7 +307,60 @@ export class JobPool implements DbPool {
     this.sweeper.unref();
   }
 
-  async query(sql: string, params: readonly QueryParam[]): Promise<Row[]> {
+  async query(sql: string, params: readonly QueryParam[], options?: DbQueryOptions): Promise<DbRows> {
+    if (this.closed) {
+      throw new Error('Mapepire pool is closed');
+    }
+    const timeoutMs = options?.timeoutMs ?? 0;
+    const slot = this.pick();
+    slot.active += 1;
+    try {
+      let job: SQLJob;
+      try {
+        job = await slot.ready;
+      } catch (error) {
+        throw new Error(describeMapepireError(error), { cause: error });
+      }
+      // With a statement time limit, a request may take that long plus the
+      // time the cancel needs, so the cancel runs before requestTimeout fires.
+      const requestTimeout =
+        timeoutMs > 0
+          ? Math.max(this.options.requestTimeout, timeoutMs + CANCEL_GRACE_MS)
+          : this.options.requestTimeout;
+      try {
+        return await withQueryTimeout(runOnJob(job, sql, params, requestTimeout), timeoutMs, async () => {
+          const cancelJob = options?.cancelJob;
+          if (!cancelJob || !job.id) {
+            throw new Error('No connection is available to cancel the statement');
+          }
+          await cancelJob(job.id);
+        });
+      } catch (error) {
+        // A timed-out job may still be running the statement, and a job whose
+        // server process exited stays "busy" in mapepire-js. Neither may be
+        // reused. A job whose statement was cancelled is idle again.
+        const cancelled = error instanceof QueryTimeoutError && error.cancelled;
+        if (!cancelled && (error instanceof RequestTimeoutError || error instanceof QueryTimeoutError || !jobIsUsable(job))) {
+          this.drop(slot);
+          void job.close().catch(() => undefined);
+        }
+        if (error instanceof QueryTimeoutError) {
+          throw error;
+        }
+        throw toMapepireError(error);
+      }
+    } finally {
+      slot.active -= 1;
+      slot.lastUsed = Date.now();
+    }
+  }
+
+  /**
+   * Prepare a statement on a job without running it. mapepire-js has no
+   * wrapper, but the Mapepire server answers a `prepare_sql` request with
+   * Db2's error, the same SQLSTATE and SQLCODE as a failed query.
+   */
+  async prepare(sql: string): Promise<void> {
     if (this.closed) {
       throw new Error('Mapepire pool is closed');
     }
@@ -235,21 +373,158 @@ export class JobPool implements DbPool {
       } catch (error) {
         throw new Error(describeMapepireError(error), { cause: error });
       }
+      prepareCounter += 1;
+      const id = `mcpprep${prepareCounter}`;
       try {
-        return await runOnJob(job, sql, params, this.options.requestTimeout);
+        const request = { id, type: 'prepare_sql', sql };
+        const response = await withTimeout(job.send<MapepireResponse>(request), this.options.requestTimeout);
+        // Release the prepared statement; nothing was run
+        void job.send({ id: `${id}c`, type: 'sqlclose', cont_id: id } as { id: string; type: string }).catch(() => undefined);
+        if (!response.success) {
+          throw toMapepireError(
+            new Error(`${response.error ?? 'The statement could not be prepared'}, ${response.sql_state}, ${response.sql_rc}`)
+          );
+        }
       } catch (error) {
-        // A timed-out job may still be running the statement, and a job whose
-        // server process exited stays "busy" in mapepire-js. Neither may be reused.
         if (error instanceof RequestTimeoutError || !jobIsUsable(job)) {
           this.drop(slot);
           void job.close().catch(() => undefined);
         }
-        throw new Error(describeMapepireError(error), { cause: error });
+        throw error instanceof DbError ? error : toMapepireError(error);
       }
     } finally {
       slot.active -= 1;
       slot.lastUsed = Date.now();
     }
+  }
+
+  /**
+   * Open a cursor on a job of its own: an idle job, or a new one below
+   * maxJobs. A cursor never shares a job, because CANCEL_SQL ends whatever
+   * the job is running and another caller's query must not be hit. The job
+   * counts as busy until the cursor closes, so the idle sweeper leaves it.
+   */
+  async openCursor(sql: string, params: readonly QueryParam[], options: DbCursorOptions): Promise<RowCursor> {
+    if (this.closed) {
+      throw new Error('Mapepire pool is closed');
+    }
+    const slot = this.slots.find((candidate) => candidate.active === 0)
+      ?? (this.slots.length < this.options.maxJobs ? this.startSlot() : undefined);
+    if (!slot) {
+      throw new Error(
+        `All ${this.options.maxJobs} Mapepire jobs are busy. Try again when a query has finished, or raise maxJobs.`
+      );
+    }
+    slot.active += 1;
+
+    let released = false;
+    const release = (drop: boolean): void => {
+      if (released) {
+        return;
+      }
+      released = true;
+      slot.active -= 1;
+      slot.lastUsed = Date.now();
+      if (drop) {
+        this.drop(slot);
+        void slot.job?.close().catch(() => undefined);
+      }
+    };
+
+    let job: SQLJob;
+    try {
+      job = await slot.ready;
+    } catch (error) {
+      release(false);
+      throw new Error(describeMapepireError(error), { cause: error });
+    }
+
+    const timeoutMs = options.timeoutMs ?? 0;
+    const requestTimeout =
+      timeoutMs > 0 ? Math.max(this.options.requestTimeout, timeoutMs + CANCEL_GRACE_MS) : this.options.requestTimeout;
+    let cancelFailed = false;
+    let failed = false;
+    const onAbort = (): void => {
+      if (!options.cancelJob || !job.id) {
+        cancelFailed = true;
+        return;
+      }
+      options.cancelJob(job.id).catch(() => {
+        cancelFailed = true;
+      });
+    };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+
+    const query = job.query<Row>(sql, params.length > 0 ? { parameters: bindParams(params) } : {});
+    let done = false;
+    let closed = false;
+
+    // A job that timed out, whose cancel failed, or whose server process is
+    // gone may still be running the statement. It is not reused.
+    const close = async (): Promise<void> => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      options.signal?.removeEventListener('abort', onAbort);
+      const drop = failed || cancelFailed || !jobIsUsable(job);
+      if (!done && !drop) {
+        await query.close().catch(() => undefined);
+      }
+      release(drop);
+    };
+
+    const fail = (error: unknown): Error => {
+      if (error instanceof RequestTimeoutError || !jobIsUsable(job)) {
+        failed = true;
+      }
+      return toMapepireError(error);
+    };
+
+    let first;
+    try {
+      options.signal?.throwIfAborted();
+      first = await withTimeout(query.execute(options.fetchSize), requestTimeout);
+    } catch (error) {
+      const wrapped = fail(error);
+      done = true;
+      await close();
+      throw wrapped;
+    }
+    done = first.is_done;
+    const columns = mapepireColumns(first.metadata?.columns ?? []);
+    let pending: Row[] | undefined = first.data ?? [];
+
+    return {
+      columns,
+      async next() {
+        if (closed) {
+          return null;
+        }
+        if (pending) {
+          const rows = pending;
+          pending = undefined;
+          if (rows.length > 0) {
+            return rows.map((row) => rowFromObject(row, columns));
+          }
+        }
+        while (!done) {
+          let result;
+          try {
+            result = await withTimeout(query.fetchMore(options.fetchSize), requestTimeout);
+          } catch (error) {
+            throw fail(error);
+          }
+          done = result.is_done;
+          const rows = result.data ?? [];
+          if (rows.length > 0) {
+            return rows.map((row) => rowFromObject(row, columns));
+          }
+        }
+        return null;
+      },
+      close,
+    };
   }
 
   async close(): Promise<void> {
@@ -359,7 +634,9 @@ export function createSshJobFactory(
     if (algorithms) {
       connectConfig.algorithms = { serverHostKey: algorithms as never };
     }
-    if (settings.privateKeyFile) {
+    if (settings.agent) {
+      connectConfig.agent = settings.agent;
+    } else if (settings.privateKeyFile) {
       connectConfig.privateKey = readFileSync(settings.privateKeyFile);
     } else {
       connectConfig.password = config.password;
@@ -418,10 +695,17 @@ export function createSshJobFactory(
             ...(settings.javaPath ? { javaPath: settings.javaPath } : {}),
             ...(settings.serverPath ? { serverPath: settings.serverPath } : {}),
           },
+          // mapepire-js 1.1 and later. Older versions ignore it and use cli,
+          // which works with their bundled server 2.3.6.
+          sshSingleTechnique: settings.technique,
         },
         jdbcOptions
       );
-      await job.connect();
+      try {
+        await job.connect();
+      } catch (error) {
+        throw withCcsidHint(error, settings.technique);
+      }
       return job;
     },
     async close() {

@@ -1,0 +1,78 @@
+/*
+ * Brand tokens (docs/assets/brand/README.md). The sign-in page (src/auth/oauth.ts),
+ * docs/docs.json, docs/style.css and src/branding.ts use the same palette:
+ * change them together.
+ */
+:root {
+  color-scheme: light dark;
+
+  --bg: #f3f1eb;
+  --surface: #faf9f6;
+  --fg: #161716;
+  --muted: #666962;
+  --line: #d8d6cf;
+  --line-strong: #161716;
+  --accent: #3159e8;
+  --accent-strong: #2447c9;
+  --on-accent: #ffffff;
+  --error: #b42318;
+
+  --font-sans: 'Geist Variable', Geist, 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 56px;
+  --space-8: 96px;
+
+  --radius-btn: 3px;
+  --radius-input: 2px;
+  --radius-code: 4px;
+  --max: 1240px;
+  --gutter: 20px;
+}
+
+@media (min-width: 900px) {
+  :root { --gutter: 56px; }
+}
+
+/*
+ * Dark mode follows the system unless the reader picked a theme with the
+ * header switch, which sets data-theme on <html>. Keep both dark blocks equal.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --bg: #121312;
+    --surface: #181918;
+    --fg: #ecebe4;
+    --muted: #9c9e97;
+    --line: #2e302d;
+    --line-strong: #ecebe4;
+    --accent: #7d97ff;
+    --accent-strong: #a3b6ff;
+    --on-accent: #0d1330;
+    --error: #f97066;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #121312;
+  --surface: #181918;
+  --fg: #ecebe4;
+  --muted: #9c9e97;
+  --line: #2e302d;
+  --line-strong: #ecebe4;
+  --accent: #7d97ff;
+  --accent-strong: #a3b6ff;
+  --on-accent: #0d1330;
+  --error: #f97066;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+}

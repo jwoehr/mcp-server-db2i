@@ -28,7 +28,7 @@ vi.mock('../../src/utils/logger.js', () => ({
   })),
 }));
 
-import { getTokenManager, TokenManager } from '../../src/auth/tokenManager.js';
+import { getTokenManager, sessionPoolKey, TokenManager } from '../../src/auth/tokenManager.js';
 import type { DB2iConfig } from '../../src/config.js';
 
 describe('TokenManager', () => {
@@ -95,7 +95,7 @@ describe('TokenManager', () => {
         vi.advanceTimersByTime(61_000);
 
         expect(tokenManager.validateToken(token).valid).toBe(false);
-        expect(cleanup).toHaveBeenCalledWith(token);
+        expect(cleanup).toHaveBeenCalledWith(token, expect.objectContaining({ token }));
       } finally {
         vi.useRealTimers();
       }
@@ -157,6 +157,36 @@ describe('TokenManager', () => {
     });
   });
 
+  describe('grants', () => {
+    it('knows a grant while any of its tokens is held', async () => {
+      const first = tokenManager.createSession(mockConfig, undefined, 'default', 'client', 'grant-a');
+      const second = tokenManager.createSession(mockConfig, undefined, 'default', 'client', 'grant-a');
+      tokenManager.createSession(mockConfig, undefined, 'default', 'client', 'grant-b');
+
+      await tokenManager.revokeToken(first.token);
+      expect(tokenManager.hasGrant('grant-a')).toBe(true);
+      await tokenManager.revokeToken(second.token);
+      expect(tokenManager.hasGrant('grant-a')).toBe(false);
+      expect(tokenManager.hasGrant('grant-b')).toBe(true);
+    });
+
+    it('tells the cleanup callback which grant a revoked token came from', async () => {
+      const cleanup = vi.fn();
+      tokenManager.setCleanupCallback(cleanup);
+      const { token } = tokenManager.createSession(mockConfig, undefined, 'default', 'client', 'grant-a');
+
+      await tokenManager.revokeGrant('grant-a');
+      expect(cleanup).toHaveBeenCalledWith(token, expect.objectContaining({ grantId: 'grant-a' }));
+    });
+
+    it('shares one pool key across a grant and keeps other tokens apart', () => {
+      expect(sessionPoolKey('tok-1', { grantId: 'g' })).toBe(sessionPoolKey('tok-2', { grantId: 'g' }));
+      expect(sessionPoolKey('tok-1', { grantId: 'g' })).not.toBe(sessionPoolKey('tok-1', { grantId: 'h' }));
+      expect(sessionPoolKey('tok-1', {})).toBe('tok-1');
+      expect(sessionPoolKey('tok-1', undefined)).toBe('tok-1');
+    });
+  });
+
   describe('getStats', () => {
     it('should return correct session counts', () => {
       tokenManager.createSession(mockConfig);
@@ -167,6 +197,53 @@ describe('TokenManager', () => {
       expect(stats.totalSessions).toBe(2);
       expect(stats.activeSessions).toBe(2);
       expect(stats.expiredSessions).toBe(0);
+    });
+  });
+
+  describe('expired session sweep', () => {
+    // The sweep runs from a timer the singleton starts once, and shutdown() in
+    // afterEach stops it, so these tests call the sweep directly.
+    function sweep(): Promise<void> {
+      return (tokenManager as unknown as { cleanupExpiredSessions(): Promise<void> }).cleanupExpiredSessions();
+    }
+
+    it('removes expired tokens nobody presents and releases their resources', async () => {
+      vi.useFakeTimers();
+      try {
+        const cleanup = vi.fn();
+        tokenManager.setCleanupCallback(cleanup);
+        const expired = tokenManager.createSession(mockConfig, 60);
+        const live = tokenManager.createSession(mockConfig, 3600);
+
+        vi.setSystemTime(Date.now() + 61_000);
+        await sweep();
+
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        expect(cleanup).toHaveBeenCalledWith(expired.token, expect.objectContaining({ token: expired.token }));
+        expect(tokenManager.getSession(expired.token)).toBeUndefined();
+        expect(tokenManager.getSession(live.token)).toBeDefined();
+        expect(tokenManager.getStats().totalSessions).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('keeps sweeping when the cleanup callback fails for one token', async () => {
+      vi.useFakeTimers();
+      try {
+        const cleanup = vi.fn().mockRejectedValueOnce(new Error('pool close failed'));
+        tokenManager.setCleanupCallback(cleanup);
+        tokenManager.createSession(mockConfig, 60);
+        tokenManager.createSession(mockConfig, 60);
+
+        vi.setSystemTime(Date.now() + 61_000);
+        await expect(sweep()).resolves.toBeUndefined();
+
+        expect(cleanup).toHaveBeenCalledTimes(2);
+        expect(tokenManager.getStats().totalSessions).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

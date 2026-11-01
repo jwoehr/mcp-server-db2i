@@ -125,6 +125,36 @@ describe('DB2I_PROFILES', () => {
     expect(test.allowedSchemas).toBeUndefined();
   });
 
+  it('reads an optional label for the sign-in page picker', () => {
+    useProfiles(`
+profiles:
+  - name: fi
+    label: "  Finland "
+    host: prod.example.com
+    username: USER
+    password: \${PROD_PASSWORD}
+  - name: se
+    host: test.example.com
+    username: USER
+    password: \${PROD_PASSWORD}
+`);
+    const [fi, se] = getSystems();
+    expect(fi.name).toBe('fi');
+    expect(fi.label).toBe('Finland');
+    expect(se.label).toBeUndefined();
+
+    resetSystems();
+    useProfiles(`
+profiles:
+  - name: fi
+    label: "${'x'.repeat(61)}"
+    host: prod.example.com
+    username: USER
+    password: \${PROD_PASSWORD}
+`);
+    expect(() => getSystems()).toThrow(SystemsError);
+  });
+
   it('gives a profile without a driver DB2I_DRIVER, and lets its own driver win', () => {
     process.env.DB2I_DRIVER = 'jt400';
     useProfiles(TWO_SYSTEMS);
@@ -256,6 +286,26 @@ profiles:
   - { name: prod, host: a.example.com, hostname: x, username: A, password: "\${PROD_PASSWORD}" }
 `);
     expect(() => getSystems()).toThrow(SystemsError);
+  });
+
+  it('reads a profile queryTimeout in seconds and refuses one out of range', () => {
+    useProfiles(`
+profiles:
+  - { name: prod, host: a.example.com, username: A, password: "\${PROD_PASSWORD}", queryTimeout: 30 }
+  - { name: test, host: b.example.com, username: B, password: "\${TEST_PASSWORD}" }
+`);
+    const [prod, test] = getSystems();
+    expect(prod.config.queryTimeout).toBe(30);
+    expect(test.config.queryTimeout).toBeUndefined();
+
+    for (const value of ['-1', '86401', '1.5', '"30"']) {
+      resetSystems();
+      useProfiles(`
+profiles:
+  - { name: prod, host: a.example.com, username: A, password: "\${PROD_PASSWORD}", queryTimeout: ${value} }
+`);
+      expect(() => getSystems()).toThrow(SystemsError);
+    }
   });
 
   it('refuses an empty list and a missing file', () => {

@@ -2,8 +2,19 @@
  * Schema allowlist for execute_query and the SQL service tools.
  *
  * When QUERY_ALLOWED_SCHEMAS is set, every table reference must resolve to
- * one of those libraries. Queries that cannot be parsed are rejected, so a
- * dialect the parser does not understand cannot skip the check.
+ * one of those libraries, and every schema-qualified function call must name
+ * one of them. Queries that cannot be parsed are rejected, so a dialect the
+ * parser does not understand cannot skip the check.
+ *
+ * Unqualified function calls are not checked. They resolve through the SQL
+ * path (the library list under system naming), which is not known here, and
+ * that is how built-ins such as UPPER and COALESCE are found. Clients cannot
+ * change the path because SET statements are rejected by the SQL validator.
+ *
+ * A table function qualified with its library, `TABLE(SCHEMA.NAME(args))`, is
+ * checked as a table named SCHEMA.NAME when its arguments hold no parentheses. Then they cannot hold a
+ * subquery or another call, so dropping them hides nothing. Other forms stay
+ * unparseable and are rejected.
  */
 
 import nodeSqlParser from 'node-sql-parser';
@@ -22,77 +33,334 @@ export interface SchemaCheckOptions {
 export interface SchemaCheckResult {
   ok: boolean;
   violations: string[];
+  /** True when the query was rejected because the checker could not parse it, not for a library. */
+  unparseable?: boolean;
 }
 
 const PARSE_DIALECTS = ['db2', 'mysql'] as const;
 
-const UNPARSEABLE_MESSAGE =
-  'Query could not be parsed, so its libraries could not be checked. ' +
-  'While a schema allowlist is set, system naming (LIB/FILE) and TABLE(...) functions are not accepted.';
+const UNPARSEABLE_CAUSES =
+  'Common causes while a schema allowlist is set: system naming (LIB/FILE), a TABLE(...) function that is ' +
+  'not qualified with its library or whose arguments hold a subquery or another call ' +
+  '(TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => \'NONE\')) works), ' +
+  'or Db2 syntax the checker does not support yet. Try SQL naming (LIB.FILE) or a simpler expression.';
+
+/** Characters of the parsed text shown after the position the parser stopped at */
+const ERROR_SNIPPET_LENGTH = 25;
 
 interface ParsedQuery {
   tables: string[];
   ast: unknown;
 }
 
+/** Where one grammar stopped, or why it gave up when it has no position */
+interface ParseFailure {
+  line?: number;
+  near?: string;
+  reason?: string;
+}
+
+/** node-sql-parser throws this, without a position, for an alias that is a keyword in its grammar */
+const RESERVED_ALIAS = /"([^"]+)" is a reserved word, can not as alias clause/;
+
 /**
- * Replace `?` parameter markers with NULL, leaving markers inside quotes alone.
- * The DB2 dialect rejects `?`, and real queries use it for prepared statements.
+ * Apply rewrite to the SQL outside string literals, quoted identifiers and
+ * comments. Those runs are copied unchanged.
  */
-function replaceParameterMarkers(sql: string): string {
+function rewriteCode(sql: string, rewrite: (code: string) => string): string {
   let out = '';
-  let quote: "'" | '"' | null = null;
+  let code = '';
+  let i = 0;
 
-  for (let i = 0; i < sql.length; i++) {
+  const flushCode = (): void => {
+    out += rewrite(code);
+    code = '';
+  };
+
+  while (i < sql.length) {
     const ch = sql[i];
-
-    if (quote) {
-      out += ch;
-      if (ch === quote) {
-        if (sql[i + 1] === quote) {
-          out += sql[++i];
-        } else {
-          quote = null;
-        }
-      }
-      continue;
-    }
+    let end: number;
 
     if (ch === "'" || ch === '"') {
-      quote = ch;
+      end = i + 1;
+      while (end < sql.length) {
+        if (sql[end] === ch) {
+          if (sql[end + 1] === ch) {
+            end += 2;
+            continue;
+          }
+          end++;
+          break;
+        }
+        end++;
+      }
+    } else if (ch === '-' && sql[i + 1] === '-') {
+      const newline = sql.indexOf('\n', i);
+      end = newline === -1 ? sql.length : newline;
+    } else if (ch === '/' && sql[i + 1] === '*') {
+      const close = sql.indexOf('*/', i + 2);
+      end = close === -1 ? sql.length : close + 2;
+    } else {
+      code += ch;
+      i++;
+      continue;
+    }
+
+    flushCode();
+    out += sql.slice(i, end);
+    i = end;
+  }
+
+  flushCode();
+  return out;
+}
+
+/** Db2 for i type names the parser rejects, mapped to ones it reads */
+const TYPE_REPLACEMENTS: Record<string, string> = {
+  NVARCHAR: 'VARCHAR',
+  VARGRAPHIC: 'VARCHAR',
+  NCHAR: 'CHAR',
+  GRAPHIC: 'CHAR',
+  NCLOB: 'VARCHAR',
+  DBCLOB: 'VARCHAR',
+  CLOB: 'VARCHAR',
+  DECFLOAT: 'DECIMAL',
+};
+
+const CAST_TYPE_RE = new RegExp(
+  `\\bAS(\\s+)(${Object.keys(TYPE_REPLACEMENTS).join('|')})\\b(?!\\s*\\.)(\\s*\\([^()]*\\))?`,
+  'gi'
+);
+
+/**
+ * Rewrite Db2 for i data type syntax the parser does not read into forms it
+ * does. Only keywords, integers and type names change, never identifiers, so
+ * the table and function references stay the same.
+ */
+function normalizeDb2Types(code: string): string {
+  return code
+    .replace(/\bCCSID\s+\d+\b/gi, '')
+    .replace(/\bFOR\s+(?:BIT|SBCS|MIXED)\s+DATA\b/gi, '')
+    .replace(CAST_TYPE_RE, (_match, space: string, type: string, args: string | undefined) => {
+      // LOB lengths such as CLOB(1M) take a K, M or G suffix
+      const length = args?.replace(/(\d+)\s*[KMG]\b/gi, '$1') ?? '';
+      return `AS${space}${TYPE_REPLACEMENTS[type.toUpperCase()]}${length}`;
+    });
+}
+
+/**
+ * Db2 for i special registers, after CURRENT and a space or an underscore.
+ * Multi-word names come before their first word, so TIME ZONE wins over TIME.
+ */
+const SPECIAL_REGISTERS = [
+  'DATE',
+  'TIME\\s+ZONE',
+  'TIMEZONE',
+  'TIMESTAMP',
+  'TIME',
+  'USER',
+  'SERVER',
+  'SCHEMA',
+  'SQLID',
+  'FUNCTION\\s+PATH',
+  'PATH',
+  'DEGREE',
+  'DEBUG\\s+MODE',
+  'DECFLOAT\\s+ROUNDING\\s+MODE',
+  'IMPLICIT\\s+XMLPARSE\\s+OPTION',
+  'LOCK\\s+TIMEOUT',
+  'TEMPORAL\\s+SYSTEM_TIME',
+  'CLIENT_ACCTNG',
+  'CLIENT_APPLNAME',
+  'CLIENT_PROGRAMID',
+  'CLIENT_USERID',
+  'CLIENT_WRKSTNNAME',
+];
+
+/** Characters that continue a Db2 for i name, besides letters, digits and _ */
+const NAME_CHAR = '\\w$#@';
+
+/**
+ * A special register that is not part of a qualified name: nothing joins it
+ * to a name before it, and no dot follows it. TIMESTAMP may carry a precision.
+ */
+const SPECIAL_REGISTER_RE = new RegExp(
+  `(?<![${NAME_CHAR}.])CURRENT(?:\\s+|_)(?:TIMESTAMP\\s*\\(\\s*\\d*\\s*\\)|${SPECIAL_REGISTERS.join('|')})(?![${NAME_CHAR}]|\\s*\\.)`,
+  'gi'
+);
+
+/**
+ * The unit of a labeled duration after a number or a closing parenthesis,
+ * as in CURRENT DATE - 30 DAYS. The unit after a column name is left alone:
+ * there it cannot be told apart from an alias.
+ */
+const DURATION_RE = new RegExp(
+  `((?<![${NAME_CHAR}.])\\d+(?:\\.\\d*)?|\\))\\s+(?:YEARS?|MONTHS?|DAYS?|HOURS?|MINUTES?|SECONDS?|MICROSECONDS?)(?![${NAME_CHAR}]|\\s*\\.)`,
+  'gi'
+);
+
+/**
+ * Rewrite Db2 for i special registers and labeled durations, which the parser
+ * does not read. A register becomes NULL and a duration loses its unit. Only
+ * keywords change: a qualified name such as MYLIB.CURRENT is never touched,
+ * and a table named CURRENT turns unparseable and is refused, as before.
+ */
+function normalizeDb2Registers(code: string): string {
+  return code.replace(SPECIAL_REGISTER_RE, 'NULL').replace(DURATION_RE, '$1');
+}
+
+/**
+ * Copy of sql with the contents of string literals, quoted identifiers and
+ * comments blanked to spaces, the same length, so a pattern can find code
+ * positions without matching text inside them. Quote characters are kept.
+ */
+function maskLiterals(sql: string): string {
+  let out = '';
+  let i = 0;
+
+  while (i < sql.length) {
+    const ch = sql[i];
+    let end: number;
+
+    if (ch === "'" || ch === '"') {
+      end = i + 1;
+      let closed = false;
+      while (end < sql.length) {
+        if (sql[end] === ch) {
+          if (sql[end + 1] === ch) {
+            end += 2;
+            continue;
+          }
+          end++;
+          closed = true;
+          break;
+        }
+        end++;
+      }
+      const inner = end - i - (closed ? 2 : 1);
+      out += ch + ' '.repeat(inner) + (closed ? ch : '');
+    } else if (ch === '-' && sql[i + 1] === '-') {
+      const newline = sql.indexOf('\n', i);
+      end = newline === -1 ? sql.length : newline;
+      out += ' '.repeat(end - i);
+    } else if (ch === '/' && sql[i + 1] === '*') {
+      const close = sql.indexOf('*/', i + 2);
+      end = close === -1 ? sql.length : close + 2;
+      out += ' '.repeat(end - i);
+    } else {
       out += ch;
+      i++;
       continue;
     }
 
-    if (ch === '?') {
-      out += 'NULL';
-      continue;
-    }
-
-    out += ch;
+    i = end;
   }
 
   return out;
 }
 
-function normalizeForParsing(sql: string): string {
-  return replaceParameterMarkers(stripTrailingRowLimit(sql));
+const NAME_PART = '(?:"[^"]*"|[A-Za-z_$#@][\\w$#@]*)';
+
+/**
+ * `TABLE ( schema.name ( args ) )` where args hold no parentheses. Group 1 is
+ * the qualified function name. An unqualified table function resolves through
+ * the SQL path at run time, not the default schema, so it is not matched and
+ * stays rejected. Matched against the masked copy, so literals and quoted
+ * identifiers cannot contribute parentheses or the TABLE keyword.
+ */
+const TABLE_FUNCTION_RE = new RegExp(
+  `\\bTABLE\\s*\\(\\s*(${NAME_PART}\\s*\\.\\s*${NAME_PART})\\s*\\([^()]*\\)\\s*\\)`,
+  'gid'
+);
+
+/**
+ * Replace each simple table function call with its name, so the parser reads
+ * it as a table reference and the allowlist checks its library.
+ */
+function normalizeTableFunctions(sql: string): string {
+  const masked = maskLiterals(sql);
+  let out = '';
+  let last = 0;
+  for (const match of masked.matchAll(TABLE_FUNCTION_RE)) {
+    const [callStart, callEnd] = match.indices?.[0] ?? [0, 0];
+    const [nameStart, nameEnd] = match.indices?.[1] ?? [0, 0];
+    const name = sql.slice(nameStart, nameEnd).replace(/\s*\.\s*/, '.');
+    out += sql.slice(last, callStart) + name;
+    last = callEnd;
+  }
+  return out + sql.slice(last);
 }
 
-function parseQuery(sql: string): ParsedQuery | undefined {
+/**
+ * Build the copy of the SQL that is parsed for the check. It is never run.
+ * `?` markers become NULL because the Db2 dialect rejects them.
+ * Exported for tests.
+ */
+export function normalizeForParsing(sql: string): string {
+  return normalizeTableFunctions(
+    rewriteCode(stripTrailingRowLimit(sql), (code) =>
+      normalizeDb2Registers(normalizeDb2Types(code.replace(/\?/g, 'NULL')))
+    )
+  );
+}
+
+function describeParseError(sql: string, error: unknown): ParseFailure {
+  const start = (error as { location?: { start?: { line?: unknown; offset?: unknown } } } | null)
+    ?.location?.start;
+  if (typeof start?.line === 'number' && typeof start.offset === 'number') {
+    const near = sql
+      .slice(start.offset, start.offset + ERROR_SNIPPET_LENGTH)
+      .replace(/\s+/g, ' ')
+      .trim();
+    return { line: start.line, near: near || undefined };
+  }
+  const reserved = error instanceof Error ? RESERVED_ALIAS.exec(error.message) : null;
+  if (reserved) {
+    return { reason: `alias "${reserved[1]}" is a reserved word to the checker, so rename it` };
+  }
+  return {};
+}
+
+function describeFailure(failure: ParseFailure): string | undefined {
+  if (failure.reason) {
+    return failure.reason;
+  }
+  if (failure.line === undefined) {
+    return undefined;
+  }
+  return failure.near
+    ? `near line ${failure.line}: "${failure.near}"`
+    : `at the end of line ${failure.line}`;
+}
+
+/**
+ * Explain an unparseable query. Every grammar must fail for a query to be
+ * rejected, and each can stop at a different problem, so name them all.
+ */
+function unparseableMessage(failures: ParseFailure[]): string {
+  const details = [
+    ...new Set(failures.map(describeFailure).filter((detail): detail is string => detail !== undefined)),
+  ];
+  const position = details.length > 0 ? ` (${details.join('; ')})` : '';
+  return `The query could not be parsed, so its libraries could not be checked${position}. ${UNPARSEABLE_CAUSES}`;
+}
+
+function parseQuery(sql: string): ParsedQuery | { failures: ParseFailure[] } {
   const parser = new Parser();
+  const failures: ParseFailure[] = [];
 
   for (const database of PARSE_DIALECTS) {
     try {
       const ast = parser.astify(sql, { database });
       const tables = parser.tableList(sql, { database });
       return { ast, tables };
-    } catch {
+    } catch (error) {
       // The other dialect may accept what this one rejects.
+      failures.push(describeParseError(sql, error));
     }
   }
 
-  return undefined;
+  return { failures };
 }
 
 function collectCteNames(node: unknown, names: Set<string>): void {
@@ -127,6 +395,50 @@ function collectCteNames(node: unknown, names: Set<string>): void {
   }
 }
 
+function identifierValue(node: unknown): string | undefined {
+  if (typeof node === 'string') {
+    return node;
+  }
+  const value = (node as { value?: unknown } | null)?.value;
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Collect schema-qualified function calls as SCHEMA.NAME.
+ * The parser puts the qualifier in `name.schema`. Extra leading name parts are
+ * treated as the qualifier too, so a shape change cannot hide one.
+ */
+function collectQualifiedFunctions(node: unknown, found: Map<string, string>): void {
+  if (!node || typeof node !== 'object') {
+    return;
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectQualifiedFunctions(item, found);
+    }
+    return;
+  }
+
+  const record = node as Record<string, unknown>;
+  if (record.type === 'function' && record.name && typeof record.name === 'object') {
+    const name = record.name as { name?: unknown; schema?: unknown };
+    const parts = Array.isArray(name.name) ? name.name.map(identifierValue) : [];
+    const functionName = parts.at(-1) ?? '?';
+    const qualifiers = [identifierValue(name.schema), ...parts.slice(0, -1)].filter(
+      (part): part is string => typeof part === 'string' && part.length > 0
+    );
+    for (const qualifier of qualifiers) {
+      const schema = qualifier.replace(/^"|"$/g, '').toUpperCase();
+      found.set(`${schema}.${functionName.toUpperCase()}`, schema);
+    }
+  }
+
+  for (const value of Object.values(record)) {
+    collectQualifiedFunctions(value, found);
+  }
+}
+
 function schemaOf(entry: string): { schema: string | undefined; table: string } | undefined {
   const parts = entry.split('::');
   if (parts.length < 3) {
@@ -147,13 +459,14 @@ function schemaOf(entry: string): { schema: string | undefined; table: string } 
 }
 
 /**
- * Check that every table reference stays inside the allowlist.
+ * Check that every table reference and qualified function call stays inside
+ * the allowlist.
  * Callers should skip this when the allowlist is unset.
  */
 export function checkQuerySchemas(sql: string, options: SchemaCheckOptions): SchemaCheckResult {
   const parsed = parseQuery(normalizeForParsing(sql));
-  if (!parsed) {
-    return { ok: false, violations: [UNPARSEABLE_MESSAGE] };
+  if (!('ast' in parsed)) {
+    return { ok: false, violations: [unparseableMessage(parsed.failures)], unparseable: true };
   }
 
   const cteNames = new Set<string>();
@@ -196,7 +509,53 @@ export function checkQuerySchemas(sql: string, options: SchemaCheckOptions): Sch
     }
   }
 
+  const functions = new Map<string, string>();
+  collectQualifiedFunctions(parsed.ast, functions);
+  for (const [name, schema] of functions) {
+    if (!allowed.has(schema)) {
+      violations.push(
+        `Function ${name} is not in the allowed schemas (${[...allowed].join(', ')}).`
+      );
+    }
+  }
+
   return { ok: violations.length === 0, violations };
+}
+
+/**
+ * Tables a query reads, as `SCHEMA.TABLE` or a bare `TABLE` when unqualified,
+ * uppercased, in the order they appear and without CTE names. Used for error
+ * hints, not for a security check. Empty when the query cannot be parsed.
+ *
+ * @param sql - Statement as the caller sent it
+ */
+export function referencedTables(sql: string): string[] {
+  let parsed: ReturnType<typeof parseQuery>;
+  try {
+    parsed = parseQuery(normalizeForParsing(sql));
+  } catch {
+    return [];
+  }
+  if (!('ast' in parsed)) {
+    return [];
+  }
+
+  const cteNames = new Set<string>();
+  collectCteNames(parsed.ast, cteNames);
+
+  const tables = new Set<string>();
+  for (const entry of parsed.tables) {
+    const ref = schemaOf(entry);
+    if (!ref) {
+      continue;
+    }
+    const table = ref.table.toUpperCase();
+    if (!ref.schema && cteNames.has(table)) {
+      continue;
+    }
+    tables.add(ref.schema ? `${ref.schema}.${table}` : table);
+  }
+  return [...tables];
 }
 
 /**

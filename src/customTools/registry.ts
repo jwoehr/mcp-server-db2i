@@ -1,16 +1,24 @@
+import type { ParsedName } from '../db/sqlServices.js';
+import type { SqlErrorDetails } from '../db/sqlErrorInfo.js';
 /**
  * Process-wide custom tools, loaded once at startup.
  */
 
 import type { LoadedCustomTools, StoredAnnotation, StoredTool } from './loader.js';
+import type { AuditErrorKind } from '../utils/auditLog.js';
 
-const EMPTY: LoadedCustomTools = { tools: [], annotations: [], masking: new Map() };
+/** A set with nothing loaded. A new object each call, so no caller shares the masking map. */
+export function emptyCustomTools(): LoadedCustomTools {
+  return { tools: [], annotations: [], masking: new Map(), instructions: [] };
+}
 
-let current: LoadedCustomTools = EMPTY;
+let current: LoadedCustomTools = emptyCustomTools();
 
 export type ParseOutcome =
-  | { ok: true }
-  | { ok: false; error: string; violations?: string[] };
+  /** names: the PARSE_STATEMENT rows, for the schema allowlist. Unset when the check is off. */
+  | { ok: true; names?: ParsedName[] }
+  /** details: Db2's SQLSTATE, SQLCODE, cause and recovery when the statement did not parse. */
+  | { ok: false; error: string; violations?: string[]; errorKind?: AuditErrorKind; details?: SqlErrorDetails };
 
 /** PARSE_STATEMENT outcomes by system and tool. A tool without `system:` can run on several. */
 const parseCache = new Map<string, ParseOutcome>();
@@ -37,7 +45,7 @@ export function getCustomTools(): LoadedCustomTools {
 }
 
 export function resetCustomTools(): void {
-  setCustomTools(EMPTY);
+  setCustomTools(emptyCustomTools());
 }
 
 export type { StoredAnnotation, StoredTool };

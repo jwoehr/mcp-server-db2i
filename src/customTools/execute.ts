@@ -3,7 +3,11 @@
  */
 
 import { executeQuery } from '../db/connection.js';
+import { roundedColumnsWarnings } from '../db/driver.js';
+import { sqlErrorFields, type SqlErrorDetails } from '../db/sqlErrorInfo.js';
 import {
+  checkParsedSchemas,
+  explainParseFailure,
   isParseStatementMissing,
   PARSE_STATEMENT_UNAVAILABLE,
   parseStatement,
@@ -11,13 +15,15 @@ import {
 } from '../db/sqlServices.js';
 import { applyQueryLimit, getQueryLimitConfig, isQueryParseCheckEnabled } from '../config.js';
 import { allowedSchemasFor, type DbTarget } from '../systems.js';
-import { applySqlRowLimit } from '../tools/sqlLimit.js';
+import { applySqlRowLimit, rowLimitWarning, takeRowsWithinLimit } from '../tools/sqlLimit.js';
 import { createChildLogger } from '../utils/logger.js';
 import { checkQuerySchemas } from '../utils/security/schemaAllowlist.js';
 import type { StoredTool } from './loader.js';
 import { cacheParse, cachedParse, type ParseOutcome } from './registry.js';
 import { maskRows } from './masking.js';
 import { formatSchemaIssues, inputSchemaFor, type ParameterDef } from './schema.js';
+import type { AuditErrorKind } from '../utils/auditLog.js';
+import { resultViewFields } from '../ui/chartSpec.js';
 
 const log = createChildLogger({ component: 'custom-tools' });
 
@@ -43,16 +49,20 @@ export function classifyParsedStatement(parsed: ParsedName[]): ParseOutcome {
         : [`Statement type is ${found}.`],
     };
   }
-  return { ok: true };
+  return { ok: true, names: parsed };
 }
 
-export interface CustomToolQueryResult {
+export interface CustomToolQueryResult extends SqlErrorDetails {
   success: boolean;
   data?: unknown[];
   rowCount?: number;
   error?: string;
   violations?: string[];
+  errorKind?: AuditErrorKind;
   limitApplied?: number;
+  /** True when the row cap left rows out. */
+  truncated?: boolean;
+  warnings?: string[];
   [key: string]: unknown;
 }
 
@@ -67,11 +77,13 @@ export async function executeCustomTool(
 ): Promise<CustomToolQueryResult> {
   const bound = bindCustomToolArgs(tool, args);
   if (!bound.ok) {
-    return { success: false, error: bound.error };
+    return { success: false, error: bound.error, errorKind: 'bad_params' };
   }
   const values = bound.params;
+  // With the parse check on, the allowlist is checked from IBM i's parsed names below.
+  // The JavaScript parser is the fallback for when the check is off.
   const allowedSchemas = allowedSchemasFor(options.target);
-  if (allowedSchemas) {
+  if (allowedSchemas && !isQueryParseCheckEnabled()) {
     const schemaResult = checkQuerySchemas(tool.sql, {
       allowed: allowedSchemas,
       defaultSchema: options.defaultSchema,
@@ -81,6 +93,7 @@ export async function executeCustomTool(
         success: false,
         error: `Schema allowlist rejected the query: ${schemaResult.violations.join('; ')}`,
         violations: schemaResult.violations,
+        errorKind: schemaResult.unparseable ? 'allowlist_parse' : 'allowlist_denied',
       };
     }
   }
@@ -91,30 +104,56 @@ export async function executeCustomTool(
       success: false,
       error: parsedOk.error,
       ...(parsedOk.violations ? { violations: parsedOk.violations } : {}),
+      ...(parsedOk.details ?? {}),
+      errorKind: parsedOk.errorKind ?? 'parse_check',
     };
+  }
+  if (allowedSchemas && parsedOk.names) {
+    const { violations } = checkParsedSchemas(parsedOk.names, {
+      allowed: allowedSchemas,
+      defaultSchema: options.defaultSchema,
+      sql: tool.sql,
+    });
+    if (violations.length > 0) {
+      return {
+        success: false,
+        error: `Schema allowlist rejected the query: ${violations.join('; ')}`,
+        violations,
+        errorKind: 'allowlist_denied',
+      };
+    }
   }
 
   const effectiveLimit = applyQueryLimit(tool.maxRows, getQueryLimitConfig());
-  const limitedSql = applySqlRowLimit(tool.sql, effectiveLimit);
+  // One row past the cap tells a full result from a cut one
+  const limitedSql = applySqlRowLimit(tool.sql, effectiveLimit + 1);
 
   try {
     const result = await executeQuery(limitedSql, values, options.target);
-    const limited = result.rows.slice(0, effectiveLimit);
-    const masked = maskRows(limited, new Map(Object.entries(tool.maskedColumns)));
+    const { rows: limited, truncated } = takeRowsWithinLimit(result.rows, effectiveLimit);
+    const maskRules = new Map(Object.entries(tool.maskedColumns));
+    const masked = maskRows(limited, maskRules);
     if (!masked.ok) {
-      return { success: false, error: masked.error };
+      return { success: false, error: masked.error, errorKind: 'masking' };
     }
-    log.info({ tool: tool.name, rowCount: masked.rows.length, effectiveLimit }, 'Custom tool executed');
+    const warnings = [
+      ...(truncated ? [rowLimitWarning(effectiveLimit)] : []),
+      ...(roundedColumnsWarnings(result.roundedColumns, new Set(maskRules.keys())) ?? []),
+    ];
+    log.info({ tool: tool.name, rowCount: masked.rows.length, effectiveLimit, truncated }, 'Custom tool executed');
     return {
       success: true,
       data: masked.rows,
       rowCount: masked.rows.length,
       limitApplied: effectiveLimit,
+      truncated,
+      ...(warnings.length > 0 ? { warnings } : {}),
+      ...resultViewFields(result.columns, new Set(maskRules.keys()), tool.chart),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error occurred';
     log.debug({ err: error, tool: tool.name }, 'Custom tool failed');
-    return { success: false, error: message };
+    return { success: false, error: message, ...sqlErrorFields(error) };
   }
 }
 
@@ -177,7 +216,12 @@ async function ensureParsed(tool: StoredTool, target?: DbTarget): Promise<ParseO
 
   try {
     const parsed = await parseStatement(tool.sql, target);
-    const outcome = classifyParsedStatement(parsed);
+    let outcome = classifyParsedStatement(parsed);
+    if (parsed.length === 0 && !outcome.ok) {
+      // PARSE_STATEMENT gives no reason; preparing the statement without running it does
+      const failure = await explainParseFailure(tool.sql, target);
+      outcome = { ...outcome, error: failure.error, details: failure.details };
+    }
     cacheParse(tool.name, target?.system, outcome);
     return outcome;
   } catch (error) {
@@ -190,6 +234,6 @@ async function ensureParsed(tool: StoredTool, target?: DbTarget): Promise<ParseO
       return outcome;
     }
     const message = error instanceof Error ? error.message : 'Unknown error occurred';
-    return { ok: false, error: message };
+    return { ok: false, error: message, errorKind: 'sql_error' };
   }
 }

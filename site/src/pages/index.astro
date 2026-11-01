@@ -1,0 +1,72 @@
+---
+import Base from '../layouts/Base.astro';
+import Hero from '../components/Hero.astro';
+import SiteVideo from '../components/SiteVideo.astro';
+import FeatureGrid from '../components/FeatureGrid.astro';
+import Architecture from '../components/Architecture.astro';
+import Install from '../components/Install.astro';
+import Compare from '../components/Compare.astro';
+import PostList from '../components/PostList.astro';
+import { getPosts } from '../lib/posts';
+import { links, url } from '../lib/links';
+import { homeJsonLd } from '../lib/structuredData';
+
+const latest = (await getPosts()).slice(0, 3);
+---
+<Base
+  title="Db2 for i MCP Server"
+  description="An open-source MCP server that lets Claude, Cursor and other AI assistants read IBM Db2 for i. Read-only by design, with a library allowlist, masking, OAuth sign-in and an audit log."
+  jsonLd={homeJsonLd(Astro.site!)}
+>
+  <Hero />
+  <SiteVideo
+    name="promo"
+    title="The whole idea in under a minute."
+    lead="One question from plain language to rows, what is enforced on every query, and how it connects to your IBM i. With sound and captions."
+    description="Promo video: asking an IBM i a question in plain language with the Db2 for i MCP Server"
+  />
+  <FeatureGrid />
+  <Architecture />
+  <Install />
+  <Compare />
+
+  <section class="section">
+    <div class="container">
+      <div class="sec-head">
+        <p class="label">From the blog</p>
+        <div class="head">
+          <h2>What's new, and why.</h2>
+          <a class="link-rule" href={url('/blog')}>All posts <span aria-hidden="true">→</span></a>
+        </div>
+      </div>
+      <PostList posts={latest} />
+    </div>
+  </section>
+
+  <section class="section section--tight">
+    <div class="container">
+      <div class="sec-head cta">
+        <p class="label">Open source</p>
+        <div>
+          <h2>Free, open source, and yours to run.</h2>
+          <p class="lead">MIT licensed. It runs on your own machines and talks only to your IBM i. Questions, ideas and bug reports are welcome on GitHub.</p>
+          <div class="btn-row">
+            <a class="btn btn--primary" href={links.quickstart}>Get started <span aria-hidden="true">→</span></a>
+            <a class="link-rule" href={links.issues}>Open an issue</a>
+          </div>
+          <p class="sponsor">
+            If it saves your team time, <a href={links.sponsor}>sponsoring</a> pays for testing against real IBM i
+            systems and new features.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+</Base>
+
+<style>
+  .head { display: flex; align-items: end; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap; }
+  .cta { border-top: 1px solid var(--line-strong); padding-top: var(--space-6); margin-bottom: 0; }
+  .cta .btn-row { margin-top: var(--space-6); }
+  .sponsor { margin: var(--space-5) 0 0; color: var(--muted); max-width: 56ch; }
+</style>

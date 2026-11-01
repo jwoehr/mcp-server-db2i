@@ -1,6 +1,22 @@
-# Security
+---
+title: "Security"
+description: "Credentials, query validation, the schema allowlist, rate limits, column masking, and the audit log."
+---
 
 This guide covers security features and best practices for mcp-server-db2i.
+
+<div data-video="security">
+  <video class="block dark:hidden" data-theme-version="light" controls playsinline preload="none" crossorigin="anonymous" width="1920" height="1080" poster="https://db2i-mcp.com/video/security-light.jpg" aria-label="The security model for reviewers: the model treated as untrusted, sign-in with each user's own IBM i profile, read-only in three layers, the library allowlist, column masking, rate limits, OAuth, secrets, where data goes, the audit log and what the server does not do, with real refusals from the server in the example web app" style="width: 100%; height: auto; aspect-ratio: 16 / 9;">
+    <source src="https://db2i-mcp.com/video/security-light.mp4" type="video/mp4" />
+    <track kind="captions" srclang="en" label="English" src="https://db2i-mcp.com/video/security.vtt" />
+  </video>
+  <video class="hidden dark:block" data-theme-version="dark" controls playsinline preload="none" crossorigin="anonymous" width="1920" height="1080" poster="https://db2i-mcp.com/video/security-dark.jpg" aria-label="The security model for reviewers: the model treated as untrusted, sign-in with each user's own IBM i profile, read-only in three layers, the library allowlist, column masking, rate limits, OAuth, secrets, where data goes, the audit log and what the server does not do, with real refusals from the server in the example web app" style="width: 100%; height: auto; aspect-ratio: 16 / 9;">
+    <source src="https://db2i-mcp.com/video/security-dark.mp4" type="video/mp4" />
+    <track kind="captions" srclang="en" label="English" src="https://db2i-mcp.com/video/security.vtt" />
+  </video>
+</div>
+
+The video walks through the security model for whoever has to approve the server, in about eight minutes. The [Security Checklist](#security-checklist) near the end of this page is the short version.
 
 ## Security Features
 
@@ -8,10 +24,25 @@ This guide covers security features and best practices for mcp-server-db2i.
 - **SSH host key check**: The `mapepire` driver refuses an IBM i whose SSH host key does not match a pinned fingerprint or `known_hosts`, so a spoofed host never receives the password
 - **No credentials in code**: All sensitive data via environment variables or file-based secrets
 - **Query validation**: AST-based SQL parsing plus regex validation blocks dangerous operations
-- **Result limiting**: Default limit of 1000 rows, configurable max limit (default: 10000)
+- **Result limiting**: Queries return 1000 rows unless the caller asks for more (`QUERY_DEFAULT_LIMIT`), and never more than 10000 (`QUERY_MAX_LIMIT`)
+- **Query timeout**: A statement that runs longer than `QUERY_TIMEOUT` (default 120 seconds) is cancelled on the IBM i
+- **Query exports**: Off by default. When on, files stay on the server host and HTTP callers get a link that allows a few downloads and expires. See [Query exports](#query-exports)
 - **Rate limiting**: Configurable request throttling to prevent abuse (100 req/15 min default)
 - **Structured logging**: Automatic redaction of sensitive fields like passwords
 - **HTTP auth**: `required` (per-user credentials via `/auth`), `token` (static bearer), or `none` (trusted networks)
+
+## Where data goes
+
+The server runs where you host it and connects only to your IBM i. It does not copy data into another database.
+
+Tool results, including the rows a query returns, go back to the MCP client, and the client passes them to its language model. With a hosted assistant such as Claude or Cursor, those results leave your network and are processed by the assistant's provider under its own terms. Use an assistant your organization has approved for this data, and limit what can come back with the [schema allowlist](#schema-allowlist), [column masking](#column-masking) and [result limits](#result-limiting).
+
+## Hosting in the cloud
+
+The server runs anywhere Node.js 22 or Docker runs, including a cloud host. It needs a network path to the IBM i: the database host server ports for the `odbc` and `jt400` drivers, or SSH (port 22) for `mapepire`.
+
+- When the IBM i is on premises, connect the cloud host over a private link such as a site-to-site VPN. Do not open the host server ports or SSH to the internet.
+- Remote clients such as claude.ai reach the server over HTTPS. Limit that endpoint to the clients' address ranges, as described in [Limiting who can reach the server](http-transport.md#limiting-who-can-reach-the-server).
 
 ## Credential Management
 
@@ -105,7 +136,7 @@ The server includes built-in rate limiting to protect the IBM i database from ex
 
 - **Default**: 100 requests per 15-minute window
 - **Scope**: Per server instance (for stdio transport, this means per-client since each MCP client spawns its own server process)
-- **HTTP transport**: Rate limiting applies per authenticated token
+- **HTTP transport**: Rate limiting applies per authenticated token. Tokens refreshed from one OAuth sign-in share one budget, so a refresh does not reset it
 
 When the rate limit is exceeded, queries return an error with `waitTimeSeconds` indicating when to retry:
 
@@ -130,7 +161,7 @@ flowchart LR
     ast -->|"DDL/DML/DCL"| reject1[["REJECTED"]]
     regex -->|"Safe"| limit["Result Limiter"]
     regex -->|"Dangerous patterns"| reject2[["REJECTED"]]
-    limit --> db[("DB2 for i")]
+    limit --> db[("Db2 for i")]
 ```
 
 ### AST-based Validation
@@ -143,20 +174,27 @@ Queries are parsed into an Abstract Syntax Tree (AST) to verify:
 
 ### Regex Validation
 
-Additional regex patterns block:
+A text scan then rejects:
 
-- Command execution attempts
-- System procedure calls
+- A statement that does not start with `SELECT`, `WITH` or `VALUES`, optionally inside parentheses. This covers `CALL`, `SET`, `LOCK TABLE`, `COMMIT` and every DDL statement
+- A second statement after a `;`. A single trailing `;` is fine
+- A data-change statement anywhere in the text, recognized by its shape: `INSERT INTO`, `DELETE FROM`, `MERGE INTO`, and `UPDATE name SET`. This also catches a data-change table reference such as `FINAL TABLE (INSERT INTO ...)`
+- Command execution: `QCMDEXC` and `SQL_EXECUTE_IMMEDIATE`
 - Dangerous functions, including schema-qualified calls. The check uses the unqualified name
 - IBM i services that send data off the system or write outside the database: HTTP services, IFS write services, spreadsheet generation, and email
+- A statement longer than `QUERY_MAX_LENGTH` characters (default `32768`)
 
-Before the keyword scan, string literals, comments, and the quotes around delimited identifiers are removed. A literal or a quoted name earlier in the statement cannot hide a later call. Words that appear only inside a literal or a comment are ignored.
+Before the scan, string literals and comments are removed, so words that appear only inside them are ignored. The scan follows Db2 for i rules: block comments nest, a `--` comment ends at a line feed or NEL (U+0085), and control and Unicode separator characters count as spaces. A statement with an unterminated string, delimited identifier or block comment is rejected. For the function checks, the quotes around delimited identifiers are removed too, so `QSYS2."QCMDEXC"(...)` is still a `QCMDEXC` call. For the data-change shapes, a delimited identifier counts as a name, never as a keyword.
+
+Write keywords are not matched as single words, because Db2 for i uses many of them for other things: `REPLACE()` is a string function, `FOR UPDATE OF` is a query clause, and columns are often named `START` or `LOAD`. The read-only connection described next and the [statement parse check](#statement-parse-check), which requires the statement type to be a query, block writes regardless of the words they use.
 
 The driver connection is a second layer. JT400 and the Mapepire server (which uses JT400 on the IBM i) use `access=read only` unless `DB2I_JDBC_OPTIONS` sets `access`; the ODBC driver uses `CONNTYPE=2` unless `DB2I_ODBC_OPTIONS` sets `CONNTYPE`. An explicit override is logged at startup.
 
 ### Statement parse check
 
-`execute_query` asks IBM i to parse the statement with `QSYS2.PARSE_STATEMENT` before it runs. The query is rejected when the statement does not parse, or when it is not a query. This catches Db2 for i syntax that the local parser accepts.
+`execute_query` asks IBM i to parse the statement with `QSYS2.PARSE_STATEMENT` before it runs. The query is rejected when the statement does not parse, or when it is not a query. The names it returns drive the [schema allowlist](#schema-allowlist), column masking and row filter warnings. A trailing semicolon is removed before parsing. `PARSE_STATEMENT` does not parse a statement that starts with `VALUES`, so such a statement is rejected while the check is on, and the error suggests the `SELECT * FROM (VALUES ...)` form.
+
+When `PARSE_STATEMENT` returns no rows, the server prepares the statement on the read-only connection, without running it, to get Db2's reason (`odbc` and `mapepire`; `jt400` cannot prepare alone). Preparing never executes the statement, and the statement stays rejected whatever the prepare returns. The prepare has a 5 second limit.
 
 The check is on unless `QUERY_PARSE_CHECK` is `false` or `0`. It adds one round trip, often a few hundred milliseconds, on every `execute_query` call. Business SQL tools run the same check the first time each tool is called, then cache the result. If `QSYS2.PARSE_STATEMENT` is not installed, the query is rejected and the error tells you to turn the check off. A missing function does not skip the check on its own.
 
@@ -173,6 +211,24 @@ Query results are automatically limited to prevent memory exhaustion:
 | `QUERY_DEFAULT_LIMIT` | `1000` | Applied when no limit specified |
 | `QUERY_MAX_LIMIT` | `10000` | Maximum allowed (caps user limits) |
 
+### Query Timeout
+
+The row limit caps what a query returns, not the work the IBM i does to produce it. A `SELECT` that scans a large table, or joins on columns without an index, can hold a CPU for a long time. The IBM i also keeps running a statement after its client disconnects or is killed. `QUERY_TIMEOUT` (seconds, default `120`) cancels such a statement on the IBM i, not only on the client side.
+
+It applies to every statement a tool runs: `execute_query`, business SQL tools, the catalog tools and `get_object_ddl`. A profile can set its own `queryTimeout`, and `0` turns the limit off. The tool returns an error that says the query was cancelled after N seconds and suggests narrowing the filter. The connection goes back to the pool.
+
+How each driver cancels:
+
+| Driver | How | Authority it needs | Extra cost |
+|--------|-----|--------------------|------------|
+| `odbc` | `SQLCancel` on the statement's own connection. The IBM i Access ODBC driver ignores `SQL_ATTR_QUERY_TIMEOUT` for elapsed time, so the server does not use it | None beyond the connection's own | None measurable |
+| `jt400` | Runs each statement in a transaction to learn its job (`QSYS2.JOB_NAME`), then calls `QSYS2.CANCEL_SQL` for that job | *JOBCTL special authority or the `QIBM_DB_SQLADM` function usage | About 40 ms per statement |
+| `mapepire` | Calls `QSYS2.CANCEL_SQL` for the job the Mapepire server reported when it connected | *JOBCTL special authority or the `QIBM_DB_SQLADM` function usage | None measurable |
+
+All three cancel by elapsed time, not by the optimizer's estimate. A read-only connection rejects `CALL QSYS2.CANCEL_SQL`, so jt400 and mapepire make that call on the separate connection `get_object_ddl` uses, which is not marked read-only and runs only fixed statements. Once a statement has used half its limit, that connection is opened in the background, so the cancel does not wait for a new Mapepire job to start.
+
+If the cancel fails, for example because the user profile lacks that authority, the tool still returns after the limit, with an error saying the statement could not be cancelled and may still be running on the IBM i. The server logs a warning the first time this happens on each system. The mapepire driver then closes the job, which frees the client but does not stop the statement on the IBM i; it runs until it finishes. With a low-privilege profile, the `odbc` driver is the one that cancels on the IBM i.
+
 ### Metadata-Only Mode
 
 If clients only need to browse schemas, tables, and columns, turn off free-form SQL entirely:
@@ -185,12 +241,17 @@ The tool is then never registered, so validation bypasses cannot reach it. Busin
 
 ### Schema Allowlist
 
-`QUERY_ALLOWED_SCHEMAS` rejects an `execute_query` call whose tables are outside that list. The check runs after the read-only validation and before the parse check and the query. The same list applies to `validate_query`, `get_object_ddl`, `get_related_objects`, `get_journal_info`, `profile_table`, the catalog browsing tools (`list_tables`, `describe_table`, `list_views`, `list_indexes`, `get_table_constraints`), the resources and prompts, and business SQL tools. `list_schemas` returns only libraries in the list. `get_related_objects` omits dependents whose schema is outside the list. A business tool that fails the check is rejected at startup, and again when it is called.
+`QUERY_ALLOWED_SCHEMAS` rejects an `execute_query` call whose tables or qualified functions are outside that list. With the [parse check](#statement-parse-check) on, which is the default, the check reads the names that IBM i's own parser returns from `QSYS2.PARSE_STATEMENT`, so any statement Db2 for i accepts can be checked. With the parse check off, a JavaScript parser reads the statement instead, before the query runs. The same list applies to `validate_query`, `get_object_ddl`, `get_related_objects`, `get_journal_info`, `index_advice`, `profile_table`, `list_routines`, `describe_routine`, the catalog browsing tools (`list_tables`, `describe_table`, `list_views`, `list_indexes`, `get_table_constraints`), the resources and prompts, and business SQL tools. `list_schemas` returns only libraries in the list. `get_related_objects` omits dependents whose schema is outside the list. A business tool that fails the check is rejected at startup, and again when it is called. A business tool the JavaScript parser cannot read is loaded when the parse check is on, and checked from the parsed names the first time it runs. `search_ibmi_services` reads only the fixed service catalog `QSYS2.SERVICES_INFO`, which lists service names and examples and no business data, so the list does not apply to it.
 
 - Unqualified names resolve to the session schema, or to `DB2I_SCHEMA` when the session has none. If that schema is missing or not in the list, the query is rejected.
+- A schema-qualified function call must name a library in the list, like a table. A user-defined function can read its own library, so `SELECT OUTSIDELIB.F(ORDERNO) FROM MYLIB.ORDERS` is rejected unless `OUTSIDELIB` is listed.
+- Unqualified function calls are not checked. They resolve through the SQL path, which is the job's library list under the default system naming, and that is how built-ins such as `UPPER` and `COALESCE` are found. `SET` statements are rejected, so a client cannot change the path. Keep libraries outside the list off the user profile's library list, and rely on object authority for the rest. The dangerous-function checks (for example `QCMDEXC`) still apply to qualified and unqualified calls.
 - The list comes from the server environment. A schema chosen at `/auth` changes where unqualified names resolve. It does not add libraries to the list.
 - With [`DB2I_PROFILES`](configuration.md#multiple-systems), each profile can set its own `allowedSchemas`. A profile without one uses `QUERY_ALLOWED_SCHEMAS`. Every call is checked against the list of the system it runs on.
-- Queries that cannot be parsed are rejected while the list is set. System naming (`LIB/FILE`) and `TABLE(...)` table functions fall into that group.
+- A table function is checked like a qualified function in its library: `TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => 'NONE'))` needs `QSYS2` in the list. An unqualified table function such as `TABLE(ACTIVE_JOB_INFO())` is rejected while the list is set, because it resolves through the SQL path, which always includes `QSYS2`, and a function there such as `DISPLAY_JOURNAL` or `IFS_READ` can read data outside the list.
+- A sequence (`NEXT VALUE FOR LIB.SEQ`) and a user-defined type (`CAST(X AS LIB.TYPE)`) must be in a listed library too.
+- The IBM i parser lists every table the statement reads, including tables in subqueries, `EXISTS`, `LATERAL`, `UNION` branches, common table expressions and `TABLE()` function arguments. A common table expression is never mistaken for a table: in `WITH ORDERS AS (SELECT * FROM OUTSIDELIB.ORDERS) SELECT * FROM ORDERS`, the check sees `OUTSIDELIB.ORDERS`.
+- With the parse check off, the JavaScript parser cannot read some Db2 for i syntax, and those queries are rejected while the list is set. Examples are system naming (`LIB/FILE`), `LISTAGG ... WITHIN GROUP`, `LATERAL`, `GROUPING SETS`, `VALUES` lists, unqualified table functions and table function arguments that hold a subquery. The error says where parsing stopped. It accepts Db2 for i casts (`CCSID n`, `FOR BIT DATA`, `NVARCHAR` and the other Db2 types), special registers such as `CURRENT DATE`, and labeled durations after a number or a parenthesis, by reading a rewritten copy of the statement. The statement sent to the IBM i is unchanged.
 - `QSYS2` and `SYSIBM` are allowed only when you add them.
 
 This does not replace IBM i object authority. A view or alias in an allowed library can still point at another library. Use a user profile that has access only to the libraries in the list.
@@ -210,24 +271,46 @@ Every request is checked against an allowlist of `Host` values before it is rout
 
 Browser requests with an `Origin` header must be same-origin or listed in `MCP_CORS_ORIGINS`. Others get 403. A listed origin is echoed in `Access-Control-Allow-Origin` with `Vary: Origin`, and `MCP_CORS_ORIGINS='*'` answers with a literal `*`. The server never sends `Access-Control-Allow-Credentials`, because tokens travel in the `Authorization` header rather than in cookies.
 
-See [HTTP Transport](http-transport.md) for the request shapes. Protocol sessions (`Mcp-Session-Id`) are deprecated; pools stay isolated by auth token in the default stateless mode.
+See [HTTP Transport](http-transport.md) for the request shapes. Protocol sessions (`Mcp-Session-Id`) are deprecated; pools stay isolated by auth token in the default stateless mode. Tokens refreshed from one OAuth sign-in share that sign-in's pool, which is always one user profile with one password; sign-ins never share a pool, even for the same user.
+
+### OAuth Authorization Server
+
+`MCP_OAUTH_ENABLED=true` adds a sign-in page and an OAuth 2.1 authorization server, so remote clients such as claude.ai can connect. See [Remote Clients (OAuth)](http-transport.md#remote-clients-oauth). The design choices that matter for security:
+
+- **Users sign in as themselves.** The page asks for an IBM i user profile and password and tests them on the chosen system. The token carries those credentials, like a `/auth` token, so object authority on the IBM i still applies. There is no shared service profile.
+- **The page is served by this server only.** It sends `Content-Security-Policy` with `default-src 'none'` (plus `img-src data:` for the inline favicon), `frame-ancestors 'none'` and a `form-action` limited to this origin and the client's redirect origin, plus `Cache-Control: no-store` and `Referrer-Policy: same-origin` (not `no-referrer`, which makes browsers post the form with `Origin: null`, and the Origin check refuses that). The password is never echoed back, and a failed sign-in shows a generic message, not the driver error.
+- **Redirect URIs are allowlisted.** Dynamic registration accepts only URIs from `MCP_OAUTH_REDIRECT_URIS` (default: the Claude connector callbacks and Cursor's `cursor://` callback) and loopback. Like loopback, an app-scheme callback returns the code to an app on the user's own machine, and the sign-in page's `form-action` allows that scheme rather than an origin. This stops a third party from registering a client that sends codes to their own site. The page names the client and the host it returns to, and asks the user to continue only if they started the connection. Prefix entries must end in `/*`, and URIs are compared after normalization.
+- **PKCE is mandatory.** Only `S256` is accepted. Codes are single use and expire after 60 seconds. A code presented a second time revokes every token it issued. The `resource` parameter, when sent, must name this server (RFC 8707).
+- **Signed state instead of stored state.** Client IDs and the pending sign-in request are HMAC-SHA256 signed with `MCP_OAUTH_SECRET`, each for its own purpose, and every registration gets a random nonce. A confidential client's secret is derived from its ID with the same key. Rotating `MCP_OAUTH_SECRET` invalidates every registration and every open sign-in page.
+- **Refresh tokens rotate and re-check.** Each refresh token works once. Each refresh opens a test connection with the stored credentials, so a disabled profile or a new password ends the grant and its access tokens. When the IBM i cannot be reached at all, the refresh answers 503 `temporarily_unavailable` and the grant stays, so an outage does not sign everyone out. An error the server cannot classify counts as a rejection, so a stored password the IBM i refused is never retried. One user profile holds at most 10 refresh grants per system; past that its own oldest grant ends, never another user's.
+- **Revocation ends the whole sign-in.** Revoking either the access token or the refresh token ends both, and every access token refreshed from the same sign-in. `MCP_OAUTH_REFRESH_EXPIRY=0` turns refresh tokens off, and users then sign in again when the access token expires (`MCP_TOKEN_EXPIRY`).
+- **Memory only, unless you choose a state file.** By default, credentials, codes and refresh tokens are never written to disk, and a restart signs everyone out. With `MCP_OAUTH_STATE_FILE`, refresh grants are written to that file so users stay signed in across restarts. **Each grant includes the user's IBM i password**, which a refresh needs to open a connection. Entries are encrypted with AES-256-GCM under a key derived from `MCP_OAUTH_SECRET` with HKDF, and each entry is bound to its ID, so entries cannot be altered or swapped unnoticed. The file keeps a SHA-256 hash of each refresh token, never the token. It is written with mode `0600`. The file requires an explicit `MCP_OAUTH_SECRET`, and anyone holding both the file and the secret can recover the passwords, so store them apart and keep both out of shared backups. Rotating the secret makes the file unreadable and signs everyone out.
+- **TLS is required** for `MCP_PUBLIC_URL`, except on loopback. Terminate TLS at a reverse proxy or tunnel and bind the server to loopback behind it.
+
+Before exposing the server on the internet, set `QUERY_ALLOWED_SCHEMAS` or a profile `allowedSchemas`, keep `MCP_TOOLS_ENABLED` to what users need, and limit what the IBM i user profiles can read.
 
 ### Auth Endpoint Rate Limiting
 
-The `/auth` endpoint has additional rate limiting to prevent brute-force attacks:
+The `/auth` endpoint and the OAuth sign-in form share additional rate limiting to prevent brute-force attacks:
 
-| Setting | Value | Description |
-|---------|-------|-------------|
-| Max attempts | 5 | Maximum attempts before lockout |
-| Window | 60 seconds | Time window for tracking attempts |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTH_RATE_LIMIT_MAX_ATTEMPTS` | `5` | Maximum login attempts before lockout |
+| `AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Time window for tracking login attempts, in milliseconds |
+| `OAUTH_RATE_LIMIT_MAX_REQUESTS` | `120` | Maximum requests across all `/oauth/*` endpoints |
+| `OAUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Time window for the OAuth endpoint limit, in milliseconds |
 
 **Behavior:**
 - Authentication attempts are tracked per IP address and counted when they arrive, so parallel requests cannot get past the limit while earlier attempts are still testing their credentials
-- After 5 attempts within 60 seconds, further requests from that IP get 429 until the window ends
-- Successful authentication clears the count for that IP
+- After the maximum number of attempts within the window (5 in 60 seconds by default), further requests from that IP get 429 until the window ends
+- A successful login does not count, but it does not clear earlier failures either, so one valid profile cannot be used to reset the count while guessing another profile's password
 - Lockout automatically expires after the window period
+- With OAuth on, the sign-in form uses the same budget, and all `/oauth/*` endpoints together are limited to 120 requests per minute per IP by default
+- Behind a reverse proxy or tunnel, set `MCP_TRUST_PROXY` so the limits see each client's address instead of the proxy's. Without it, every client shares the proxy's budget
 
-> **Note:** These values are currently hardcoded. Environment variable configuration may be added in a future release.
+Both limits use [express-rate-limit](https://github.com/express-rate-limit/express-rate-limit) with an in-memory store.
+
+> **Note:** These limits cannot be turned off, and `RATE_LIMIT_ENABLED=false` does not disable them. Each value must be a positive whole number, and a window can be at most `2147483647` ms (about 24.8 days). See [Rate Limiting](configuration.md#rate-limiting) in the configuration reference.
 
 ### TLS/HTTPS
 
@@ -264,6 +347,19 @@ The server rejects a statement that uses a masked column as anything other than 
 
 A view, an alias, or a table function that reads a masked table is not covered unless the view itself is listed in `masking`.
 
+## Query exports
+
+`export_query` writes query results to files in `EXPORT_DIR` on the server host. It is off until `EXPORT_ENABLED` and `EXPORT_DIR` are set. Things to know before turning it on:
+
+- **Same checks as `execute_query`.** The statement goes through the SQL validator, `QUERY_ALLOWED_SCHEMAS`, the parse check, and column masking. Masked columns are masked in the file and in the sample rows. If a masked column the statement selects is missing from the result, the export fails and no file is kept.
+- **A download link works like a password.** Over HTTP the link is `<MCP_PUBLIC_URL>/exports/<id>`, where the id is 256 random bits. Anyone who has the link can download the file until it expires (`EXPORT_TTL_MINUTES`, 15 by default), with no bearer token, because a browser following a link from a chat cannot send one. A link allows `EXPORT_MAX_DOWNLOADS` downloads, 3 by default. Treat a chat that holds a link as holding the data.
+- **Link previews.** Chat apps and email security scanners often fetch a link before the user clicks it. `HEAD` requests do not count as downloads, and the default of 3 downloads leaves room for a preview that uses `GET`. `EXPORT_MAX_DOWNLOADS=1` makes links single use, at the cost of links that a preview has already spent.
+- **Files on the host.** Exports are files on the MCP host, readable by the user the server runs as. The directory is created with mode `0700`, files with `0600`, and the server refuses a directory that is a symbolic link or belongs to another user. Files are deleted after the last allowed download, when they expire, at shutdown, and at the next startup.
+- **Load on the IBM i.** Exports read many more rows than `execute_query` returns. `EXPORT_MAX_ROWS` (100,000), `EXPORT_MAX_BYTES` (100 MB), `EXPORT_TIMEOUT` and `EXPORT_MAX_CONCURRENT` (2) bound that. Keep them low on a production system.
+- **Formulas.** XLSX files hold values only, never formulas. In CSV files a text value that starts with `=`, `+`, `-` or `@` gets a leading `'`, so a spreadsheet does not run it as a formula.
+- **Audit.** The export is recorded like any tool call, with `rowCount` and `bytes`. Each download request adds a line with `"event":"export_download"`, the first 8 characters of the id, the IP address, who ran the export, and whether it succeeded. The full link is never logged.
+- **Rate limit.** `/exports/:id` allows 30 requests per minute per IP address.
+
 ## Mapepire driver (SSH)
 
 With `DB2I_DRIVER=mapepire` the server logs in to the IBM i with SSH and runs the Mapepire server inside that session. Some things to know:
@@ -272,7 +368,7 @@ With `DB2I_DRIVER=mapepire` the server logs in to the IBM i with SSH and runs th
 - **Files on the IBM i.** On first use, mapepire-js uploads its bundled server JAR to `$HOME/.mapepire` in the user's home directory and checks its SHA-256. Later connections reuse it, or a JAR that Code for i left in `$HOME/.vscode`. Set `serverPath` to run an installed JAR instead. Delete `$HOME/.mapepire` to remove it.
 - **SSH access.** The user profile needs SSH login, which also allows a shell. Give the MCP server a dedicated, low-privilege profile, as you would for the other drivers. If sshd allows it, limit what that profile can do over SSH.
 - **Encryption.** SSH encrypts the whole session, so the JDBC `secure` option is not needed.
-- **Keys.** `privateKeyFile` logs in with a key instead of the password. The key file must not have a passphrase, so protect it like a password file. Over HTTP with `MCP_AUTH_MODE=required`, `/auth` sessions ignore the key and log in over SSH with the caller's password, so the key cannot stand in for a caller's credentials.
+- **Keys and Agent.** `privateKeyFile` logs in with a key file directly. The key file must not have a passphrase, so protect it like a password file. Setting `agent=true` (or a socket path) delegates authentication to the local SSH agent (`SSH_AUTH_SOCK` or Pageant on Windows), allowing passphrased keys already loaded into the agent to authenticate seamlessly. Over HTTP with `MCP_AUTH_MODE=required`, `/auth` sessions ignore both the key and the agent, logging in over SSH with the caller's password so server credentials cannot stand in for a caller's credentials.
 
 ## Audit log
 
@@ -281,6 +377,39 @@ With `DB2I_DRIVER=mapepire` the server logs in to the IBM i with SSH and runs th
 Resource reads and the `write_query` prompt query the catalog too, so they are recorded the same way. Their `tool` is `resource:table`, `resource:table_ddl`, or `prompt:write_query`, and `args` holds the schema and table. Reading `db2i://business-context` and completing names are not recorded.
 
 Hashing is the default because the statement often contains customer values, and an audit file should not become a second copy of the data. Set `MCP_AUDIT_PARAMS=true` only when you need the bound values and the file is protected like a credential.
+
+The audit log also records why the server stopped, as a line such as `{"time":"...","event":"shutdown","reason":"stdin closed"}`. The reason is `SIGINT`, `SIGTERM`, `SIGHUP`, or `stdin closed` (the stdio client went away). A second line with reason `deadline` means shutdown ran past 5 seconds and the process exited while a pool was still closing. Lines with an `event` field have no `tool`.
+
+### Call details and sign-ins
+
+When the audit log is on, each tool call line also records:
+
+- `serverVersion`: the server version, from `package.json`. Every line has it, events such as `sign_in` and `shutdown` too, so errors can be counted per release.
+- `build`: the value of `MCP_BUILD_ID`, when it is set. A server built from a checkout between releases reports the previous release as `serverVersion`, so set `MCP_BUILD_ID` to the git commit to tell such deployments apart.
+- `client`: the MCP client's `name` and `version` from the request metadata, or the HTTP `userAgent` when the client sends none.
+- `session`: a 12-character hash of the session key. It groups calls from one sign-in or token without logging the key, which can be a bearer token.
+- `truncated: true` when a successful call stopped at a row or size limit and more rows matched: `execute_query` and business SQL tools at their row limit, a listing tool at its cap, or an export at `max_rows` or `EXPORT_MAX_BYTES`. A complete result has no `truncated` field.
+- `skippedFilters`: the annotated tables whose row filter an `execute_query`, `export_query` or `validate_query` statement left out. See [Row filters](custom-tools.md#row-filters).
+- For a failed call, `errorKind` says why: `security_validation`, `allowlist_parse` (with the parse check off, the JavaScript allowlist parser could not read the SQL), `allowlist_denied` (a library outside `QUERY_ALLOWED_SCHEMAS`), `parse_check`, `masking`, `bad_params`, `sql_error`, `not_found`, `unknown_system`, `rate_limited`, `exception` or `other`. `sqlstate`, `sqlcode` and the rule `violations` are added when the call had them. `rejectedBy` says which check refused the statement: `validator`, `allowlist`, `parse_check`, `masking` or `db2`. A statement the parse check could not parse counts as `db2` when Db2 gave its reason, so the server's own checks are the first four.
+- A `validate_query` call records its verdict as `valid`, with its `violations` and, for a statement that does not parse, Db2's `sqlstate` and `sqlcode`. An assistant that runs a statement after `valid: false` can be traced.
+
+Sign-ins are recorded as `{"event":"sign_in", ...}` lines: `method` (`oauth` for the sign-in page, `password` for `POST /auth`), the user name as entered, the `system`, the OAuth `client` name, the IP address, the `outcome` (`success`, `failure`, `rate_limited` or `error`) and, for a failure, the `reason`. Passwords are never written. A failed sign-in can carry a mistyped user name, and the reason is the driver's message, which can name the host.
+
+### Intent
+
+`MCP_TOOL_INTENT=true` adds an optional `context` argument to every tool and asks the model, in the server instructions, to fill it in with one sentence on the user's goal. The server removes it before the tool runs, so results do not change, and writes it to the audit line as `intent`. A YAML tool with its own `context` parameter keeps that parameter and gets no intent argument. It is off by default and tool schemas are unchanged while it is off.
+
+The server never sees the user's prompt. The intent is the model's summary of it, which is useful for learning what people ask for, and just as sensitive.
+
+### Before you turn these on
+
+These settings are optional. A default install records none of this, and the server never sends the audit log anywhere. Where the file or stream goes is your decision. Before turning them on, or shipping the log to another system:
+
+- **Treat the log as personal data.** User names, IP addresses, SQL text, bound values and intent text identify people and can contain customer names, order numbers or other business data. The intent is written from what the user typed.
+- **Tell your users** what is recorded and why, and make sure you have a legal basis for it, for example under GDPR.
+- **Limit access and keep it short.** Protect the log like the data it describes, and delete it when you no longer need it.
+- **Think twice before sending it to a third-party service** (a log platform or a product analytics tool). That copies the data to another processor, in another place, under their retention. Check that your agreements and your users' expectations cover it.
+- **Start with the least you need.** `MCP_AUDIT_SQL=hash` and `MCP_AUDIT_PARAMS` left off keep statement values out of the log. Turn on `MCP_TOOL_INTENT` only when you will read the intents.
 
 The pino log is not this record. At `info` it does not keep the SQL, and at `debug` it is a diagnostic trace, not an answer to who ran what. A failed audit write is reported once and does not fail the tool call.
 
@@ -317,9 +446,11 @@ LOG_LEVEL=info
 - [ ] Set `secure=true` in `DB2I_JDBC_OPTIONS` (or `SSL=1` in `DB2I_ODBC_OPTIONS`) after the IBM i host servers are configured for SSL
 - [ ] With the `mapepire` driver, pin `hostKey` or keep the host in `known_hosts`, and leave `insecureHostKey` unset
 - [ ] Set `MCP_ALLOWED_HOSTS` to the public hostname when the HTTP server is not loopback-only
+- [ ] With `MCP_OAUTH_ENABLED`, set `MCP_OAUTH_SECRET`, serve `MCP_PUBLIC_URL` over HTTPS, and keep `MCP_OAUTH_REDIRECT_URIS` to the clients you use
+- [ ] With `MCP_OAUTH_STATE_FILE`, keep the file and `MCP_OAUTH_SECRET` in separate places, and out of shared backups
 - [ ] Leave `access` (JDBC) and `CONNTYPE` (ODBC) unset so the connection stays read only, or treat an explicit value as a deliberate override
 - [ ] Set appropriate rate limits
-- [ ] Configure query limits
+- [ ] Configure query limits, and keep `QUERY_TIMEOUT` on. With `jt400` or `mapepire`, check that the user profile can run `QSYS2.CANCEL_SQL`, or use `odbc`
 - [ ] Disable tools clients don't need (e.g. `MCP_TOOLS_DISABLED=execute_query`)
 - [ ] Set `QUERY_ALLOWED_SCHEMAS` when `execute_query` or business SQL tools are enabled, and limit the IBM i user profile to those libraries
 - [ ] Use `info` or higher log level

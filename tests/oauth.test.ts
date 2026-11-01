@@ -1,0 +1,1316 @@
+/**
+ * Built-in OAuth 2.1 authorization server: metadata, registration, IBM i
+ * login page, code exchange with PKCE, refresh rotation and revocation.
+ */
+
+import crypto from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Express } from 'express';
+
+// A password of "wrong" fails the test connection; anything else logs in
+vi.mock('node-jt400', async () => {
+  const { withExecute } = await import('./helpers/jt400Fake.js');
+  return {
+    pool: vi.fn((config: { password: string }) => withExecute({
+      query: config.password === 'wrong'
+        ? vi.fn().mockRejectedValue(new Error('SQL30082 password incorrect on ibmi.example.com'))
+        : vi.fn().mockResolvedValue([]),
+      close: vi.fn().mockResolvedValue(undefined),
+    })),
+  };
+});
+
+import { createHttpApp } from '../src/transports/http.js';
+import { getTokenManager, sessionPoolKey } from '../src/auth/tokenManager.js';
+import { closeAllSessionPools, executeQuery, getSessionPoolCount, hasSessionPool } from '../src/db/connection.js';
+import { isRedirectUriAllowed, resetOAuthState } from '../src/auth/oauth.js';
+import { isTransientConnectionError } from '../src/auth/login.js';
+import { getOAuthConfig } from '../src/config.js';
+import { resetSystems } from '../src/systems.js';
+import { withExecute } from './helpers/jt400Fake.js';
+import { closeAuditLog, initAuditLog } from '../src/utils/auditLog.js';
+
+const PROFILES = `
+profiles:
+  - name: prod
+    host: ibmi.example.com
+    driver: jt400
+    username: SVCUSER
+    password: \${SVC_PASSWORD}
+    schema: MYLIB
+  - name: test
+    host: ibmi.example.com
+    driver: jt400
+    username: SVCUSER
+    password: \${SVC_PASSWORD}
+    schema: OTHERLIB
+`;
+
+const PUBLIC_URL = 'https://mcp.example.com';
+const SIGN_IN_PAGE_VARIABLE = /^MCP_OAUTH_(LANGUAGE|STRINGS|BRAND_NAME|LOGO|TITLE|SYSTEM_LABEL|ACCENT|ACCENT_DARK|FONT_FAMILY|FONT_FILE)$/;
+const CLAUDE_CALLBACK = 'https://claude.ai/api/mcp/auth_callback';
+
+async function listen(app: Express): Promise<{ server: http.Server; baseUrl: string }> {
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const { port } = server.address() as AddressInfo;
+  return { server, baseUrl: `http://127.0.0.1:${port}` };
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+
+function pkce(): { verifier: string; challenge: string } {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+function hiddenRequest(html: string): string {
+  const match = html.match(/name="request" value="([^"]+)"/);
+  if (!match) throw new Error('login form has no request field');
+  return match[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+describe('OAuth authorization server', () => {
+  const originalEnv = process.env;
+  let dir: string;
+  let server: http.Server;
+  let baseUrl: string;
+
+  async function restart(): Promise<void> {
+    await closeServer(server);
+    ({ server, baseUrl } = await listen(createHttpApp()));
+  }
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'db2i-oauth-'));
+    const file = path.join(dir, 'profiles.yaml');
+    writeFileSync(file, PROFILES);
+    process.env = {
+      ...originalEnv,
+      MCP_AUTH_MODE: 'required',
+      MCP_SESSION_MODE: 'stateless',
+      MCP_OAUTH_ENABLED: 'true',
+      MCP_PUBLIC_URL: PUBLIC_URL,
+      MCP_OAUTH_SECRET: 'x'.repeat(40),
+      DB2I_PROFILES: file,
+      SVC_PASSWORD: 'svcpass',
+    };
+    delete process.env.DB2I_HOSTNAME;
+    delete process.env.MCP_AUTH_ALLOWED_DB_HOSTS;
+    delete process.env.MCP_OAUTH_REDIRECT_URIS;
+    delete process.env.MCP_OAUTH_REFRESH_EXPIRY;
+    delete process.env.MCP_OAUTH_STATE_FILE;
+    for (const name of Object.keys(process.env).filter((key) => SIGN_IN_PAGE_VARIABLE.test(key))) {
+      delete process.env[name];
+    }
+    resetSystems();
+    resetOAuthState();
+    ({ server, baseUrl } = await listen(createHttpApp()));
+  });
+
+  afterEach(async () => {
+    closeAuditLog();
+    await closeServer(server);
+    await getTokenManager().shutdown();
+    resetOAuthState();
+    resetSystems();
+    process.env = originalEnv;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function register(body: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    const res = await fetch(`${baseUrl}/oauth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        redirect_uris: [CLAUDE_CALLBACK],
+        client_name: 'Claude',
+        token_endpoint_auth_method: 'none',
+        ...body,
+      }),
+    });
+    expect(res.status).toBe(201);
+    return (await res.json()) as Record<string, unknown>;
+  }
+
+  function authorizeUrl(clientId: string, challenge: string, extra: Record<string, string> = {}): string {
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: CLAUDE_CALLBACK,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      state: 'st-123',
+      resource: `${PUBLIC_URL}/mcp`,
+      ...extra,
+    });
+    return `${baseUrl}/oauth/authorize?${params}`;
+  }
+
+  function postLogin(request: string, fields: Record<string, string>): Promise<Response> {
+    return fetch(`${baseUrl}/oauth/authorize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ request, ...fields }),
+      redirect: 'manual',
+    });
+  }
+
+  function postToken(fields: Record<string, string>, headers: Record<string, string> = {}): Promise<Response> {
+    return fetch(`${baseUrl}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+      body: new URLSearchParams(fields),
+    });
+  }
+
+  /** Exchange a code for tokens. */
+  async function exchange(clientId: string, code: string, verifier: string): Promise<{ access_token: string; refresh_token: string }> {
+    const res = await postToken({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_CALLBACK });
+    expect(res.status).toBe(200);
+    return (await res.json()) as { access_token: string; refresh_token: string };
+  }
+
+  function revoke(clientId: string, token: string): Promise<Response> {
+    return fetch(`${baseUrl}/oauth/revoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token, client_id: clientId }),
+    });
+  }
+
+  /** Make the next test connection fail with this error. */
+  async function failNextConnection(message: string): Promise<void> {
+    const { pool } = await import('node-jt400');
+    vi.mocked(pool).mockImplementationOnce(() => withExecute({
+      query: vi.fn().mockRejectedValue(new Error(message)),
+      close: vi.fn().mockResolvedValue(undefined),
+    }) as never);
+  }
+
+  /**
+   * The callback a successful sign-in returns to. A hosted client gets a page that
+   * navigates with Refresh, since form-action would block a redirect chain.
+   */
+  function returnUrl(res: globalThis.Response): URL {
+    expect(res.status).toBe(200);
+    const refresh = res.headers.get('refresh') ?? '';
+    expect(refresh).toMatch(/^0; url=/);
+    return new URL(refresh.slice('0; url='.length));
+  }
+
+  /** Register, sign in, and return the code plus what the token request needs. */
+  async function signIn(
+    fields: Record<string, string> = { username: 'CALLER', password: 'callerpass', system: 'test' },
+    registration: Record<string, unknown> = {}
+  ): Promise<{ clientId: string; clientSecret?: string; code: string; verifier: string }> {
+    const client = await register(registration);
+    const clientId = client.client_id as string;
+    const { verifier, challenge } = pkce();
+    const page = await fetch(authorizeUrl(clientId, challenge));
+    expect(page.status).toBe(200);
+    const res = await postLogin(hiddenRequest(await page.text()), fields);
+    const location = returnUrl(res);
+    expect(`${location.origin}${location.pathname}`).toBe(CLAUDE_CALLBACK);
+    expect(location.searchParams.get('state')).toBe('st-123');
+    expect(location.searchParams.get('iss')).toBe(PUBLIC_URL);
+    return {
+      clientId,
+      clientSecret: client.client_secret as string | undefined,
+      code: location.searchParams.get('code') as string,
+      verifier,
+    };
+  }
+
+  it('publishes protected resource and authorization server metadata', async () => {
+    const prm = await (await fetch(`${baseUrl}/.well-known/oauth-protected-resource/mcp`)).json();
+    expect(prm).toMatchObject({
+      resource: `${PUBLIC_URL}/mcp`,
+      authorization_servers: [PUBLIC_URL],
+      resource_name: 'Db2 for i MCP Server',
+    });
+
+    const as = await (await fetch(`${baseUrl}/.well-known/oauth-authorization-server`)).json();
+    expect(as).toMatchObject({
+      issuer: PUBLIC_URL,
+      authorization_endpoint: `${PUBLIC_URL}/oauth/authorize`,
+      token_endpoint: `${PUBLIC_URL}/oauth/token`,
+      registration_endpoint: `${PUBLIC_URL}/oauth/register`,
+      code_challenge_methods_supported: ['S256'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
+    });
+  });
+
+  it('challenges /mcp with the resource metadata URL', async () => {
+    const res = await fetch(`${baseUrl}/mcp`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(
+      `Bearer resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource/mcp"`
+    );
+
+    const bad = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer nope' },
+      body: '{}',
+    });
+    expect(bad.headers.get('www-authenticate')).toMatch(/error="invalid_token"/);
+  });
+
+  it('serves the project icon without authentication', async () => {
+    for (const [path, type] of [
+      ['/favicon.ico', 'image/x-icon'],
+      ['/favicon.svg', 'image/svg+xml'],
+      ['/icon.png', 'image/png'],
+      ['/icon.svg', 'image/svg+xml'],
+    ]) {
+      const res = await fetch(`${baseUrl}${path}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain(type);
+      expect(res.headers.get('cache-control')).toBe('public, max-age=86400');
+    }
+  });
+
+  it('accepts the public hostname in the Host allowlist', async () => {
+    const res = await new Promise<number>((resolve, reject) => {
+      const url = new URL(`${baseUrl}/.well-known/oauth-authorization-server`);
+      http
+        .get({ host: url.hostname, port: url.port, path: url.pathname, headers: { Host: 'mcp.example.com' } }, (r) => {
+          r.resume();
+          resolve(r.statusCode ?? 0);
+        })
+        .on('error', reject);
+    });
+    expect(res).toBe(200);
+  });
+
+  it('refuses redirect URIs outside the allowlist at registration', async () => {
+    const res = await fetch(`${baseUrl}/oauth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: ['https://attacker.example.net/callback'] }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('invalid_redirect_uri');
+  });
+
+  it('allows loopback redirects and configured prefixes', () => {
+    const allowlist = ['https://app.example.com/oauth/*', CLAUDE_CALLBACK];
+    expect(isRedirectUriAllowed('http://localhost:53682/callback', allowlist)).toBe(true);
+    expect(isRedirectUriAllowed('http://127.0.0.1:9/cb', allowlist)).toBe(true);
+    expect(isRedirectUriAllowed('https://app.example.com/oauth/done', allowlist)).toBe(true);
+    expect(isRedirectUriAllowed(CLAUDE_CALLBACK, allowlist)).toBe(true);
+    expect(isRedirectUriAllowed(`${CLAUDE_CALLBACK}/extra`, allowlist)).toBe(false);
+    expect(isRedirectUriAllowed('https://app.example.com/other', allowlist)).toBe(false);
+    expect(isRedirectUriAllowed('https://app.example.com/oauth/../evil', allowlist)).toBe(false);
+    expect(isRedirectUriAllowed('https://claude.ai/api/mcp/auth_callback#frag', allowlist)).toBe(false);
+    expect(isRedirectUriAllowed('not a url', allowlist)).toBe(false);
+  });
+
+  it('issues a distinct client ID and secret for identical metadata', async () => {
+    const a = await register({ token_endpoint_auth_method: 'client_secret_post' });
+    const b = await register({ token_endpoint_auth_method: 'client_secret_post' });
+    expect(a.client_id).not.toBe(b.client_id);
+    expect(a.client_secret).not.toBe(b.client_secret);
+  });
+
+  it('rejects a tampered client ID', async () => {
+    const client = await register();
+    const tampered = `${(client.client_id as string).slice(0, -2)}AA`;
+    const res = await fetch(authorizeUrl(tampered, pkce().challenge));
+    expect(res.status).toBe(400);
+    expect(await res.text()).toMatch(/not registered/);
+  });
+
+  it('renders a login page with a strict CSP and the profiles to choose from', async () => {
+    const client = await register();
+    const res = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("form-action 'self' https://claude.ai");
+    expect(csp).toContain('img-src data:');
+    // no-referrer would make browsers post the form with `Origin: null`, which the Origin check refuses
+    expect(res.headers.get('referrer-policy')).toBe('same-origin');
+    const html = await res.text();
+    expect(html).toContain('<svg class="logo"');
+    expect(html).toContain('aria-label="db2i/mcp"');
+    expect(html).toContain('<title>Sign in to IBM i · Db2 for i MCP Server</title>');
+    expect(html).toContain('rel="icon" type="image/svg+xml" href="data:image/svg+xml,');
+    expect(html).toContain('<option value="prod" selected>prod</option>');
+    expect(html).toContain('<option value="test">test</option>');
+    expect(html).toContain('<strong>Claude</strong>');
+  });
+
+  it('keeps the default look and English with no page settings', async () => {
+    const client = await register();
+    const res = await fetch(authorizeUrl(client.client_id as string, pkce().challenge), {
+      headers: { 'Accept-Language': 'fi-FI,fi;q=0.9' },
+    });
+    expect(res.headers.get('content-security-policy')).not.toContain('font-src');
+    expect(res.headers.get('vary') ?? '').not.toContain('Accept-Language');
+    const html = await res.text();
+    expect(html).toContain('<html lang="en">');
+    expect(html).toContain('<div class="brand"><svg class="logo"');
+    expect(html).toContain('<label for="system">System</label>');
+    expect(html).toContain('<strong>Claude</strong> is asking to connect. After you sign in, you return to <strong>claude.ai</strong>.');
+    expect(html).not.toContain('class="credit"');
+    expect(html).not.toContain('@font-face');
+  });
+
+  it('shows every string in Finnish with MCP_OAUTH_LANGUAGE=fi, including errors', async () => {
+    process.env.MCP_OAUTH_LANGUAGE = 'fi';
+    await restart();
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const html = await page.text();
+    expect(html).toContain('<html lang="fi">');
+    expect(html).toContain('<title>Kirjaudu IBM i:hin · Db2 for i MCP Server</title>');
+    expect(html).toContain('<strong>Claude</strong> pyytää yhteyttä. Kirjautumisen jälkeen palaat osoitteeseen <strong>claude.ai</strong>.');
+    expect(html).toContain('<label for="system">Järjestelmä</label>');
+    expect(html).toContain('<label for="username">Käyttäjänimi</label>');
+    expect(html).toContain('<span>Kirjaudu</span>');
+
+    const failed = await postLogin(hiddenRequest(html), { username: 'CALLER', password: 'wrong', system: 'prod' });
+    expect(await failed.text()).toContain('Kirjautuminen epäonnistui. Tarkista käyttäjänimi ja salasana.');
+
+    const expired = await postLogin('tampered', { username: 'CALLER', password: 'x' });
+    const expiredHtml = await expired.text();
+    expect(expiredHtml).toContain('<h1>Kirjautumisvirhe</h1>');
+    expect(expiredHtml).toContain('Tämä kirjautumissivu on vanhentunut.');
+
+    const unknown = await fetch(authorizeUrl('not-a-client', pkce().challenge));
+    expect(await unknown.text()).toContain('Tätä sovellusta ei ole rekisteröity');
+  });
+
+  it('shows the rate limit error in the page language, with the seconds filled in', async () => {
+    process.env.MCP_OAUTH_LANGUAGE = 'fi';
+    process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS = '1';
+    await restart();
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const request = hiddenRequest(await page.text());
+    await postLogin(request, { username: 'CALLER', password: 'wrong', system: 'prod' });
+    const limited = await postLogin(request, { username: 'CALLER', password: 'wrong', system: 'prod' });
+    expect(limited.status).toBe(429);
+    expect(await limited.text()).toMatch(/Liian monta kirjautumisyritystä\. Yritä uudelleen \d+ sekunnin kuluttua\./);
+  });
+
+  it('does not show configuration errors from the sign-in on the page', async () => {
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const res = await postLogin(hiddenRequest(await page.text()), { username: 'CALLER', password: 'x', system: 'nosuch' });
+    expect(res.status).toBe(400);
+    const html = await res.text();
+    expect(html).toContain('This system cannot be used to sign in. Ask your administrator.');
+    expect(html).not.toContain('Available:');
+  });
+
+  it('follows Accept-Language with auto and falls back to English', async () => {
+    process.env.MCP_OAUTH_LANGUAGE = 'auto';
+    await restart();
+    const client = await register();
+    const url = authorizeUrl(client.client_id as string, pkce().challenge);
+
+    const finnish = await fetch(url, { headers: { 'Accept-Language': 'fi-FI,fi;q=0.9,en;q=0.8' } });
+    expect(finnish.headers.get('vary')).toContain('Accept-Language');
+    expect(await finnish.text()).toContain('<html lang="fi">');
+
+    const german = await fetch(url, { headers: { 'Accept-Language': 'de-DE,de;q=0.9' } });
+    expect(await german.text()).toContain('<html lang="en">');
+  });
+
+  it('uses a strings file, escaping its text', async () => {
+    const file = path.join(dir, 'strings.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        en: { note: 'Use your <b>ERP</b> password & user.' },
+        sv: { heading: 'Logga in', intro: '{client} vill ansluta. Du återvänder till {returnTo}.' },
+      })
+    );
+    process.env.MCP_OAUTH_STRINGS = file;
+    process.env.MCP_OAUTH_LANGUAGE = 'auto';
+    await restart();
+    const client = await register({ client_name: '<img src=x>' });
+    const url = authorizeUrl(client.client_id as string, pkce().challenge);
+
+    const english = await (await fetch(url)).text();
+    expect(english).toContain('<p class="note">Use your &lt;b&gt;ERP&lt;/b&gt; password &amp; user.</p>');
+
+    const swedish = await (await fetch(url, { headers: { 'Accept-Language': 'sv-SE' } })).text();
+    expect(swedish).toContain('<html lang="sv">');
+    expect(swedish).toContain('<h1>Logga in</h1>');
+    expect(swedish).toContain('<strong>&lt;img src=x&gt;</strong> vill ansluta. Du återvänder till <strong>claude.ai</strong>.');
+    // Keys the file leaves out stay English
+    expect(swedish).toContain('<span>Sign in</span>');
+  });
+
+  it('refuses to start with an invalid strings file', async () => {
+    const file = path.join(dir, 'strings.json');
+    writeFileSync(file, JSON.stringify({ fi: { heading: 'x', unknown: 'y' } }));
+    process.env.MCP_OAUTH_STRINGS = file;
+    expect(() => getOAuthConfig('required')).toThrow(/fi.unknown is not a sign-in page string/);
+  });
+
+  it('shows the company branding: name, logo, title, labels, colors and font', async () => {
+    const logo = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>';
+    writeFileSync(path.join(dir, 'logo.svg'), logo);
+    writeFileSync(path.join(dir, 'brand.woff2'), Buffer.concat([Buffer.from('wOF2', 'latin1'), Buffer.alloc(40)]));
+    writeFileSync(
+      path.join(dir, 'profiles.yaml'),
+      PROFILES.replace('  - name: prod\n', '  - name: prod\n    label: Finland\n')
+    );
+    resetSystems();
+    Object.assign(process.env, {
+      MCP_OAUTH_BRAND_NAME: 'Acme & Co',
+      MCP_OAUTH_LOGO: path.join(dir, 'logo.svg'),
+      MCP_OAUTH_TITLE: 'Sign in to Acme ERP',
+      MCP_OAUTH_SYSTEM_LABEL: 'Country',
+      MCP_OAUTH_ACCENT: '#0F6E4B',
+      MCP_OAUTH_ACCENT_DARK: '#5FD3A0',
+      MCP_OAUTH_FONT_FAMILY: '"Inter", sans-serif',
+      MCP_OAUTH_FONT_FILE: path.join(dir, 'brand.woff2'),
+    });
+    await restart();
+    const client = await register();
+    const res = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain('font-src data:');
+    expect(csp).toContain('img-src data:');
+    expect(csp).not.toMatch(/https?:\/\/(?!claude\.ai)/);
+    const html = await res.text();
+    expect(html).toContain('<title>Sign in to Acme ERP · Acme &amp; Co</title>');
+    expect(html).toContain(
+      `<div class="brand custom"><img class="brand-logo" src="data:image/svg+xml;base64,${Buffer.from(logo).toString('base64')}" alt="">` +
+        '<span class="brand-name">Acme &amp; Co</span></div>'
+    );
+    expect(html).not.toContain('<svg class="logo"');
+    expect(html).toContain('<h1>Sign in to Acme ERP</h1>');
+    expect(html).toContain('<label for="system">Country</label>');
+    // The label is shown; the profile name is what the form submits
+    expect(html).toContain('<option value="prod" selected>Finland</option>');
+    expect(html).toContain('<option value="test">test</option>');
+    expect(html).toContain(':root { --accent: #0f6e4b; --on-accent: #ffffff; }');
+    expect(html).toContain('@media (prefers-color-scheme: dark) { :root { --accent: #5fd3a0; --on-accent: #000000; } }');
+    expect(html).toContain('@font-face { font-family: "sign-in-brand"; src: url(data:font/woff2;base64,');
+    expect(html).toMatch(/@font-face \{[^}]*font-weight: 1 1000;/);
+    expect(html).toContain(':root { --sans: "sign-in-brand", "Inter", sans-serif; }');
+    expect(html).toContain('<p class="credit">db2i/mcp</p>');
+
+    // The title is the heading in every language, and the Finnish page keeps it
+    process.env.MCP_OAUTH_LANGUAGE = 'fi';
+    await restart();
+    const finnish = await (await fetch(authorizeUrl(client.client_id as string, pkce().challenge))).text();
+    expect(finnish).toContain('<h1>Sign in to Acme ERP</h1>');
+    expect(finnish).toContain('<label for="username">Käyttäjänimi</label>');
+  });
+
+  it('names the site with the logo alt text when there is no brand name', async () => {
+    writeFileSync(path.join(dir, 'logo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    process.env.MCP_OAUTH_LOGO = path.join(dir, 'logo.png');
+    await restart();
+    const client = await register();
+    const res = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    expect(res.headers.get('content-security-policy')).not.toContain('font-src');
+    const html = await res.text();
+    expect(html).toContain('<img class="brand-logo" src="data:image/png;base64,iVBORw0KGgo=" alt="Db2 for i MCP Server">');
+    expect(html).toContain('<p class="credit">db2i/mcp</p>');
+  });
+
+  it('sends PKCE and response type errors back to the client', async () => {
+    const client = await register();
+    const noPkce = await fetch(authorizeUrl(client.client_id as string, pkce().challenge, { code_challenge_method: 'plain' }), {
+      redirect: 'manual',
+    });
+    expect(noPkce.status).toBe(302);
+    const location = new URL(noPkce.headers.get('location') as string);
+    expect(location.searchParams.get('error')).toBe('invalid_request');
+    expect(location.searchParams.get('state')).toBe('st-123');
+
+    const wrongResource = await fetch(
+      authorizeUrl(client.client_id as string, pkce().challenge, { resource: 'https://other.example.com/mcp' }),
+      { redirect: 'manual' }
+    );
+    expect(new URL(wrongResource.headers.get('location') as string).searchParams.get('error')).toBe('invalid_target');
+  });
+
+  it('signs in with the caller’s IBM i credentials and binds the token to the chosen profile', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const res = await postToken({
+      grant_type: 'authorization_code',
+      code,
+      code_verifier: verifier,
+      client_id: clientId,
+      redirect_uri: CLAUDE_CALLBACK,
+      resource: `${PUBLIC_URL}/mcp`,
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const body = (await res.json()) as { access_token: string; refresh_token: string; token_type: string };
+    expect(body.token_type).toBe('Bearer');
+    expect(body.refresh_token).toBeTruthy();
+
+    const session = getTokenManager().validateToken(body.access_token).session;
+    expect(session?.system).toBe('test');
+    expect(session?.config.username).toBe('CALLER');
+    expect(session?.config.password).toBe('callerpass');
+    expect(session?.config.schema).toBe('OTHERLIB');
+    expect(session?.clientId).toBe(clientId);
+  });
+
+  it('shows a generic error for a wrong password and keeps the user on the page', async () => {
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const res = await postLogin(hiddenRequest(await page.text()), { username: 'CALLER', password: 'wrong', system: 'prod' });
+    expect(res.status).toBe(401);
+    const html = await res.text();
+    expect(html).toContain('Sign-in failed. Check the user and password.');
+    expect(html).not.toContain('SQL30082');
+    expect(html).not.toContain('wrong');
+    expect(html).toContain('value="CALLER"');
+  });
+
+  it('rate limits the login form', async () => {
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const request = hiddenRequest(await page.text());
+    let last = 0;
+    for (let i = 0; i < 6; i++) {
+      last = (await postLogin(request, { username: 'CALLER', password: 'wrong', system: 'prod' })).status;
+    }
+    expect(last).toBe(429);
+  });
+
+  it('accepts a same-origin form post', async () => {
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const res = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: baseUrl },
+      body: new URLSearchParams({ request: hiddenRequest(await page.text()), username: 'CALLER', password: 'callerpass', system: 'test' }),
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('refresh')).toContain(CLAUDE_CALLBACK);
+    const html = await res.text();
+    expect(html).toContain('Returning to <strong>claude.ai</strong>');
+    expect(html).toContain(`<a href="${CLAUDE_CALLBACK}?code=`);
+  });
+
+  it('does not let a successful sign-in reset earlier failures', async () => {
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const request = hiddenRequest(await page.text());
+    for (let i = 0; i < 4; i++) {
+      expect((await postLogin(request, { username: 'VICTIM', password: 'wrong', system: 'prod' })).status).toBe(401);
+    }
+    expect((await postLogin(request, { username: 'CALLER', password: 'callerpass', system: 'prod' })).status).toBe(200);
+    expect((await postLogin(request, { username: 'VICTIM', password: 'wrong', system: 'prod' })).status).toBe(401);
+    expect((await postLogin(request, { username: 'VICTIM', password: 'wrong', system: 'prod' })).status).toBe(429);
+  });
+
+  it('shares the configured login limit between the sign-in form and /auth', async () => {
+    process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS = '2';
+    await restart();
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    const request = hiddenRequest(await page.text());
+    expect((await postLogin(request, { username: 'CALLER', password: 'wrong', system: 'prod' })).status).toBe(401);
+    expect((await postLogin(request, { username: 'CALLER', password: 'wrong', system: 'prod' })).status).toBe(401);
+
+    // The third attempt goes to /auth and finds the budget already spent
+    const auth = await fetch(`${baseUrl}/auth`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'CALLER', password: 'wrong', system: 'prod' }),
+    });
+    expect(auth.status).toBe(429);
+  });
+
+  it('writes sign-in events to the audit log for the sign-in form and /auth', async () => {
+    const auditFile = path.join(dir, 'audit.log');
+    process.env.MCP_AUDIT_LOG = auditFile;
+    process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS = '4';
+    initAuditLog();
+    await restart();
+
+    await signIn();
+    const client = await register();
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    expect((await postLogin(hiddenRequest(await page.text()), { username: 'CALLER', password: 'wrong', system: 'prod' })).status).toBe(401);
+    const auth = (password: string) => fetch(`${baseUrl}/auth`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'CALLER', password, system: 'test' }),
+    });
+    const noPassword = await fetch(`${baseUrl}/auth`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'CALLER', system: 'test' }),
+    });
+    expect(noPassword.status).toBe(400);
+    expect((await auth('wrong')).status).toBe(401);
+    expect((await auth('wrong')).status).toBe(401);
+    expect((await auth('wrong')).status).toBe(429);
+
+    const events = readFileSync(auditFile, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((line) => line.event === 'sign_in');
+    expect(events.map((event) => [event.method, event.outcome])).toEqual([
+      ['oauth', 'success'],
+      ['oauth', 'failure'],
+      ['password', 'failure'],
+      ['password', 'failure'],
+      ['password', 'failure'],
+      ['password', 'rate_limited'],
+    ]);
+    expect(events[0]).toMatchObject({ identity: 'CALLER', system: 'test', client: 'Claude' });
+    expect(events[1]).toMatchObject({ identity: 'CALLER', system: 'prod', reason: expect.any(String) });
+    expect(events[2]).toMatchObject({ identity: 'CALLER', system: 'test', reason: expect.any(String) });
+    expect(events[5]).toMatchObject({ identity: 'CALLER', system: 'test' });
+    for (const event of events) {
+      expect(JSON.stringify(event)).not.toContain('wrong');
+      expect(JSON.stringify(event)).not.toContain('callerpass');
+    }
+  });
+
+  it('refuses registrations whose client ID would be too long to use', async () => {
+    const uris = Array.from({ length: 10 }, (_, i) => `http://127.0.0.1:${9000 + i}/${'a'.repeat(2000)}`);
+    const res = await fetch(`${baseUrl}/oauth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: uris, token_endpoint_auth_method: 'none' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('invalid_client_metadata');
+  });
+
+  it('sends an oversized state back to the client instead of rendering a form that cannot work', async () => {
+    const client = await register();
+    const res = await fetch(authorizeUrl(client.client_id as string, pkce().challenge, { state: 'x'.repeat(13000) }), {
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get('location') as string).searchParams.get('error')).toBe('invalid_request');
+  });
+
+  it('challenges only failed requests', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = await exchange(clientId, code, verifier);
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokens.access_token}` },
+      body: '{}',
+    });
+    expect(res.status).not.toBe(401);
+    expect(res.headers.get('www-authenticate')).toBeNull();
+  });
+
+  it('redirects a loopback client straight to its callback', async () => {
+    const LOOPBACK_CALLBACK = 'http://127.0.0.1:33418/callback';
+    const client = await register({ redirect_uris: [LOOPBACK_CALLBACK] });
+    const page = await fetch(authorizeUrl(client.client_id as string, pkce().challenge, { redirect_uri: LOOPBACK_CALLBACK }));
+    const res = await postLogin(hiddenRequest(await page.text()), { username: 'CALLER', password: 'callerpass', system: 'test' });
+    expect(res.status).toBe(303);
+    const location = new URL(res.headers.get('location') as string);
+    expect(`${location.origin}${location.pathname}`).toBe(LOOPBACK_CALLBACK);
+    expect(location.searchParams.get('code')).toBeTruthy();
+  });
+
+  it('signs Cursor in through its cursor:// callback', async () => {
+    const CURSOR_CALLBACK = 'cursor://anysphere.cursor-mcp/oauth/callback';
+    const client = await register({ redirect_uris: [CURSOR_CALLBACK], client_name: 'Cursor' });
+    const { verifier, challenge } = pkce();
+    const page = await fetch(authorizeUrl(client.client_id as string, challenge, { redirect_uri: CURSOR_CALLBACK }));
+    expect(page.status).toBe(200);
+    // URL.origin is "null" for an app scheme, which is not a valid CSP source: allow the scheme
+    const csp = page.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("form-action 'self' cursor:");
+    expect(csp).not.toContain('null');
+    const html = await page.text();
+    expect(html).toContain('you return to <strong>cursor://anysphere.cursor-mcp</strong>');
+
+    const res = await postLogin(hiddenRequest(html), { username: 'CALLER', password: 'callerpass', system: 'test' });
+    expect(res.status).toBe(303);
+    const location = new URL(res.headers.get('location') as string);
+    expect(`${location.protocol}//${location.host}${location.pathname}`).toBe(CURSOR_CALLBACK);
+    const tokens = await postToken({
+      grant_type: 'authorization_code',
+      code: location.searchParams.get('code') as string,
+      code_verifier: verifier,
+      client_id: client.client_id as string,
+      redirect_uri: CURSOR_CALLBACK,
+    });
+    expect(tokens.status).toBe(200);
+  });
+
+  it('refuses other app schemes unless configured', async () => {
+    const res = await fetch(`${baseUrl}/oauth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: ['otherapp://callback'] }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses a forged or expired login request', async () => {
+    const res = await postLogin('eyJ4IjoxfQ.bad', { username: 'CALLER', password: 'callerpass' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toMatch(/expired/);
+  });
+
+  it('uses each code once and checks the verifier and client', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const wrongVerifier = await postToken({
+      grant_type: 'authorization_code', code, code_verifier: pkce().verifier, client_id: clientId, redirect_uri: CLAUDE_CALLBACK,
+    });
+    expect(wrongVerifier.status).toBe(400);
+    expect((await wrongVerifier.json()).error).toBe('invalid_grant');
+
+    // The failed attempt used the code up
+    const replay = await postToken({
+      grant_type: 'authorization_code', code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_CALLBACK,
+    });
+    expect(replay.status).toBe(400);
+
+    const other = await signIn();
+    const otherClient = await register();
+    const wrongClient = await postToken({
+      grant_type: 'authorization_code',
+      code: other.code,
+      code_verifier: other.verifier,
+      client_id: otherClient.client_id as string,
+      redirect_uri: CLAUDE_CALLBACK,
+    });
+    expect(wrongClient.status).toBe(400);
+  });
+
+  it('revokes the tokens of a replayed code', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = await exchange(clientId, code, verifier);
+
+    const replay = await postToken({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_CALLBACK });
+    expect(replay.status).toBe(400);
+    expect(getTokenManager().validateToken(tokens.access_token).valid).toBe(false);
+    const refresh = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    expect(refresh.status).toBe(400);
+  });
+
+  it('requires the secret of a confidential client', async () => {
+    const { clientId, clientSecret, code, verifier } = await signIn(undefined, { token_endpoint_auth_method: 'client_secret_basic' });
+    expect(clientSecret).toBeTruthy();
+    const fields = { grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: CLAUDE_CALLBACK };
+
+    const noSecret = await postToken({ ...fields, client_id: clientId });
+    expect(noSecret.status).toBe(401);
+    expect((await noSecret.json()).error).toBe('invalid_client');
+
+    const basic = Buffer.from(`${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret as string)}`).toString('base64');
+    // The failed attempt did not consume the code: client authentication runs first
+    const ok = await postToken(fields, { Authorization: `Basic ${basic}` });
+    expect(ok.status).toBe(200);
+  });
+
+  it('rotates refresh tokens and re-checks the credentials', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const first = (await (
+      await postToken({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_CALLBACK })
+    ).json()) as { refresh_token: string };
+
+    const refreshed = await postToken({ grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: clientId });
+    expect(refreshed.status).toBe(200);
+    const second = (await refreshed.json()) as { access_token: string; refresh_token: string };
+    expect(second.refresh_token).not.toBe(first.refresh_token);
+    expect(getTokenManager().validateToken(second.access_token).session?.system).toBe('test');
+
+    const reused = await postToken({ grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: clientId });
+    expect(reused.status).toBe(400);
+    expect((await reused.json()).error).toBe('invalid_grant');
+  });
+
+  it('ends a refresh grant when the IBM i password no longer works', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = (await (
+      await postToken({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_CALLBACK })
+    ).json()) as { access_token: string; refresh_token: string };
+
+    // Simulate a password change on the IBM i
+    const session = getTokenManager().getSession(tokens.access_token);
+    expect(session).toBeDefined();
+    const { pool } = await import('node-jt400');
+    vi.mocked(pool).mockImplementationOnce(() => withExecute({
+      query: vi.fn().mockRejectedValue(new Error('password expired')),
+      close: vi.fn().mockResolvedValue(undefined),
+    }) as never);
+
+    const res = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error_description).toMatch(/Sign in again/);
+  });
+
+  it('keeps the refresh grant when the IBM i cannot be reached', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = await exchange(clientId, code, verifier);
+
+    await failNextConnection('connect ECONNREFUSED 192.0.2.1:8471');
+    const down = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    expect(down.status).toBe(503);
+    expect((await down.json()).error).toBe('temporarily_unavailable');
+
+    const up = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    expect(up.status).toBe(200);
+  });
+
+  it('does not undo a revocation that lands during the refresh credential check', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = await exchange(clientId, code, verifier);
+
+    // Hold the refresh's test query until the revocation is done
+    let started!: () => void;
+    const queryStarted = new Promise<void>((resolve) => { started = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { pool } = await import('node-jt400');
+    vi.mocked(pool).mockImplementationOnce(() => withExecute({
+      query: vi.fn(async () => {
+        started();
+        await gate;
+        return [];
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+    }) as never);
+
+    const refreshing = postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    await queryStarted;
+    expect((await revoke(clientId, tokens.access_token)).status).toBe(200);
+    release();
+
+    const res = await refreshing;
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('invalid_grant');
+    expect(body.access_token).toBeUndefined();
+    expect(body.refresh_token).toBeUndefined();
+    expect(getTokenManager().getStats().totalSessions).toBe(0);
+    expect(getSessionPoolCount()).toBe(0);
+  });
+
+  it('does not let another client use up a refresh token', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = await exchange(clientId, code, verifier);
+    const stranger = await register();
+
+    const stolen = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: stranger.client_id as string });
+    expect(stolen.status).toBe(400);
+    const own = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    expect(own.status).toBe(200);
+  });
+
+  it('caps refresh grants per user without touching other users', async () => {
+    const other = await signIn({ username: 'OTHER', password: 'otherpass', system: 'test' });
+    const otherTokens = await exchange(other.clientId, other.code, other.verifier);
+
+    const grants: Array<{ clientId: string; refresh: string }> = [];
+    for (let i = 0; i < 11; i++) {
+      const { clientId, code, verifier } = await signIn();
+      grants.push({ clientId, refresh: (await exchange(clientId, code, verifier)).refresh_token });
+    }
+
+    const oldest = await postToken({ grant_type: 'refresh_token', refresh_token: grants[0].refresh, client_id: grants[0].clientId });
+    expect(oldest.status).toBe(400);
+    const newest = await postToken({ grant_type: 'refresh_token', refresh_token: grants[10].refresh, client_id: grants[10].clientId });
+    expect(newest.status).toBe(200);
+    const untouched = await postToken({ grant_type: 'refresh_token', refresh_token: otherTokens.refresh_token, client_id: other.clientId });
+    expect(untouched.status).toBe(200);
+  });
+
+  it('ends the refresh token when its access token is revoked', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = await exchange(clientId, code, verifier);
+    expect((await revoke(clientId, tokens.access_token)).status).toBe(200);
+    const refresh = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    expect(refresh.status).toBe(400);
+  });
+
+  it('ends the access tokens when their refresh token is revoked', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = await exchange(clientId, code, verifier);
+    expect((await revoke(clientId, tokens.refresh_token)).status).toBe(200);
+    expect(getTokenManager().validateToken(tokens.access_token).valid).toBe(false);
+  });
+
+  it('revokes only tokens of the calling client', async () => {
+    const { clientId, code, verifier } = await signIn();
+    const tokens = (await (
+      await postToken({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: clientId, redirect_uri: CLAUDE_CALLBACK })
+    ).json()) as { access_token: string; refresh_token: string };
+
+    const stranger = await register();
+    const revokeAs = (id: string, token: string): Promise<Response> =>
+      fetch(`${baseUrl}/oauth/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token, client_id: id }),
+      });
+
+    expect((await revokeAs(stranger.client_id as string, tokens.access_token)).status).toBe(200);
+    expect(getTokenManager().validateToken(tokens.access_token).valid).toBe(true);
+
+    expect((await revokeAs(clientId, tokens.access_token)).status).toBe(200);
+    expect(getTokenManager().validateToken(tokens.access_token).valid).toBe(false);
+
+    expect((await revokeAs(clientId, tokens.refresh_token)).status).toBe(200);
+    const refresh = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+    expect(refresh.status).toBe(400);
+  });
+
+  describe('connection pools', () => {
+    beforeEach(async () => {
+      await closeAllSessionPools();
+      const { pool } = await import('node-jt400');
+      vi.mocked(pool).mockClear();
+    });
+
+    /** Pools the jt400 driver was asked to create. */
+    async function poolsCreated(): Promise<number> {
+      const { pool } = await import('node-jt400');
+      return vi.mocked(pool).mock.calls.length;
+    }
+
+    /** The pool key a token's queries run on. */
+    function keyOf(token: string): string {
+      return sessionPoolKey(token, getTokenManager().getSession(token));
+    }
+
+    /** Run a query the way a tool call with this token would. */
+    async function queryAs(token: string): Promise<void> {
+      const session = getTokenManager().getSession(token);
+      expect(session).toBeDefined();
+      await executeQuery('VALUES 1', [], { poolKey: keyOf(token), system: session!.system, config: session!.config });
+    }
+
+    /** Expire an access token the way the clock would. */
+    function expire(token: string): void {
+      const session = getTokenManager().getSession(token);
+      expect(session).toBeDefined();
+      session!.expiresAt = new Date(0);
+      expect(getTokenManager().validateToken(token).valid).toBe(false);
+    }
+
+    it('hands the sign-in check pool to the grant, and a refresh keeps it', async () => {
+      const { clientId, code, verifier } = await signIn();
+      const first = await exchange(clientId, code, verifier);
+      const key = keyOf(first.access_token);
+      expect(key).not.toBe(first.access_token);
+      expect(hasSessionPool(key)).toBe(true);
+      expect(getSessionPoolCount()).toBe(1);
+
+      await queryAs(first.access_token);
+      expect(await poolsCreated()).toBe(1);
+
+      const refreshed = await postToken({ grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: clientId });
+      expect(refreshed.status).toBe(200);
+      const second = (await refreshed.json()) as { access_token: string; refresh_token: string };
+      expect(keyOf(second.access_token)).toBe(key);
+      // The refresh still signs on to prove the password, then closes that pool and keeps the warm one
+      expect(await poolsCreated()).toBe(2);
+      const { pool } = await import('node-jt400');
+      await vi.waitFor(() => expect(vi.mocked(pool).mock.results[1].value.close).toHaveBeenCalled());
+      expect(getSessionPoolCount()).toBe(1);
+
+      await queryAs(second.access_token);
+      expect(await poolsCreated()).toBe(2);
+
+      // The old token expiring leaves the pool to the new one
+      expire(first.access_token);
+      await Promise.resolve();
+      expect(hasSessionPool(key)).toBe(true);
+
+      expect((await revoke(clientId, second.refresh_token)).status).toBe(200);
+      expect(hasSessionPool(key)).toBe(false);
+      expect(getSessionPoolCount()).toBe(0);
+    });
+
+    it('closes the grant pool with its last token and gives the next refresh the check pool', async () => {
+      const { clientId, code, verifier } = await signIn();
+      const first = await exchange(clientId, code, verifier);
+      const key = keyOf(first.access_token);
+
+      expire(first.access_token);
+      await vi.waitFor(() => expect(hasSessionPool(key)).toBe(false));
+
+      const refreshed = await postToken({ grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: clientId });
+      expect(refreshed.status).toBe(200);
+      const second = (await refreshed.json()) as { access_token: string };
+      expect(hasSessionPool(key)).toBe(true);
+      await queryAs(second.access_token);
+      expect(await poolsCreated()).toBe(2);
+    });
+
+    it('closes the grant pool when a refresh finds the password changed', async () => {
+      const { clientId, code, verifier } = await signIn();
+      const tokens = await exchange(clientId, code, verifier);
+      const key = keyOf(tokens.access_token);
+
+      await failNextConnection('password expired');
+      const res = await postToken({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: clientId });
+      expect(res.status).toBe(400);
+      await vi.waitFor(() => expect(getSessionPoolCount()).toBe(0));
+      expect(hasSessionPool(key)).toBe(false);
+    });
+
+    it('never shares a pool between sign-ins', async () => {
+      const a = await signIn();
+      const b = await signIn({ username: 'OTHER', password: 'otherpass', system: 'test' });
+      const c = await signIn();
+      const keys = [
+        keyOf((await exchange(a.clientId, a.code, a.verifier)).access_token),
+        keyOf((await exchange(b.clientId, b.code, b.verifier)).access_token),
+        keyOf((await exchange(c.clientId, c.code, c.verifier)).access_token),
+      ];
+      expect(new Set(keys).size).toBe(3);
+      expect(getSessionPoolCount()).toBe(3);
+    });
+
+    it('closes the check pool when the code exchange is refused', async () => {
+      const { clientId, code } = await signIn();
+      expect(getSessionPoolCount()).toBe(1);
+      const res = await postToken({ grant_type: 'authorization_code', code, code_verifier: 'x'.repeat(43), client_id: clientId, redirect_uri: CLAUDE_CALLBACK });
+      expect(res.status).toBe(400);
+      await vi.waitFor(() => expect(getSessionPoolCount()).toBe(0));
+    });
+
+    it('hands the POST /auth check pool to its token', async () => {
+      const res = await fetch(`${baseUrl}/auth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'CALLER', password: 'callerpass', system: 'test' }),
+      });
+      expect(res.status).toBe(201);
+      const { access_token: token } = (await res.json()) as { access_token: string };
+      expect(keyOf(token)).toBe(token);
+      expect(hasSessionPool(token)).toBe(true);
+      expect(getSessionPoolCount()).toBe(1);
+      await queryAs(token);
+      expect(await poolsCreated()).toBe(1);
+
+      await getTokenManager().revokeToken(token);
+      expect(hasSessionPool(token)).toBe(false);
+    });
+  });
+
+  describe('with MCP_OAUTH_STATE_FILE', () => {
+    let stateFile: string;
+
+    beforeEach(async () => {
+      stateFile = path.join(dir, 'oauth', 'grants.json');
+      process.env.MCP_OAUTH_STATE_FILE = stateFile;
+      await restart();
+    });
+
+    /** Stop everything a process restart loses: access tokens and in-memory grants. */
+    async function simulateRestart(): Promise<void> {
+      resetOAuthState();
+      await getTokenManager().shutdown();
+      await restart();
+    }
+
+    function refresh(clientId: string, refreshToken: string): Promise<Response> {
+      return postToken({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: clientId });
+    }
+
+    it('keeps users signed in across a restart', async () => {
+      const { clientId, code, verifier } = await signIn();
+      const first = await exchange(clientId, code, verifier);
+
+      const raw = readFileSync(stateFile, 'utf8');
+      expect(raw).not.toContain(first.refresh_token);
+      expect(raw).not.toContain('callerpass');
+
+      await simulateRestart();
+      expect(getTokenManager().validateToken(first.access_token).valid).toBe(false);
+      const refreshed = await refresh(clientId, first.refresh_token);
+      expect(refreshed.status).toBe(200);
+      const second = (await refreshed.json()) as { access_token: string; refresh_token: string };
+      expect(getTokenManager().validateToken(second.access_token).session?.system).toBe('test');
+
+      // Rotation is written too: after another restart only the new token works
+      await simulateRestart();
+      expect((await refresh(clientId, first.refresh_token)).status).toBe(400);
+      expect((await refresh(clientId, second.refresh_token)).status).toBe(200);
+    });
+
+    it('does not bring back a revoked grant', async () => {
+      const { clientId, code, verifier } = await signIn();
+      const tokens = await exchange(clientId, code, verifier);
+      expect((await revoke(clientId, tokens.access_token)).status).toBe(200);
+
+      await simulateRestart();
+      expect((await refresh(clientId, tokens.refresh_token)).status).toBe(400);
+    });
+
+    it('drops a grant whose profile was removed', async () => {
+      const { clientId, code, verifier } = await signIn();
+      const tokens = await exchange(clientId, code, verifier);
+
+      writeFileSync(process.env.DB2I_PROFILES as string, PROFILES.split('  - name: test')[0]);
+      resetSystems();
+      await simulateRestart();
+      const res = await refresh(clientId, tokens.refresh_token);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe('invalid_grant');
+    });
+  });
+
+  it('limits requests per IP across the OAuth endpoints', async () => {
+    let last = 0;
+    for (let i = 0; i < 121; i++) {
+      last = (await fetch(`${baseUrl}/oauth/revoke`, { method: 'POST' })).status;
+    }
+    expect(last).toBe(429);
+    // Metadata stays reachable
+    expect((await fetch(`${baseUrl}/.well-known/oauth-authorization-server`)).status).toBe(200);
+  });
+
+  it('uses the configured OAuth request limit', async () => {
+    process.env.OAUTH_RATE_LIMIT_MAX_REQUESTS = '3';
+    process.env.OAUTH_RATE_LIMIT_WINDOW_MS = '120000';
+    await restart();
+    for (let i = 0; i < 3; i++) {
+      expect((await fetch(`${baseUrl}/oauth/revoke`, { method: 'POST' })).status).not.toBe(429);
+    }
+    const limited = await fetch(`${baseUrl}/oauth/revoke`, { method: 'POST' });
+    expect(limited.status).toBe(429);
+    expect(Number(limited.headers.get('Retry-After'))).toBeGreaterThan(60);
+  });
+
+  it('keeps client registrations across a restart when the secret is set', async () => {
+    const client = await register();
+    await restart();
+    const res = await fetch(authorizeUrl(client.client_id as string, pkce().challenge));
+    expect(res.status).toBe(200);
+  });
+
+  it('is off unless enabled, and leaves the routes unmounted', async () => {
+    delete process.env.MCP_OAUTH_ENABLED;
+    await restart();
+    const res = await fetch(`${baseUrl}/.well-known/oauth-authorization-server`);
+    expect(res.status).toBe(404);
+    const mcp = await fetch(`${baseUrl}/mcp`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    expect(mcp.headers.get('www-authenticate')).toBeNull();
+  });
+});
+
+describe('isTransientConnectionError', () => {
+  it('treats network failures as transient', () => {
+    expect(isTransientConnectionError(new Error('connect ECONNREFUSED 192.0.2.1:8471'))).toBe(true);
+    expect(isTransientConnectionError(Object.assign(new Error('socket failed'), { code: 'ETIMEDOUT' }))).toBe(true);
+    expect(isTransientConnectionError(new Error('Connection timed out'))).toBe(true);
+  });
+
+  it('recognizes the driver messages for an unreachable IBM i', () => {
+    // ODBC: host servers not listening, and a name that does not resolve
+    expect(isTransientConnectionError(new Error(
+      '[08004] [IBM][System i Access ODBC Driver]Communication link failure. comm rc=10061 - CWBCO1049 - The IBM i server application  is not started, or the connection was blocked by a firewall'
+    ))).toBe(true);
+    expect(isTransientConnectionError(new Error(
+      '[08S01] [IBM][System i Access ODBC Driver]Communication link failure. comm rc=11001 - CWBCO1004 - Remote address could not be resolved'
+    ))).toBe(true);
+    // JT400: the same two cases
+    expect(isTransientConnectionError(new Error('The application requester cannot establish the connection. (Connection refused)'))).toBe(true);
+    expect(isTransientConnectionError(new Error('The application requester cannot establish the connection. (ibmi.example.com)'))).toBe(true);
+  });
+
+  it('treats the drivers\' wrong-password messages as a refusal', () => {
+    expect(isTransientConnectionError(new Error(
+      '[28000] [IBM][System i Access ODBC Driver]Communication link failure. comm rc=8002 - CWBSY0002 - Password for user CALLER on system ibmi.example.com is not correct'
+    ))).toBe(false);
+    expect(isTransientConnectionError(new Error('The application server rejected the connection. (Password length is not valid.)'))).toBe(false);
+  });
+
+  it('treats credential errors and anything unknown as a refusal', () => {
+    expect(isTransientConnectionError(new Error('SQL30082 password incorrect'))).toBe(false);
+    expect(isTransientConnectionError(new Error('Communication link failure. comm rc=8015 - CWBSY0002 - Password for user CALLER is not correct'))).toBe(false);
+    expect(isTransientConnectionError(new Error('User profile CALLER is disabled; connection reset'))).toBe(false);
+    expect(isTransientConnectionError(new Error('something odd'))).toBe(false);
+  });
+});
+
+describe('getOAuthConfig', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv, MCP_OAUTH_ENABLED: 'true', MCP_PUBLIC_URL: 'https://mcp.example.com' };
+    delete process.env.MCP_OAUTH_SECRET;
+    delete process.env.MCP_OAUTH_REDIRECT_URIS;
+    delete process.env.MCP_OAUTH_REFRESH_EXPIRY;
+    delete process.env.MCP_OAUTH_STATE_FILE;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('returns null when disabled', () => {
+    delete process.env.MCP_OAUTH_ENABLED;
+    expect(getOAuthConfig('required')).toBeNull();
+  });
+
+  it('needs required auth mode and a public URL', () => {
+    expect(() => getOAuthConfig('token')).toThrow(/MCP_AUTH_MODE=required/);
+    delete process.env.MCP_PUBLIC_URL;
+    expect(() => getOAuthConfig('required')).toThrow(/MCP_PUBLIC_URL is required/);
+  });
+
+  it('needs https except on loopback, and an origin only', () => {
+    process.env.MCP_PUBLIC_URL = 'http://mcp.example.com';
+    expect(() => getOAuthConfig('required')).toThrow(/https/);
+    process.env.MCP_PUBLIC_URL = 'http://localhost:3000';
+    expect(getOAuthConfig('required')?.resource).toBe('http://localhost:3000/mcp');
+    process.env.MCP_PUBLIC_URL = 'https://mcp.example.com/db2i';
+    expect(() => getOAuthConfig('required')).toThrow(/origin only/);
+  });
+
+  it('defaults to the Claude callbacks, a random key and a 7 day refresh lifetime', () => {
+    const config = getOAuthConfig('required');
+    expect(config?.redirectUris).toEqual([
+      'https://claude.ai/api/mcp/auth_callback',
+      'https://claude.com/api/mcp/auth_callback',
+      'cursor://anysphere.cursor-mcp/oauth/callback',
+    ]);
+    expect(config?.ephemeralSecret).toBe(true);
+    expect(config?.secret).toEqual(getOAuthConfig('required')?.secret);
+    expect(config?.refreshExpiry).toBe(604800);
+  });
+
+  it('refuses a redirect prefix that does not end at a path boundary', () => {
+    process.env.MCP_OAUTH_REDIRECT_URIS = 'https://app.example.com*';
+    expect(() => getOAuthConfig('required')).toThrow(/must end with/);
+    process.env.MCP_OAUTH_REDIRECT_URIS = 'https://app.example.com/oauth/*';
+    expect(getOAuthConfig('required')?.redirectUris).toEqual(['https://app.example.com/oauth/*']);
+  });
+
+  it('needs an explicit secret for a state file', () => {
+    process.env.MCP_OAUTH_STATE_FILE = 'oauth/grants.json';
+    delete process.env.MCP_OAUTH_SECRET;
+    expect(() => getOAuthConfig('required')).toThrow(/MCP_OAUTH_STATE_FILE requires MCP_OAUTH_SECRET/);
+    process.env.MCP_OAUTH_SECRET = 'x'.repeat(40);
+    expect(getOAuthConfig('required')?.stateFile).toBe(path.resolve('oauth/grants.json'));
+  });
+
+  it('refuses a short secret', () => {
+    process.env.MCP_OAUTH_SECRET = 'short';
+    expect(() => getOAuthConfig('required')).toThrow(/at least 32/);
+  });
+});
