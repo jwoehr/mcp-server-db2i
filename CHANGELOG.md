@@ -1,5 +1,38 @@
 # Changelog
 
+## [3.8.9](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.8...v3.8.9) (2026-11-18)
+
+
+### Bug Fixes
+
+* **db:** reconnect after the IBM i ends a pooled connection ([#369](https://github.com/Strom-Capital/mcp-server-db2i/issues/369)) ([1769010](https://github.com/Strom-Capital/mcp-server-db2i/commit/1769010a390dd0d578079edbc73d3e66328ef2a2)), closes [#368](https://github.com/Strom-Capital/mcp-server-db2i/issues/368)
+
+## [3.8.8](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.7...v3.8.8) (2026-11-16)
+
+
+### Bug Fixes
+
+* **ui:** steady result view height, focus, states and grid readability ([#366](https://github.com/Strom-Capital/mcp-server-db2i/issues/366)) ([df0448f](https://github.com/Strom-Capital/mcp-server-db2i/commit/df0448fd6bbabf1fe1e795ac43f45c3424dc03a1))
+
+
+### Dependencies
+
+* bump @hono/node-server, express-rate-limit, hono, astro, dev tooling and web-app example packages ([#364](https://github.com/Strom-Capital/mcp-server-db2i/issues/364)) ([20843ba](https://github.com/Strom-Capital/mcp-server-db2i/commit/20843ba071774feaeed62a8fef8f4c5281b3b662))
+
+## [3.8.7](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.6...v3.8.7) (2026-11-11)
+
+
+### Bug Fixes
+
+* **ui:** word result warnings for the user too and tighten the result view ([#354](https://github.com/Strom-Capital/mcp-server-db2i/issues/354)) ([7488e07](https://github.com/Strom-Capital/mcp-server-db2i/commit/7488e07520ecab2b2324ef75c29bdc4e6bd2a5a2))
+
+## [3.8.6](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.5...v3.8.6) (2026-11-06)
+
+
+### Dependencies
+
+* bump express-rate-limit, hono, dev tooling and web-app example packages ([#352](https://github.com/Strom-Capital/mcp-server-db2i/issues/352)) ([cbef137](https://github.com/Strom-Capital/mcp-server-db2i/commit/cbef1372068ae984057e251ad4e29c04bbef4cff))
+
 ## [3.8.5](https://github.com/Strom-Capital/mcp-server-db2i/compare/v3.8.4...v3.8.5) (2026-10-29)
 
 

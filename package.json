@@ -1,7 +1,7 @@
 {
   "name": "mcp-server-db2i",
   "mcpName": "io.github.Strom-Capital/mcp-server-db2i",
-  "version": "3.8.5",
+  "version": "3.8.9",
   "description": "Read-only MCP server that lets AI assistants query IBM Db2 for i, with per-user sign-in, a library allowlist and an audit log",
   "type": "module",
   "main": "dist/index.js",
@@ -76,7 +76,7 @@
     "@types/express": "^5.0.6",
     "@types/node": "^22.20.4",
     "@types/ssh2": "^1.15.6",
-    "@vitest/coverage-v8": "^5.0.3",
+    "@vitest/coverage-v8": "^5.1.0",
     "chart.js": "^4.5.1",
     "esbuild": "^0.28.2",
     "eslint": "^10.11.0",
@@ -85,7 +85,7 @@
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.70.1",
-    "vitest": "^5.0.3"
+    "vitest": "^5.1.0"
   },
   "engines": {
     "node": ">=22"
